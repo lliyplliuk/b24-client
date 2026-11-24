@@ -1,27 +1,27 @@
 <p align="center">
-  <img src="assets/icons/128.png" alt="Логотип клиента Битрикс24" width="88" height="88">
+  <img src="assets/icons/128.png" alt="Bitrix24 client logo" width="88" height="88">
 </p>
 
-# Клиент облачного Битрикс24
+# Desktop Client for Bitrix24 Cloud
 
-Неофициальное настольное приложение на C++ и Qt Widgets. В одном окне можно читать переписку, работать с задачами проектов и следить за уведомлениями портала.
+An unofficial desktop client built with C++ and Qt Widgets. Keep up with your chats, project tasks, and portal notifications in one window.
 
-## Что доступно
+## Features
 
-- **Переписка.** Обычные чаты и чаты задач с отдельными счётчиками непрочитанного, поиск по сообщениям, закрепления, ответы, реакции и вложения.
-- **Проекты и задачи.** Канбан, список задач и диаграмма Ганта. В карточке можно открыть чат задачи. При создании задачи можно указать ответственного, постановщика, проект, стадию и наблюдателей и приложить файлы.
-- **События и рабочее время.** Уведомления портала и отдельный экран для учёта рабочего дня.
+- **Messaging.** Regular chats and task chats with separate unread counts, message search, pins, replies, reactions, and attachments.
+- **Projects and tasks.** Work with a Kanban board, task list, or Gantt chart. Open a task's chat from its details. When creating a task, you can choose the assignee, creator, project, stage, and observers, and attach files.
+- **Notifications and time tracking.** See portal notifications and track your workday in a dedicated view.
 
-## Платформы
+## Platforms
 
-| Платформа | Возможности |
+| Platform | Availability |
 | --- | --- |
-| Linux | Демо без сети и работа с облачным порталом. Для входа клиент открывает Google Chrome в отдельном профиле. |
-| Windows | Сборка и тесты в GitHub Actions, демо и режим диагностики с импортированной сессией. Встроенный вход через Chrome доступен на Linux. |
+| Linux | Offline demo and access to your cloud portal. The client opens Google Chrome in a dedicated browser profile for sign-in. |
+| Windows | Builds and tests run in GitHub Actions. The demo and diagnostics with an imported session are available. The built-in Chrome sign-in flow is Linux-only. |
 
-## Быстрый старт на Linux
+## Quick start on Linux
 
-На Debian и Ubuntu установите компилятор C++17, CMake и зависимости Qt 6. Для тестов нужен модуль Qt Test.
+On Debian and Ubuntu, install a C++17 compiler, CMake, and the Qt 6 development packages. Running the tests also requires Qt Test.
 
 ```bash
 sudo apt install build-essential cmake qt6-base-dev qt6-websockets-dev
@@ -30,21 +30,21 @@ cmake --build build --parallel 4
 ./build/bin/bitrix24-client --demo
 ```
 
-Демо использует синтетические данные. Учётная запись и подключение к сети не требуются.
+The demo uses sample data and runs offline without an account.
 
-Для работы с порталом замените адрес в примере на свой.
+To connect to your portal, replace the example URL with your own.
 
 ```bash
 ./build/bin/bitrix24-client --portal https://portal.example/online/
 ```
 
-При обычном запуске клиент проверяет сохранённую сессию последнего портала. Если она отсутствует или истекла, нажмите «Войти». В Chrome откроется страница Битрикс24, где можно выбрать Яндекс или ввести логин и пароль. Клиент подтвердит сессию после возврата на выбранный портал.
+At startup, the client checks the saved session for the last portal you used. If the session is missing or has expired, click **Sign in**. The Bitrix24 page opens in Chrome, where you can sign in with Yandex or enter your username and password. The client confirms your session once the browser returns to the selected portal.
 
-На Linux подтверждённая сессия хранится отдельно для каждого портала в системном хранилище Secret Service через libsecret. При недоступном хранилище вход через Chrome по-прежнему работает. Временный сбой при проверке сохраняет сессию для следующей попытки.
+On Linux, the client stores each portal's confirmed session separately in the system's Secret Service keyring using libsecret. You can still sign in through Chrome if the keyring is unavailable. If a temporary error interrupts session verification, the client keeps the saved session for the next attempt.
 
-## Сборка на Windows
+## Build on Windows
 
-Установите компилятор C++17, CMake и Qt 6 с модулем WebSockets. Если CMake не находит Qt, укажите путь к нему через `CMAKE_PREFIX_PATH`. Команды ниже рассчитаны на генератор Visual Studio.
+Install a C++17 compiler, CMake, and Qt 6 with WebSockets. If CMake cannot find Qt, set `CMAKE_PREFIX_PATH` to your Qt installation. These commands assume a Visual Studio generator.
 
 ```powershell
 cmake -S . -B build
@@ -52,42 +52,42 @@ cmake --build build --config Release
 .\build\bin\Release\bitrix24-client.exe --demo
 ```
 
-Настройки Qt и сборки для CI приведены в [GitHub Actions](.github/workflows/windows-build.yml).
+The [GitHub Actions workflow](.github/workflows/windows-build.yml) lists the Qt and build settings used in CI.
 
-## Проверки
+## Run the tests
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-При сборке генератором Visual Studio добавьте к команде CTest параметр `-C Release`.
+If you built with a Visual Studio generator, add `-C Release` to the CTest command.
 
 <details>
-<summary>Клавиатура и навигация</summary>
+<summary>Keyboard shortcuts and navigation</summary>
 
-- `Alt+1` открывает чаты, `Alt+2` — проекты, `Alt+3` — уведомления. `F5` обновляет текущий экран.
-- В области переписки `Ctrl+F` открывает поиск, `Enter` отправляет сообщение, `Shift+Enter` вставляет перенос строки. Нажатие на чат или `Enter` в списке чатов переводит фокус в поле ввода. Стрелки перемещают по истории, а набранный в ней текст попадает в черновик при доступной отправке.
-- Выделяйте текст мышью или клавишами `Shift` и стрелками. `Ctrl+C` копирует выделение. `Ctrl+A` выделяет всё сообщение, если курсор находится в его тексте. `Esc` сбрасывает выделение.
-- В чате прокрутка вверх или «Более ранние сообщения» загружают историю. «К последним сообщениям» возвращает в конец чата. Нажмите на строку закрепления, чтобы перейти к сообщению. Если закреплений несколько, соседняя кнопка открывает список.
-- Нажмите на реакцию под сообщением, чтобы поставить или снять её. Меню «⋯» открывает действия и выбор реакций. Часто используемые реакции идут первыми.
-- Команда «Редактировать…» открывает своё сообщение в поле ввода. `Enter` сохраняет правку, `Esc` отменяет её и возвращает черновик с цитатой.
-- В проекте кнопка «Ещё задачи» загружает следующую страницу выбранной стадии. При наличии системного трея закрытие окна оставляет Push&Pull подключённым. Пункт «Открыть Битрикс24» возвращает рабочее окно.
+- `Alt+1` opens chats, `Alt+2` opens projects, and `Alt+3` opens notifications. `F5` refreshes the current view.
+- In a conversation, `Ctrl+F` opens search, `Enter` sends the message, and `Shift+Enter` inserts a line break. Clicking a chat or pressing `Enter` in the chat list focuses the message composer. Use the arrow keys to navigate the message history. When sending is available, typing in the history adds text to the draft.
+- Select text with the mouse or with `Shift` and the arrow keys. `Ctrl+C` copies the selection. `Ctrl+A` selects the entire message when the cursor is inside its text. `Esc` clears the selection.
+- Scroll up or click **Earlier messages** to load more history. **Back to latest** takes you to the end of the conversation. Click the pinned-message banner to jump to that message. If there are several pins, use the adjacent button to open the list.
+- Click a reaction below a message to add or remove it. Open the **⋯** menu for message actions and more reactions. Your most-used reactions appear first.
+- Choose **Edit…** on one of your messages to open it in the composer. `Enter` saves the edit. `Esc` cancels it and restores the previous draft and any quoted message.
+- In a project, **More tasks** loads the next page for the selected stage. If a system tray is available, closing the window leaves Push&Pull connected. Choose **Open Bitrix24** from the tray to reopen the window.
 
 </details>
 
 <details>
-<summary>Диагностика подключения</summary>
+<summary>Connection diagnostics</summary>
 
-Параметр `--session-stdin` импортирует из приватного канала одну JSON-строку с полями `origin`, `cookie` и `csrf` и включает режим чтения. Дополнительный параметр `--probe` проверяет чтение и Push&Pull без окна. Код возврата `2` означает, что часть проверок не завершилась.
+The `--session-stdin` option reads a single JSON line containing `origin`, `cookie`, and `csrf` from a private input channel and starts the client in read-only mode. Add `--probe` to check read access and Push&Pull without opening a window. Exit code `2` means that some checks did not complete.
 
 </details>
 
-Используемые методы и форматы запросов описаны в [документации по взаимодействию с порталом](docs/contracts.md).
+See the [portal integration notes](docs/contracts.md) for the methods and request formats used by the client.
 
-## Неофициальный проект
+## Unofficial Project
 
-Проект независим от разработчика Битрикс24 и не получает его поддержки. Программа предоставляется «как есть», без гарантий. Авторы не несут ответственности за последствия её использования в пределах, допускаемых применимым законодательством.
+This independent project has no affiliation with or support from the developer of Bitrix24. The software is provided as is, without warranty. The authors disclaim liability for its use to the extent permitted by applicable law.
 
-## Лицензия
+## License
 
-Код проекта распространяется по [лицензии MIT](LICENSE). На Qt распространяются [собственные лицензионные условия](https://www.qt.io/development/qt-framework/qt-licensing).
+The project code is available under the [MIT License](LICENSE). Qt is subject to its [own licensing terms](https://www.qt.io/development/qt-framework/qt-licensing).
