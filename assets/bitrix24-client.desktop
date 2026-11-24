@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Bitrix24 Client
+Name[ru]=Клиент Битрикс24
+Comment=Chats, projects and tasks
+Comment[ru]=Чаты, проекты и задачи
+Exec=bitrix24-client
+Icon=bitrix24-client
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupNotify=true
+StartupWMClass=bitrix24-client

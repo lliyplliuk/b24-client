@@ -1,0 +1,25 @@
+# build/
+build*/
+*.user
+.cache/
+compile_commands.json
+
+# Local tools and environment
+/.claude/
+/.codex/
+/.local-qt/
+/AGENTS.md
+/CLAUDE.md
+/docs/verification.md
+.env
+.env.*
+!.env.example
+
+# Local SSH credentials
+/.ssh/
+id_dsa*
+id_ecdsa*
+id_ed25519*
+id_rsa*
+!id_*.pub
+*.ppk
