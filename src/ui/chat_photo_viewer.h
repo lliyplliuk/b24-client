@@ -1,18 +1,25 @@
 #pragma once
 
 #include "ui/loading_indicator.h"
+#include "ui/message_menu_window.h"
 
+#include <QApplication>
+#include <QContextMenuEvent>
 #include <QDialog>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointer>
 #include <QPushButton>
 #include <QScreen>
 #include <QShortcut>
 #include <QStackedWidget>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
+#include <QWindow>
 
 #include <functional>
 
@@ -29,7 +36,7 @@ public:
 
     void setOriginal(QImage image)
     {
-        m_photo = QPixmap::fromImage(std::move(image));
+        m_photo = std::move(image);
         m_zoom = 1.0;
         m_pan = {};
         m_dragging = false;
@@ -38,6 +45,7 @@ public:
     }
 
     QSize imageSize() const { return m_photo.size(); }
+    const QImage &image() const { return m_photo; }
     qreal zoomFactor() const { return m_zoom; }
     bool canZoomOut() const { return m_zoom > 1.0; }
     bool canZoomIn() const { return m_zoom < maximumZoom(); }
@@ -54,7 +62,7 @@ protected:
         painter.setRenderHint(QPainter::SmoothPixmapTransform);
         QRectF photo(QPointF{}, photoSize());
         photo.moveCenter(QRectF(rect()).center() + m_pan);
-        painter.drawPixmap(photo, m_photo, QRectF(m_photo.rect()));
+        painter.drawImage(photo, m_photo, QRectF(m_photo.rect()));
     }
 
     void resizeEvent(QResizeEvent *event) override
@@ -153,7 +161,7 @@ private:
         update();
     }
 
-    QPixmap m_photo;
+    QImage m_photo;
     qreal m_zoom = 1.0;
     QPointF m_pan;
     QPointF m_dragPoint;
@@ -161,15 +169,105 @@ private:
     std::function<void()> m_zoomChanged;
 };
 
+class PhotoViewerInput final : public QObject {
+public:
+    explicit PhotoViewerInput(QDialog &viewer)
+        : QObject(qApp), m_viewer(&viewer), m_owner(viewer.parentWidget()->window())
+    {
+        qApp->installEventFilter(this);
+        connect(&viewer, &QObject::destroyed, this, [this] {
+            m_viewer.clear();
+            retireIfIdle();
+        });
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        const auto type = event->type();
+        const bool press = type == QEvent::MouseButtonPress || type == QEvent::MouseButtonDblClick;
+        const bool release = type == QEvent::MouseButtonRelease;
+        const auto button = press || release ? static_cast<QMouseEvent *>(event)->button() : Qt::NoButton;
+        if (m_dismissedContextPending) {
+            // Qt sends the mouse context event separately, on press or release depending on the platform.
+            const bool dismissedContext = type == QEvent::ContextMenu
+                && static_cast<QContextMenuEvent *>(event)->reason() == QContextMenuEvent::Mouse
+                && m_owner && belongsTo(watched, *m_owner);
+            if (press || dismissedContext) {
+                m_dismissedContextPending = false;
+                retireIfIdle();
+                if (dismissedContext)
+                    return true;
+            }
+        }
+        // A chat row can act on release alone, after the viewer has already been destroyed.
+        if (m_dismissedButton != Qt::NoButton && button == m_dismissedButton) {
+            m_dismissedButton = Qt::NoButton;
+            retireIfIdle();
+            return release && m_owner && belongsTo(watched, *m_owner);
+        }
+        if (!press && !release && type != QEvent::Wheel && type != QEvent::ContextMenu
+            && type != QEvent::KeyPress && type != QEvent::KeyRelease
+            && type != QEvent::Shortcut && type != QEvent::ShortcutOverride)
+            return false;
+        if (!m_viewer || !m_viewer->isVisible() || !m_owner || belongsTo(watched, *m_viewer)
+            || !belongsTo(watched, *m_owner))
+            return false;
+        const auto *modal = QApplication::activeModalWidget();
+        if (press && (!modal || !belongsTo(modal, *m_viewer))) {
+            m_dismissedButton = button;
+            m_dismissedContextPending = button == Qt::RightButton;
+            // A release outside this application might never reach Qt.
+            QTimer::singleShot(30000, this, [this] {
+                m_dismissedButton = Qt::NoButton;
+                m_dismissedContextPending = false;
+                retireIfIdle();
+            });
+            m_viewer->reject();
+        }
+        return true;
+    }
+
+private:
+    void retireIfIdle()
+    {
+        if (!m_viewer && m_dismissedButton == Qt::NoButton && !m_dismissedContextPending)
+            deleteLater();
+    }
+
+    static bool belongsTo(const QObject *target, const QWidget &owner)
+    {
+        const auto *ownerWindow = owner.windowHandle();
+        for (auto *object = target; object; object = object->parent()) {
+            if (object == &owner)
+                return true;
+            // Native mouse events can reach a QWindow before being delivered to a widget.
+            for (auto *window = qobject_cast<const QWindow *>(object); window; window = window->transientParent()) {
+                if (window == ownerWindow)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    QPointer<QDialog> m_viewer;
+    QPointer<QWidget> m_owner;
+    Qt::MouseButton m_dismissedButton = Qt::NoButton;
+    bool m_dismissedContextPending = false;
+};
+
 class ChatPhotoDialog final : public QDialog {
 public:
-    ChatPhotoDialog(QWidget *parent, const QString &name, std::function<void()> download)
+    using SaveAction = std::function<void(const QImage &)>;
+
+    ChatPhotoDialog(QWidget *parent, const QString &name, SaveAction download)
         : QDialog(parent)
     {
         setObjectName(QStringLiteral("chatPhotoViewer"));
         setWindowTitle(name.isEmpty() ? QStringLiteral("Фотография") : name);
-        setWindowModality(Qt::WindowModal);
         setAttribute(Qt::WA_DeleteOnClose);
+        if (parent)
+            new PhotoViewerInput(*this);
         const auto *display = parent ? parent->screen() : screen();
         const auto available = display ? display->availableGeometry().size() : QSize(960, 620);
         resize(qMin(920, available.width() - 44), qMin(690, available.height() - 60));
@@ -198,6 +296,12 @@ public:
         m_viewport->addWidget(m_canvas);
         m_viewport->addWidget(m_state);
         m_viewport->setCurrentWidget(m_state);
+        for (auto *surface : {static_cast<QWidget *>(m_canvas), static_cast<QWidget *>(m_state)}) {
+            surface->setContextMenuPolicy(Qt::CustomContextMenu);
+            QObject::connect(surface, &QWidget::customContextMenuRequested, this, [this, surface](const QPoint &point) {
+                showImageMenu(surface->mapToGlobal(point));
+            });
+        }
         auto *photoRow = new QHBoxLayout;
         photoRow->setSpacing(6);
         m_previous = new QPushButton(QStringLiteral("‹"), this);
@@ -257,7 +361,7 @@ public:
         m_save->setAccessibleName(QStringLiteral("Сохранить оригинал фотографии"));
         QObject::connect(m_save, &QPushButton::clicked, this, [this] {
             if (m_download)
-                m_download();
+                m_download({});
         });
         toolbar->addWidget(m_save);
         auto *close = new QPushButton(QStringLiteral("Закрыть"), this);
@@ -269,10 +373,14 @@ public:
     }
 
     void setNavigationAction(std::function<void(int)> navigate) { m_navigate = std::move(navigate); }
-    void setSaveAction(std::function<void()> download) { m_download = std::move(download); }
+    void setSaveAction(SaveAction download) { m_download = std::move(download); }
 
     void setPhoto(const QString &name, qsizetype index, qsizetype count, bool hasOriginal)
     {
+        ++m_photoRevision;
+        if (m_imageMenu)
+            m_imageMenu->close();
+        m_hasOriginal = hasOriginal;
         setWindowTitle(name.isEmpty() ? QStringLiteral("Фотография") : name);
         m_previous->setVisible(count > 1);
         m_next->setVisible(count > 1);
@@ -308,6 +416,27 @@ public:
     }
 
 private:
+    void showImageMenu(const QPoint &point)
+    {
+        if (m_imageMenu)
+            m_imageMenu->close();
+        const auto samePhoto = [this, revision = m_photoRevision] { return isVisible() && revision == m_photoRevision; };
+        const bool ready = m_canvas->isVisible() && !m_canvas->image().isNull();
+        std::function<void()> download;
+        if (m_download && (m_hasOriginal || ready))
+            download = [this, samePhoto] {
+                if (samePhoto())
+                    m_download(m_canvas->image());
+            };
+        std::function<QImage()> copy;
+        if (ready)
+            copy = [this, samePhoto] { return samePhoto() && m_canvas->isVisible() ? m_canvas->image() : QImage(); };
+        auto *menu = createImageContextMenu(this, std::move(download), std::move(copy));
+        m_imageMenu = menu;
+        QObject::connect(this, &QDialog::finished, menu, &QMenu::close);
+        showMessageMenuWindow(*menu, QRect(point, QSize(1, 1)));
+    }
+
     QStackedWidget *m_viewport = nullptr;
     ChatPhotoCanvas *m_canvas = nullptr;
     QLabel *m_state = nullptr;
@@ -315,8 +444,11 @@ private:
     QPushButton *m_previous = nullptr;
     QPushButton *m_next = nullptr;
     QPushButton *m_save = nullptr;
+    QPointer<QMenu> m_imageMenu;
+    quint64 m_photoRevision = 0;
+    bool m_hasOriginal = false;
     std::function<void(int)> m_navigate;
-    std::function<void()> m_download;
+    SaveAction m_download;
     std::function<void()> m_refreshControls;
 };
 

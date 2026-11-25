@@ -2,12 +2,16 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QClipboard>
 #include <QCursor>
+#include <QImage>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QScreen>
 #include <QTimer>
+
+#include <utility>
 
 namespace bx::ui {
 namespace {
@@ -91,6 +95,32 @@ private:
 };
 
 } // namespace
+
+QMenu *createImageContextMenu(QWidget *parent, std::function<void()> download, std::function<QImage()> image)
+{
+    auto *menu = new QMenu(parent);
+    menu->setObjectName(QStringLiteral("imageContextMenu"));
+    menu->setToolTipsVisible(true);
+    QObject::connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+    auto *save = menu->addAction(QStringLiteral("Скачать изображение"));
+    save->setEnabled(bool(download));
+    if (download)
+        QObject::connect(save, &QAction::triggered, menu, std::move(download));
+    else
+        save->setToolTip(QStringLiteral("Изображение недоступно для скачивания"));
+    auto *copy = menu->addAction(QStringLiteral("Скопировать изображение"));
+    copy->setEnabled(bool(image));
+    if (image) {
+        QObject::connect(copy, &QAction::triggered, menu, [image = std::move(image)] {
+            const auto pixels = image();
+            if (!pixels.isNull())
+                QGuiApplication::clipboard()->setImage(pixels);
+        });
+    } else {
+        copy->setToolTip(QStringLiteral("Изображение ещё не загружено"));
+    }
+    return menu;
+}
 
 void showMessageMenuWindow(QMenu &menu, const QRect &globalAnchor)
 {

@@ -47,6 +47,7 @@ add_library(bxwidgets STATIC
     src/ui/main_window.h
     src/ui/main_window.cpp
     src/ui/chat_action_ui.cpp
+    src/ui/chat_video_previews.cpp
     src/ui/message_markup.cpp
     src/ui/message_menu_window.cpp
     src/ui/public_link_preview.cpp

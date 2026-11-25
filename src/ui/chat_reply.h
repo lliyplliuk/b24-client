@@ -1,7 +1,12 @@
 #pragma once
 
+#include <QImage>
 #include <QString>
 #include <QVector>
+
+#include <memory>
+
+class QTemporaryDir;
 
 namespace bx::ui {
 
@@ -22,15 +27,22 @@ struct ChatMention {
     }
 };
 
+struct ChatDraftImage {
+    std::shared_ptr<QTemporaryDir> directory;
+    QString path;
+    QImage thumbnail;
+};
+
 struct ChatDraft {
     QString text;
     ChatReply reply;
     QVector<ChatMention> mentions;
+    std::shared_ptr<const ChatDraftImage> image;
 
-    bool isEmpty() const { return text.isEmpty() && reply.id.isEmpty(); }
+    bool isEmpty() const { return text.isEmpty() && reply.id.isEmpty() && !image; }
     bool operator==(const ChatDraft &other) const
     {
-        return text == other.text && reply.id == other.reply.id && mentions == other.mentions;
+        return text == other.text && reply.id == other.reply.id && mentions == other.mentions && image == other.image;
     }
 };
 

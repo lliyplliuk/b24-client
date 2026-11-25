@@ -10,26 +10,36 @@
 #include "ui/workspace_style.h"
 #include "ui/workspace_presentation.h"
 
+#include <QBuffer>
 #include <QButtonGroup>
 #include <QClipboard>
 #include <QContextMenuEvent>
 #include <QCursor>
+#include <QDir>
 #include <QEvent>
+#include <QFile>
 #include <QFrame>
 #include <QGridLayout>
+#include <QHideEvent>
 #include <QHBoxLayout>
+#include <QImageReader>
+#include <QImageWriter>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QMenu>
+#include <QMimeData>
 #include <QPainterPath>
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QTextBlock>
+#include <QTextLayout>
+#include <QTemporaryDir>
 #include <QTimer>
 #include <QScrollBar>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 
@@ -335,23 +345,53 @@ public:
         m_stickyDay->setStyleSheet(QStringLiteral(
             "QLabel#chatStickyDay { color: #486961; background: #dce9e2; border-radius: 9px; }"));
         m_stickyDay->hide();
-        connect(model(), &QAbstractItemModel::rowsInserted, this, [this] { scheduleAlignment(); });
-        connect(model(), &QAbstractItemModel::rowsRemoved, this, [this] { scheduleAlignment(); });
-        connect(model(), &QAbstractItemModel::modelReset, this, [this] { scheduleAlignment(); });
-        connect(verticalScrollBar(), &QScrollBar::valueChanged, this, [this] {
+        const auto historyChanged = [this] {
+            m_wheelAnimation.stop();
+            scheduleAlignment();
+        };
+        connect(model(), &QAbstractItemModel::rowsInserted, this, historyChanged);
+        connect(model(), &QAbstractItemModel::rowsRemoved, this, historyChanged);
+        connect(model(), &QAbstractItemModel::modelReset, this, historyChanged);
+        auto *scroll = verticalScrollBar();
+        m_wheelAnimation.setDuration(120);
+        m_wheelAnimation.setEasingCurve(QEasingCurve::OutCubic);
+        connect(&m_wheelAnimation, &QVariantAnimation::stateChanged, this, [this](QAbstractAnimation::State state) {
+            if (state == QAbstractAnimation::Stopped)
+                m_olderOnWheelEnd = false;
+        });
+        connect(&m_wheelAnimation, &QVariantAnimation::valueChanged, this, [this, scroll](const QVariant &value) {
+            if (m_wheelAnimation.state() != QAbstractAnimation::Running)
+                return;
+            scroll->setValue(value.toInt());
+            if (m_olderOnWheelEnd && scroll->value() == scroll->minimum()) {
+                m_olderOnWheelEnd = false;
+                if (!m_failedOlder)
+                    requestOlder();
+            }
+        });
+        connect(scroll, &QScrollBar::rangeChanged, &m_wheelAnimation, &QVariantAnimation::stop);
+        connect(scroll, &QScrollBar::sliderPressed, &m_wheelAnimation, &QVariantAnimation::stop);
+        connect(scroll, &QScrollBar::valueChanged, this, [this](int value) {
+            if (m_wheelAnimation.currentValue().toInt() != value)
+                m_wheelAnimation.stop();
             clearMessageHover();
             updateStickyDay();
             if (m_onViewportChanged)
                 m_onViewportChanged();
         });
-        connect(verticalScrollBar(), &QScrollBar::actionTriggered, this, [this] { resumeReadAfterJump(); });
+        connect(scroll, &QScrollBar::actionTriggered, this, [this] {
+            m_wheelAnimation.stop();
+            resumeReadAfterJump();
+        });
     }
 
     void setOnViewportChanged(std::function<void()> handler) { m_onViewportChanged = std::move(handler); }
+    bool showingLiveHistory() const { return m_liveReadHistory && !m_browsingOlder; }
     void setLiveReadHistory(bool live)
     {
         m_liveReadHistory = live;
         if (!live) {
+            m_wheelAnimation.stop();
             if (m_openMessageMenu)
                 m_openMessageMenu->close();
             m_readPausedByJump = false;
@@ -831,9 +871,13 @@ protected:
             return;
         const auto index = model()->index(row(entry), 0);
         const auto *painter = static_cast<workspace::RowPainter *>(itemDelegate());
+        clearMessageHover();
+        if (!keyboard && painter->showPhotoMenuAt(index, viewportPoint)) {
+            event->accept();
+            return;
+        }
         const auto href = keyboard ? QString() : painter->linkAt(index, visualRect(index), viewportPoint);
         const auto point = keyboard ? viewport()->mapToGlobal(visualItemRect(entry).center()) : event->globalPos();
-        clearMessageHover();
         if (showMessageMenu(index, QRect(point, QSize(1, 1)), href))
             event->accept();
     }
@@ -914,6 +958,7 @@ protected:
 
     void hideEvent(QHideEvent *event) override
     {
+        m_wheelAnimation.stop();
         if (m_openMessageMenu)
             m_openMessageMenu->close();
         clearMessageHover();
@@ -944,6 +989,7 @@ protected:
         case Qt::Key_PageDown:
         case Qt::Key_Home:
         case Qt::Key_End:
+            m_wheelAnimation.stop();
             if (auto *delegate = textDelegate())
                 delegate->clearTextSelection();
             resumeReadAfterJump();
@@ -957,7 +1003,7 @@ protected:
             (!text.front().isPrint() && !text.front().isHighSurrogate())) {
             if (!(event->modifiers() & (disallowed | Qt::ShiftModifier)) &&
                 (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
-                openFocusedPhoto()) {
+                openFocusedMedia()) {
                 event->accept();
                 return;
             }
@@ -982,23 +1028,51 @@ protected:
     {
         clearMessageHover();
         resumeReadAfterJump();
+        auto *scroll = verticalScrollBar();
         const auto angle = event->angleDelta();
-        if (angle.y() > 0 && verticalScrollBar()->value() == verticalScrollBar()->minimum() && !m_failedOlder)
+        const bool towardStart = angle.y() != 0 && (angle.y() > 0) == scroll->invertedControls();
+        if (towardStart && scroll->value() == scroll->minimum() && !m_failedOlder)
             requestOlder();
         const bool detent = event->pixelDelta().isNull() && angle.x() == 0 && angle.y() != 0
             && angle.y() % QWheelEvent::DefaultDeltasPerStep == 0 && event->modifiers() == Qt::NoModifier
             && event->phase() == Qt::NoScrollPhase && event->deviceType() != QInputDevice::DeviceType::TouchPad;
         if (!detent) {
+            m_wheelAnimation.stop();
             QListWidget::wheelEvent(event);
             return;
         }
-        // Keep Qt's wheel-line preference and fractional scrolling for the smaller step.
-        QWheelEvent compact(event->position(), event->globalPosition(), {}, QPoint(0, angle.y() / 2),
-                            event->buttons(), event->modifiers(), event->phase(), event->inverted(),
-                            event->source(), event->pointingDevice());
-        compact.setTimestamp(event->timestamp());
-        QListWidget::wheelEvent(&compact);
-        event->setAccepted(compact.isAccepted());
+
+        const int page = scroll->pageStep();
+        const auto nativeNotch = qMin(qreal(page), qreal(scroll->singleStep()) * QApplication::wheelScrollLines());
+        if (nativeNotch <= 0) {
+            event->ignore();
+            return;
+        }
+        const auto notches = qAbs(angle.y()) / QWheelEvent::DefaultDeltasPerStep;
+        const int pixels = qMax(1, qRound(qMin(qreal(page), nativeNotch * notches / 8.0)));
+        const int step = towardStart ? -pixels : pixels;
+        const int current = scroll->value();
+        const bool running = m_wheelAnimation.state() == QAbstractAnimation::Running;
+        const int previousTarget = running ? m_wheelAnimation.endValue().toInt() : current;
+        // Keep pending distance for consecutive notches in one direction, and reverse from the visible position.
+        const bool sameDirection = step < 0 ? previousTarget < current : previousTarget > current;
+        const int base = sameDirection ? previousTarget : current;
+        const int target = int(qBound(qint64(scroll->minimum()), qint64(base) + step, qint64(scroll->maximum())));
+        if (target == current) {
+            m_wheelAnimation.stop();
+            event->ignore();
+            return;
+        }
+        if (!running || target != previousTarget) {
+            m_wheelAnimation.stop();
+            m_wheelAnimation.setStartValue(current);
+            m_wheelAnimation.setEndValue(target);
+            m_wheelAnimation.start();
+        } else if (towardStart && target == scroll->minimum()) {
+            // A further notch at the queued boundary asks for older history once we arrive.
+            m_olderOnWheelEnd = true;
+        }
+        event->accept();
     }
 
 private:
@@ -1128,6 +1202,7 @@ private:
 
     void clearHistoryWindow()
     {
+        m_wheelAnimation.stop();
         m_history.clear();
         m_pendingOlder.clear();
         m_scannedOlder = 0;
@@ -1274,8 +1349,7 @@ private:
         updateOlderButton();
     }
 
-    // Enter в сфокусированной истории открывает фотографию так же, как клик мышью.
-    bool openFocusedPhoto()
+    bool openFocusedMedia()
     {
         auto *entry = currentItem();
         if (!entry)
@@ -1283,7 +1357,7 @@ private:
         auto *delegate = static_cast<workspace::RowPainter *>(itemDelegate());
         if (!delegate)
             return false;
-        return delegate->activateImage(model()->index(row(entry), 0));
+        return delegate->activateMedia(model()->index(row(entry), 0));
     }
 
     void sendToComposer(QEvent *event)
@@ -1316,6 +1390,8 @@ private:
         });
     }
 
+    QVariantAnimation m_wheelAnimation;
+    bool m_olderOnWheelEnd = false;
     bool m_queued = false;
     bool m_liveReadHistory = false;
     bool m_readPausedByJump = false;
@@ -1545,11 +1621,24 @@ private:
     EmojiTile *m_first = nullptr;
 };
 
+inline bool validChatClipboardImageSize(const QSize &size)
+{
+    constexpr qint64 maxPixels = 12 * 1024 * 1024;
+    return !size.isEmpty() && size.width() <= 8192 && size.height() <= 8192
+        && qint64(size.width()) * size.height() <= maxPixels;
+}
+
 class ChatTextEdit final : public QPlainTextEdit {
 public:
-    explicit ChatTextEdit(QWidget *parent) : QPlainTextEdit(parent) {}
+    explicit ChatTextEdit(QWidget *parent) : QPlainTextEdit(parent)
+    {
+        setFixedHeight(singleLineHeight);
+        connect(this, &QPlainTextEdit::textChanged, this, [this] { scheduleHeightUpdate(); });
+    }
     bool composing() const { return m_preedit; }
     std::function<void()> userEdited;
+    std::function<bool()> mayPasteImage;
+    std::function<void(const QImage &)> imagePasted;
 
     void setSingleLinePlaceholder(const QString &text)
     {
@@ -1558,17 +1647,56 @@ public:
     }
 
 protected:
+    bool canInsertFromMimeData(const QMimeData *source) const override
+    {
+        const bool image = source->hasImage() || source->hasFormat(QStringLiteral("image/png"));
+        return (acceptsImagePaste() && image) || QPlainTextEdit::canInsertFromMimeData(source);
+    }
+
+    void insertFromMimeData(const QMimeData *source) override
+    {
+        const bool rawPng = source->hasFormat(QStringLiteral("image/png"));
+        if (acceptsImagePaste() && (rawPng || source->hasImage())) {
+            QImage image;
+            if (rawPng) {
+                const auto bytes = source->data(QStringLiteral("image/png"));
+                if (!bytes.isEmpty() && bytes.size() <= tunables::kChatClipboardPngBytes) {
+                    QBuffer buffer;
+                    buffer.setData(bytes);
+                    buffer.open(QIODevice::ReadOnly);
+                    QImageReader reader(&buffer, "png");
+                    if (validChatClipboardImageSize(reader.size()))
+                        image = reader.read();
+                }
+            } else {
+                const auto data = source->imageData();
+                image = qvariant_cast<QImage>(data);
+                if (image.isNull())
+                    image = qvariant_cast<QPixmap>(data).toImage();
+            }
+            if (!image.isNull() || !(source->hasText() || source->hasHtml())) {
+                imagePasted(image);
+                return;
+            }
+        }
+        QPlainTextEdit::insertFromMimeData(source);
+    }
+
     void resizeEvent(QResizeEvent *event) override
     {
         QPlainTextEdit::resizeEvent(event);
         updatePlaceholder();
+        if (event->size().width() != event->oldSize().width())
+            scheduleHeightUpdate();
     }
 
     void changeEvent(QEvent *event) override
     {
         QPlainTextEdit::changeEvent(event);
-        if (event->type() == QEvent::FontChange || event->type() == QEvent::StyleChange)
+        if (event->type() == QEvent::FontChange || event->type() == QEvent::StyleChange) {
             updatePlaceholder();
+            scheduleHeightUpdate();
+        }
     }
 
     void keyPressEvent(QKeyEvent *event) override
@@ -1590,6 +1718,32 @@ protected:
     }
 
 private:
+    bool acceptsImagePaste() const
+    {
+        return !isReadOnly() && imagePasted && mayPasteImage && mayPasteImage();
+    }
+
+    static constexpr int singleLineHeight = 43;
+    static constexpr int maximumVisibleLines = 6;
+
+    void scheduleHeightUpdate()
+    {
+        if (m_heightUpdatePending)
+            return;
+        m_heightUpdatePending = true;
+        QTimer::singleShot(0, this, [this] {
+            m_heightUpdatePending = false;
+            int lines = 0;
+            for (auto block = document()->begin(); block.isValid() && lines < maximumVisibleLines; block = block.next()) {
+                blockBoundingRect(block);
+                lines += qMax(1, block.layout()->lineCount());
+            }
+            const int target = singleLineHeight + (qBound(1, lines, maximumVisibleLines) - 1) * fontMetrics().lineSpacing();
+            if (target != minimumHeight())
+                setFixedHeight(target);
+        });
+    }
+
     void updatePlaceholder()
     {
         const int width = qMax(0, qFloor(viewport()->width() - 2 * document()->documentMargin()));
@@ -1598,6 +1752,7 @@ private:
 
     QString m_fullPlaceholder;
     bool m_preedit = false;
+    bool m_heightUpdatePending = false;
 };
 
 class ChatComposer final : public QFrame {
@@ -1644,12 +1799,36 @@ public:
         outer->addWidget(m_quote);
         m_quote->hide();
 
+        m_imageRow = new QFrame(this);
+        m_imageRow->setObjectName(QStringLiteral("composerPastedImage"));
+        m_imageRow->setStyleSheet(QStringLiteral("QFrame#composerPastedImage {background:#e8f1ee;border-radius:5px;}"));
+        auto *imageRow = new QHBoxLayout(m_imageRow);
+        imageRow->setContentsMargins(8, 4, 4, 4);
+        m_imagePreview = new QLabel(m_imageRow);
+        m_imagePreview->setAccessibleName(QStringLiteral("Изображение из буфера"));
+        m_imagePreview->setAlignment(Qt::AlignCenter);
+        m_imagePreview->setFixedSize(80, 52);
+        imageRow->addWidget(m_imagePreview);
+        auto *filename = workspace::label(pastedImageName(), "quiet", m_imageRow);
+        filename->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        imageRow->addWidget(filename, 1);
+        auto *removeImage = new GlyphButton(Glyph::Close, QStringLiteral("Удалить изображение из черновика"), m_imageRow);
+        imageRow->addWidget(removeImage);
+        connect(removeImage, &QPushButton::clicked, this, [this] {
+            clearDraftImage();
+            m_input->setFocus(Qt::OtherFocusReason);
+        });
+        outer->addWidget(m_imageRow);
+        m_imageRow->hide();
+
         auto *layout = new QHBoxLayout;
         layout->setSpacing(4);
         outer->addLayout(layout);
         m_file = new GlyphButton(Glyph::Attach, fileName, this);
         layout->addWidget(m_file, 0, Qt::AlignBottom);
         m_input = new ChatTextEdit(this);
+        m_input->mayPasteImage = [this] { return !editingMessage(); };
+        m_input->imagePasted = [this](const QImage &image) { stageImage(image); };
         m_input->userEdited = [this] {
             if (editingMessage() || !m_typingScope || m_typingDelay.isActive())
                 return;
@@ -1661,7 +1840,6 @@ public:
         m_input->setAccessibleName(inputName);
         setPlaceholderText(QStringLiteral("Напишите сообщение"));
         m_input->setToolTip(QStringLiteral("Enter — отправить, Shift+Enter — новая строка"));
-        m_input->setFixedHeight(43);
         m_input->setTabChangesFocus(true);
         m_input->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
         m_input->setFrameShape(QFrame::NoFrame);
@@ -1709,6 +1887,18 @@ public:
     QPushButton *emoji() const { return m_emoji; }
     QPushButton *send() const { return m_send; }
     const ChatReply &reply() const { return m_reply; }
+    bool hasDraftImage() const { return bool(m_image); }
+    void clearDraftImage() { setDraftImage({}); }
+    void forgetDraftImages()
+    {
+        m_preEditDraft.image.reset();
+        clearDraftImage();
+    }
+    void setImageDraftHandlers(std::function<void()> changed, std::function<void(const QString &)> error)
+    {
+        m_onImageChanged = std::move(changed);
+        m_onImageError = std::move(error);
+    }
     bool composing() const { return m_input->composing(); }
     bool editingMessage() const { return !m_editId.isEmpty(); }
     bool messageEditPending() const { return m_editPending; }
@@ -1717,6 +1907,7 @@ public:
         return editingMessage() && m_editDialog == dialog && m_editId == id;
     }
     void setEditStateChanged(std::function<void()> callback) { m_onEditStateChanged = std::move(callback); }
+    void setEditLatest(std::function<bool()> callback) { m_onEditLatest = std::move(callback); }
     void beginMessageEdit(const QString &dialog, const QString &id, const QString &text,
                           std::function<void(const QString &)> submit)
     {
@@ -1737,7 +1928,6 @@ public:
         m_cancelQuote->setAccessibleName(QStringLiteral("Отменить редактирование сообщения"));
         m_cancelQuote->setToolTip(QStringLiteral("Отменить редактирование (Escape)"));
         m_input->setToolTip(QStringLiteral("Enter — сохранить, Shift+Enter — новая строка, Escape — отменить"));
-        m_input->setFixedHeight(92);
         setDraft({text, {}, {}});
         m_input->moveCursor(QTextCursor::End);
         m_input->setFocus(Qt::OtherFocusReason);
@@ -1784,7 +1974,6 @@ public:
         m_cancelQuote->setAccessibleName(QStringLiteral("Отменить ответ"));
         m_cancelQuote->setToolTip(QStringLiteral("Отменить ответ"));
         m_input->setToolTip(QStringLiteral("Enter — отправить, Shift+Enter — новая строка"));
-        m_input->setFixedHeight(43);
         const auto saved = std::exchange(m_preEditDraft, {});
         setDraft(saved);
         auto cursor = m_input->textCursor();
@@ -1870,6 +2059,10 @@ public:
     {
         if (handleMentionKey(event))
             return true;
+        if (event->key() == Qt::Key_Up && event->modifiers() == Qt::NoModifier
+            && !composing() && !editingMessage() && !m_mentions->isVisible()
+            && m_input->document()->isEmpty() && m_reply.id.isEmpty() && !hasDraftImage() && m_onEditLatest)
+            return m_onEditLatest();
         return event->key() == Qt::Key_Escape && cancelMessageEdit();
     }
     void dismissMentionSearch()
@@ -1878,7 +2071,7 @@ public:
         m_mentions->dismiss();
         m_candidate = {};
     }
-    ChatDraft draft() const { return {m_input->toPlainText(), m_reply, mentionSpans()}; }
+    ChatDraft draft() const { return {m_input->toPlainText(), m_reply, mentionSpans(), m_image}; }
     QString wireText() const
     {
         auto text = m_input->toPlainText();
@@ -1909,6 +2102,7 @@ public:
         m_input->setUndoRedoEnabled(undoEnabled);
         m_loadingDraft = false;
         setReply(draft.reply);
+        setDraftImage(draft.image);
     }
     void dismissEmoji()
     {
@@ -2036,7 +2230,63 @@ private:
         dismissMentionSearch();
     }
 
+    static QString pastedImageName() { return QStringLiteral("Из буфера.png"); }
+
+    void stageImage(const QImage &image)
+    {
+        const auto failure = [this](const QString &message) {
+            if (m_onImageError)
+                m_onImageError(message);
+        };
+        if (image.isNull() || !validChatClipboardImageSize(image.size())) {
+            failure(QStringLiteral("Не удалось вставить изображение. Размер или формат не поддерживается."));
+            return;
+        }
+        QByteArray png;
+        QBuffer buffer(&png);
+        buffer.open(QIODevice::WriteOnly);
+        QImageWriter writer(&buffer, "png");
+        writer.setCompression(60);
+        const auto source = image.convertToFormat(image.hasAlphaChannel() ? QImage::Format_ARGB32 : QImage::Format_RGB32);
+        if (source.isNull() || !writer.write(source)) {
+            failure(QStringLiteral("Не удалось подготовить изображение для отправки"));
+            return;
+        }
+        if (png.size() > tunables::kChatClipboardPngBytes) {
+            failure(QStringLiteral("Изображение после сжатия превышает 16 МиБ"));
+            return;
+        }
+        auto directory = std::make_shared<QTemporaryDir>(QDir::temp().filePath(QStringLiteral("bitrix24-chat-XXXXXX")));
+        const auto path = directory->filePath(pastedImageName());
+        QFile output(path);
+        if (!directory->isValid() || !output.open(QIODevice::WriteOnly | QIODevice::NewOnly)
+            || output.write(png) != png.size() || !output.flush()) {
+            failure(QStringLiteral("Не удалось подготовить изображение для отправки"));
+            return;
+        }
+        output.close();
+        auto thumbnail = source.scaled(m_imagePreview->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        thumbnail.setDevicePixelRatio(1);
+        setDraftImage(std::make_shared<ChatDraftImage>(ChatDraftImage{std::move(directory), path, thumbnail}));
+    }
+
+    void setDraftImage(std::shared_ptr<const ChatDraftImage> image)
+    {
+        if (m_image == image)
+            return;
+        m_image = std::move(image);
+        m_imagePreview->setPixmap(m_image ? QPixmap::fromImage(m_image->thumbnail) : QPixmap{});
+        m_imageRow->setVisible(bool(m_image));
+        if (m_onImageChanged)
+            m_onImageChanged();
+    }
+
     ChatTextEdit *m_input = nullptr;
+    QFrame *m_imageRow = nullptr;
+    QLabel *m_imagePreview = nullptr;
+    std::shared_ptr<const ChatDraftImage> m_image;
+    std::function<void()> m_onImageChanged;
+    std::function<void(const QString &)> m_onImageError;
     QLabel *m_typing = nullptr;
     QTimer m_typingExpiry;
     QTimer m_typingDelay;
@@ -2062,6 +2312,7 @@ private:
     QString m_editSubmitted;
     bool m_editPending = false;
     std::function<void()> m_onEditStateChanged;
+    std::function<bool()> m_onEditLatest;
     std::function<void(const QString &)> m_submitEdit;
 };
 

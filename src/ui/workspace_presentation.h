@@ -132,7 +132,23 @@ inline void presentMessages(QListWidget *list, QLabel *state, const QVector<Mess
             : (message.author.isEmpty() ? QStringLiteral("Участник") : message.author);
         const auto meta = clockLabel(message.createdAt);
         const auto title = grouped || message.outgoing || message.system ? QString() : author;
-        auto *item = workspace::addMarkupRow(list, title, message.text, meta,
+        const bool nativeReply = !message.replyId.isEmpty() || !message.replyAuthor.isEmpty() ||
+                                 !message.replyText.isEmpty() || !message.replyFiles.isEmpty();
+        const auto legacyQuote = workspace::leadingAttributedMessageQuote(message.text);
+        const auto *replySource = nativeReply ? replySources.value(message.replyId) : nullptr;
+        const auto &replyFiles = message.replyFiles.isEmpty() && replySource ? replySource->files : message.replyFiles;
+        QString replyAuthor;
+        QString replyExcerpt;
+        if (nativeReply) {
+            replyAuthor = workspace::markupPlainText(message.replyAuthor.left(512)).simplified();
+            if (replyAuthor.isEmpty() && replySource)
+                replyAuthor = replySource->outgoing ? QStringLiteral("Вы") : replySource->author.simplified();
+            const auto &rawQuote = message.replyText.isEmpty() && replySource ? replySource->text : message.replyText;
+            replyExcerpt = workspace::markupPlainText(rawQuote.left(1024)).simplified().left(240);
+        }
+        const bool splitQuote = legacyQuote && (!nativeReply
+            || (legacyQuote->author == replyAuthor && legacyQuote->excerpt == replyExcerpt));
+        auto *item = workspace::addMarkupRow(list, title, splitQuote ? legacyQuote->body : message.text, meta,
                                               message.id.isEmpty() ? QString::number(i + 1) : message.id);
         if (!title.isEmpty())
             item->setData(workspace::AvatarUrl, message.authorAvatarUrl);
@@ -145,29 +161,25 @@ inline void presentMessages(QListWidget *list, QLabel *state, const QVector<Mess
             item->setData(workspace::ForwardByline, byline);
             context.append(byline);
         }
-        if (!message.replyId.isEmpty() || !message.replyAuthor.isEmpty() ||
-            !message.replyText.isEmpty() || !message.replyFiles.isEmpty()) {
-            const auto *source = replySources.value(message.replyId);
-            const auto &replyFiles = message.replyFiles.isEmpty() && source ? source->files : message.replyFiles;
+        if (nativeReply) {
             item->setData(workspace::ReplyFiles, QVariant::fromValue(replyFiles));
-            auto replyAuthor = workspace::markupPlainText(message.replyAuthor.left(512)).simplified();
-            if (replyAuthor.isEmpty() && source)
-                replyAuthor = source->outgoing ? QStringLiteral("Вы") : source->author.simplified();
             const auto byline = replyAuthor.isEmpty() ? QStringLiteral("Ответ на сообщение")
                                                      : QStringLiteral("Ответ · %1").arg(replyAuthor);
-            const auto rawQuote = message.replyText.isEmpty() && source ? source->text : message.replyText;
-            auto quote = workspace::markupPlainText(rawQuote.left(1024)).simplified().left(240);
-            if (quote.isEmpty() && (!replyFiles.isEmpty() || (source && !source->attachments.isEmpty())))
-                quote = QStringLiteral("Вложение");
-            if (quote.isEmpty())
-                quote = message.replyId.isEmpty() ? QStringLiteral("Исходное сообщение недоступно")
+            if (replyExcerpt.isEmpty() && (!replyFiles.isEmpty() || (replySource && !replySource->attachments.isEmpty())))
+                replyExcerpt = QStringLiteral("Вложение");
+            if (replyExcerpt.isEmpty())
+                replyExcerpt = message.replyId.isEmpty() ? QStringLiteral("Исходное сообщение недоступно")
                     : QStringLiteral("Сообщение №%1").arg(message.replyId);
             item->setData(workspace::ReplyTargetId, portalTaskIdentifier(message.replyId));
             item->setData(workspace::ReplyByline, byline);
-            item->setData(workspace::ReplyPreview, quote);
-            context.append(byline + QStringLiteral(". ") + quote);
+            item->setData(workspace::ReplyPreview, replyExcerpt);
+            context.append(byline + QStringLiteral(". ") + replyExcerpt);
             for (const auto &file : replyFiles)
                 context.append(file.name);
+        } else if (splitQuote) {
+            item->setData(workspace::ReplyByline, legacyQuote->author);
+            item->setData(workspace::ReplyPreview, legacyQuote->excerpt);
+            context.append(legacyQuote->author + QStringLiteral(". ") + legacyQuote->excerpt);
         }
         if (unreadBoundary) {
             firstUnread = item;
@@ -187,8 +199,8 @@ inline void presentMessages(QListWidget *list, QLabel *state, const QVector<Mess
             files.removeAll(attachmentNames({file.name}).value(0));
             context.append(file.name);
         }
-        if (!files.isEmpty()) {
-            const auto fileText = QStringLiteral("Вложения: %1").arg(files.join(QStringLiteral(", ")));
+        const auto fileText = files.isEmpty() ? QString() : QStringLiteral("Вложения: %1").arg(files.join(QStringLiteral(", ")));
+        if (!fileText.isEmpty()) {
             if (!plain.isEmpty())
                 plain += QLatin1Char('\n');
             plain += fileText;
@@ -196,7 +208,13 @@ inline void presentMessages(QListWidget *list, QLabel *state, const QVector<Mess
             if (!html.isEmpty())
                 item->setData(workspace::MarkupHtml, html + QStringLiteral("<br>") + fileText.toHtmlEscaped());
             item->setData(workspace::Detail, plain);
-            auto visible = QStringList{title, plain, meta};
+        }
+        if (splitQuote || !fileText.isEmpty()) {
+            // The delegate paints the split body, while the item retains the full text for whole-row consumers.
+            auto listText = splitQuote ? workspace::markupPlainText(message.text) : plain;
+            if (splitQuote && !fileText.isEmpty())
+                listText += QLatin1Char('\n') + fileText;
+            auto visible = QStringList{title, listText, meta};
             visible.removeAll(QString());
             item->setText(visible.join(QLatin1Char('\n')));
         }

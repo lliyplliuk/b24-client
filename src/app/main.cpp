@@ -25,6 +25,7 @@
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <QTranslator>
+#include <QWindow>
 #include <algorithm>
 #include <cstdio>
 #include <optional>
@@ -473,19 +474,21 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
             }
         });
     }
-    if (cloud) {
-        QObject::connect(&app, &QGuiApplication::applicationStateChanged, &tray, [&](Qt::ApplicationState state) {
-            cloud->setForeground(window && window->isVisible() && state == Qt::ApplicationActive);
-        });
-    }
+    const auto updateWorkspaceActivity = [&] {
+        const auto *native = window ? window->windowHandle() : nullptr;
+        const bool visible = native && native->isVisible() && native->visibility() != QWindow::Minimized;
+        cloud->setWorkspaceVisible(visible);
+        cloud->setForeground(visible && app.applicationState() == Qt::ApplicationActive);
+    };
+    if (cloud)
+        QObject::connect(&app, &QGuiApplication::applicationStateChanged, &tray, updateWorkspaceActivity);
     const auto showWindow = [&] {
         if (loggedOut)
             return;
-        if (!window) {
-            if (cloud) {
+        const bool creating = !window;
+        if (creating) {
+            if (cloud)
                 cloud->setActiveSection(0);
-                cloud->setForeground(app.applicationState() == Qt::ApplicationActive);
-            }
             window = new MainWindow(&backend, readOnly);
             window->setLogoutAvailable(!logoutPortal.isEmpty());
             QObject::connect(window, &MainWindow::logoutRequested, &tray, [&] {
@@ -515,6 +518,7 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
                 QObject::connect(window, &MainWindow::historyClosed, cloud, &CloudBackend::clearOpenHistory);
                 QObject::connect(window, &QObject::destroyed, cloud, [cloud] {
                     cloud->setForeground(false);
+                    cloud->setWorkspaceVisible(false);
                     cloud->clearOpenHistory(false);
                     cloud->clearOpenHistory(true);
                 });
@@ -536,12 +540,14 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
             }
         }
         window->showNormal();
+        if (cloud && creating && window->windowHandle())
+            QObject::connect(window->windowHandle(), &QWindow::visibilityChanged, &tray, updateWorkspaceActivity);
         window->raise();
         window->activateWindow();
         if (recovery == Recovery::WaitingForWindow)
             QTimer::singleShot(0, &tray, startPassiveSignin);
         if (cloud)
-            cloud->setForeground(app.applicationState() == Qt::ApplicationActive);
+            updateWorkspaceActivity();
     };
 
     if (QSystemTrayIcon::isSystemTrayAvailable()) {

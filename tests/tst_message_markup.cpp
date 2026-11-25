@@ -17,6 +17,7 @@ private slots:
     void decodesOfficialMarkup_data();
     void decodesOfficialMarkup();
     void rendersBbCodeQuotesInTaskContent();
+    void presentsLeadingAttributedChatQuoteSeparately();
     void timestampMatchesLocalTime();
     void paintsSafeRichContent();
     void keepsEmojiClustersAndMarkup();
@@ -110,6 +111,77 @@ void MessageMarkupTest::rendersBbCodeQuotesInTaskContent()
     QCOMPARE(markupPlainText(unbalanced), unbalanced);
     const auto mixed = u"[QUOTE]Открытая цитата\n------------------------------------------------------\nТекст[/QUOTE]"_s;
     QVERIFY(!parseMessageMarkup(mixed).html.contains(u"<blockquote"));
+}
+
+void MessageMarkupTest::presentsLeadingAttributedChatQuoteSeparately()
+{
+    using namespace Qt::StringLiterals;
+    using namespace bx::workspace;
+    const auto divider = u"------------------------------------------------------"_s;
+    const auto quote = divider + u"[BR]FrozaSupport [сегодня, 13:54] #chat7/1[BR]"
+        u"[B]Цитата[/B] [URL=https://quoted.example.test/]ссылка[/URL][BR]"_s + divider;
+    const auto body = u"[B]Ответ[/B] [URL=/company/personal/user/7/tasks/task/view/42/]Задача[/URL]"_s;
+    const auto source = quote + u"[BR]"_s + body;
+    QListWidget history;
+    configureRows(&history, Row::Message);
+    QLabel status;
+    bx::Message chat;
+    chat.id = u"51"_s;
+    chat.text = source;
+    bx::ui::presentMessages(&history, &status, {chat});
+    const auto *item = history.item(0);
+    QCOMPARE(item->data(ReplyByline).toString(), u"FrozaSupport"_s);
+    QCOMPARE(item->data(ReplyPreview).toString(), u"Цитата ссылка"_s);
+    QVERIFY(item->data(ReplyTargetId).toString().isEmpty());
+    QCOMPARE(item->data(Detail).toString(), u"Ответ Задача"_s);
+    QCOMPARE(item->data(MessageLinks).toStringList(), QStringList{u"/company/personal/user/7/tasks/task/view/42/"_s});
+    QCOMPARE(item->data(RawMessageBody).toString(), source);
+    QVERIFY(item->text().contains(u"Цитата ссылка"));
+    QVERIFY(markupPlainText(source).contains(u"FrozaSupport [сегодня, 13:54]\nЦитата ссылка"));
+
+    chat.replyId = u"32"_s;
+    chat.replyAuthor = u"Участник"_s;
+    chat.replyText = u"Родная цитата"_s;
+    bx::ui::presentMessages(&history, &status, {chat});
+    item = history.item(0);
+    QCOMPARE(item->data(ReplyTargetId).toString(), u"32"_s);
+    QCOMPARE(item->data(ReplyPreview).toString(), u"Родная цитата"_s);
+    QVERIFY(item->data(Detail).toString().contains(u"Цитата ссылка"));
+
+    chat.replyAuthor = u"FrozaSupport"_s;
+    chat.replyText = u"Цитата ссылка"_s;
+    bx::ui::presentMessages(&history, &status, {chat});
+    item = history.item(0);
+    QCOMPARE(item->data(ReplyTargetId).toString(), u"32"_s);
+    QCOMPARE(item->data(ReplyPreview).toString(), u"Цитата ссылка"_s);
+    QCOMPARE(item->data(Detail).toString(), u"Ответ Задача"_s);
+
+    chat.replyId.clear();
+    chat.replyAuthor.clear();
+    chat.replyText.clear();
+    chat.text = QString(source).replace(u"[BR]"_s, u"\r\n"_s)
+                               .replace(u"FrozaSupport"_s, u"[USER=7]FrozaSupport[/USER]"_s);
+    bx::ui::presentMessages(&history, &status, {chat});
+    QCOMPARE(history.item(0)->data(ReplyByline).toString(), u"FrozaSupport"_s);
+
+    const auto invalid = QStringList{
+        u"До цитаты[BR]"_s + source,
+        quote.chopped(divider.size()) + u"[BR]"_s + body,
+        divider + u"[BR]Автор [не дата][BR]Цитата[BR]"_s + divider + u"[BR]"_s + body,
+        divider + u"[BR]Автор [13:54][BR][QUOTE]Вложенная цитата[/QUOTE][BR]"_s + divider + u"[BR]"_s + body,
+        divider + u"[BR]Автор [13:54][BR]Текст "_s + divider + u"[BR]"_s + body,
+        quote + u"Текст на той же строке"_s,
+        quote,
+        quote + u"[BR][BR] "_s,
+        u"[CODE]"_s + source + u"[/CODE]"_s,
+    };
+    for (const auto &markup : invalid) {
+        chat.text = markup;
+        bx::ui::presentMessages(&history, &status, {chat});
+        item = history.item(0);
+        QVERIFY(item->data(ReplyByline).toString().isEmpty());
+        QCOMPARE(item->data(Detail).toString(), markupPlainText(markup));
+    }
 }
 
 void MessageMarkupTest::keepsBothPaddedLinkCardsClickable()
@@ -571,11 +643,13 @@ void MessageMarkupTest::renderedPhotoUsesOnlyItsThumbnailHeight()
     main->setData(MessageFiles, QVariant::fromValue(QVector<bx::MessageFile>{file}));
     auto *quoted = addMarkupRow(&list, {}, u"Ответ"_s, u"15:21"_s, u"2"_s);
     quoted->setData(ReplyByline, u"Ответ на сообщение"_s);
+    quoted->setData(ReplyTargetId, u"1"_s);
     auto replyPhoto = photo;
     replyPhoto.name = u"reply-photo.png"_s;
     replyPhoto.downloadUrl = QUrl(u"https://example.test/reply-original.png"_s);
     auto *painter = static_cast<RowPainter *>(list.itemDelegate());
     QList<QUrl> menus, viewed, directDownloads;
+    QStringList replyTargets;
     painter->setMessagePhotoMenuHandler([&menus](const QModelIndex &, const bx::MessageFile &file, const QRect &) {
         menus.append(file.downloadUrl);
     });
@@ -583,6 +657,7 @@ void MessageMarkupTest::renderedPhotoUsesOnlyItsThumbnailHeight()
     painter->setMessageDownloadHandler([&directDownloads](const bx::MessageFile &file) {
         directDownloads.append(file.downloadUrl);
     });
+    painter->setReplyNavigation([&replyTargets](const QString &id) { replyTargets.append(id); });
     QPixmap pixmap;
     painter->setMessagePreviewSource([&](const QUrl &url) { return url == photo.previewUrl ? &pixmap : nullptr; });
     list.show();
@@ -598,13 +673,15 @@ void MessageMarkupTest::renderedPhotoUsesOnlyItsThumbnailHeight()
     pixmap.fill(QColor("#528eb1"));
     const auto index = list.model()->index(0, 0);
     const int mainWidth = painter->receiptArea(index, list.visualItemRect(main)).width() - 20;
-    const auto quoteIndex = list.model()->index(1, 0);
-    const int quoteWidth = painter->receiptArea(quoteIndex, list.visualItemRect(quoted)).width() - 32;
     constexpr int thumbnailGap = 5;
     QCOMPARE(savedHeight(main) - mainWithoutPhoto,
              bx::ui::chatPreviewDisplaySize(photo.previewSize, mainWidth).height() + thumbnailGap);
-    QCOMPARE(savedHeight(quoted) - quotedWithoutPhoto,
-             bx::ui::chatPreviewDisplaySize(photo.previewSize, quoteWidth).height() + thumbnailGap);
+    const auto compactQuoteHeight = savedHeight(quoted);
+    QVERIFY(compactQuoteHeight > quotedWithoutPhoto);
+    QVERIFY(compactQuoteHeight - quotedWithoutPhoto < bx::ui::chatPreviewDisplaySize(photo.previewSize, mainWidth).height());
+    replyPhoto.previewSize = QSize(80, 200);
+    quoted->setData(ReplyFiles, QVariant::fromValue(QVector<bx::MessageFile>{replyPhoto}));
+    QCOMPARE(savedHeight(quoted), compactQuoteHeight);
     list.doItemsLayout();
     const auto image = list.viewport()->grab().toImage();
     const auto shot = qEnvironmentVariable("B24_PHOTO_ATTACHMENT_SCREENSHOT");
@@ -619,15 +696,19 @@ void MessageMarkupTest::renderedPhotoUsesOnlyItsThumbnailHeight()
                     painted = painted.united(QRect(x, y, 1, 1));
         return painted;
     };
-    for (auto *item : {main, quoted}) {
-        const auto bounds = previewBounds(item);
-        QVERIFY(bounds.width() >= 70 && bounds.height() >= 54);
-        QTest::mouseMove(list.viewport(), bounds.topRight() + QPoint(-14, 16));
-        QCOMPARE(list.viewport()->cursor().shape(), Qt::PointingHandCursor);
-        QTest::mouseClick(list.viewport(), Qt::LeftButton, {}, bounds.topRight() + QPoint(-14, 16));
-        QTest::mouseClick(list.viewport(), Qt::LeftButton, {}, bounds.center());
-    }
-    QCOMPARE(menus, QList<QUrl>({photo.downloadUrl, replyPhoto.downloadUrl}));
+    const auto mainBounds = previewBounds(main);
+    QVERIFY(mainBounds.width() >= 70 && mainBounds.height() >= 54);
+    const auto menuPoint = mainBounds.topRight() + QPoint(-14, 16);
+    QTest::mouseMove(list.viewport(), menuPoint);
+    QCOMPARE(list.viewport()->cursor().shape(), Qt::PointingHandCursor);
+    QTest::mouseClick(list.viewport(), Qt::LeftButton, {}, menuPoint);
+    QTest::mouseClick(list.viewport(), Qt::LeftButton, {}, mainBounds.center());
+    const auto compactBounds = previewBounds(quoted);
+    QVERIFY(compactBounds.width() >= 32 && compactBounds.height() >= 32);
+    QVERIFY(compactBounds.width() < mainBounds.width() && compactBounds.height() < mainBounds.height());
+    QTest::mouseClick(list.viewport(), Qt::LeftButton, {}, compactBounds.center());
+    QCOMPARE(replyTargets, QStringList{u"1"_s});
+    QCOMPARE(menus, QList<QUrl>{photo.downloadUrl});
     QCOMPARE(viewed, menus);
     QVERIFY(directDownloads.isEmpty());
     const auto archiveCard = previewBounds(main).bottomLeft() + QPoint(16, 25);

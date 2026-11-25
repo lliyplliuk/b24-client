@@ -42,9 +42,9 @@ namespace bx {
 
 class BoardWidget;
 namespace ui { class TaskGanttView; }
-namespace ui { class WorktimePanel; }
+namespace ui { class WorktimePanel; class ChatVideoPreviews; }
 namespace ui { class ProjectToolsDialog; }
-namespace ui { class AvatarBadge; class ChatComposer; class PinnedMessageBar; class TaskCardDialog; class TaskEditForm; class NameDialog; class StageManagerDialog; class GlyphButton; }
+namespace ui { class AvatarBadge; class ChatComposer; class HistoryList; class PinnedMessageBar; class TaskCardDialog; class TaskEditForm; class NameDialog; class StageManagerDialog; class GlyphButton; }
 
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -120,6 +120,8 @@ private:
     void openChatRow(const QListWidgetItem &item);
     void addMessageActions(QMenu &menu, const QPersistentModelIndex &message, const QString &dialog, bool taskChat,
                            const QString &href);
+    bool beginMessageEdit(const QPersistentModelIndex &message, const QString &dialog);
+    bool editLatestMessage(const ui::HistoryList *history, const QString &dialog);
     QWidget *messageActionOwner(const QAbstractItemModel *model, const QString &dialog);
     std::function<QPersistentModelIndex()> messageActionTarget(const QPersistentModelIndex &message,
                                                               const QString &dialog);
@@ -175,6 +177,7 @@ private:
     void loadVisibleAvatars();
     void requestAvatar(const QUrl &url);
     void loadVisibleChatPreviews();
+    void refreshChatMediaRows();
     bool isCurrentTaskLink(const QListWidget *history, const QUrl &url) const;
     void requestExternalLinkPreviews(QListWidget *history, qint64 newest);
     bool needsPublicLinkPreview(QListWidget *history, const QString &id, const QUrl &url) const;
@@ -205,7 +208,8 @@ private:
     void bindMessageFiles(QListWidget *list, bool linkCards = false);
     void openMessageViewers(QListWidget *history, const QString &messageId, const QPoint &anchor);
     void openMessagePhoto(const MessageFile &file, QWidget *parent, const QVector<MessageFile> &loaded = {});
-    void saveMessageFile(const MessageFile &file, QWidget *parent);
+    void playMessageVideo(const MessageFile &file, QWidget *parent, std::function<bool()> stillVisible);
+    void saveMessageFile(const MessageFile &file, QWidget *parent, const QImage &preview = {});
     void showMessageResults(const QVector<Message> &messages);
     void runProjectTaskSearch();
     void displayProjectTaskResults();
@@ -222,6 +226,9 @@ private:
     void createProject();
     void openStageManager();
     void pickFile(const QString &scope, const QString &kind);
+    void uploadPastedChatImage(ui::ChatComposer *composer, const QString &scope, bool task, const QString &caption);
+    bool pastedChatImagePending(const QString &scope, bool task) const;
+    void clearPastedChatImages();
     void queueDescriptionFiles(const QString &taskId, const QStringList &paths);
     bool uploadNextDescriptionFile();
     void clearDescriptionUpload();
@@ -308,6 +315,7 @@ private:
     QString m_messageSearchQuery;
     QString m_messageSearchScope;
     QString m_pendingUpload;
+    ui::ChatDraft m_pendingPastedChatImage;
     QString m_uploadName;
     QString m_descriptionUploadTask;
     QPointer<ui::TaskCardDialog> m_descriptionUploadCard;
@@ -333,6 +341,7 @@ private:
     QUrl m_projectAvatarUrl;
     QCache<QUrl, QPixmap> m_avatars{128};
     ui::ChatImagePreviews m_chatImagePreviews;
+    std::unique_ptr<ui::ChatVideoPreviews> m_chatVideoPreviews;
     QCache<QUrl, MessageLinkPreview> m_chatLinkPreviews{300};
     QCache<QPair<QString, QUrl>, ChatAsset> m_externalLinkPreviews{150};
     PublicLinkRequest m_publicLinkRequest;

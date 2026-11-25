@@ -1177,6 +1177,8 @@ public:
         m_send = m_composer->send();
         connect(m_send, &QPushButton::clicked, this, [this] { send(); });
         m_composer->setEditStateChanged([this] { updateButtons(); });
+        m_composer->setImageDraftHandlers([this] { updateButtons(); },
+                                          [this](const QString &error) { setStatus(error); });
         thread->addWidget(m_composer);
         m_splitter->addWidget(chat);
         m_splitter->setStretchFactor(1, 1);
@@ -1969,8 +1971,8 @@ private:
         m_file->setEnabled(m_writable && !m_uploading && !editingMessage);
         const auto wire = m_composer->wireText();
         const auto text = wire.trimmed();
-        const bool canSubmit = editingMessage ? m_composer->canSaveMessageEdit(wire)
-                                              : !m_sending && !text.isEmpty() && text.size() <= 20000;
+        const bool canSubmit = editingMessage ? m_composer->canSaveMessageEdit(wire) : !m_sending
+            && text.size() <= 20000 && (m_composer->hasDraftImage() ? !m_uploading : !text.isEmpty());
         m_send->setEnabled(m_writable && canSubmit);
         m_send->setToolTip(editingMessage ? (savingMessage ? QStringLiteral("Сохраняем сообщение…") : QStringLiteral("Сохранить сообщение"))
                                            : m_send->accessibleName());

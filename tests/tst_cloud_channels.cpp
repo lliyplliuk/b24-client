@@ -1,11 +1,13 @@
 #include "cloud/cloud_backend.h"
 #include "core/notification_targets.h"
+#include "core/tunables.h"
 
 #include <QDir>
 #include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkRequest>
+#include <QPointer>
 #include <QSignalSpy>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -17,6 +19,7 @@
 #include <QUuid>
 #include <algorithm>
 #include <functional>
+#include <utility>
 
 using namespace bx;
 
@@ -58,6 +61,7 @@ struct Response {
     QByteArray contentType = "application/json";
     qint64 advertisedLength = -1;
     bool holdOpen = false;
+    bool deferred = false;
 };
 Response ajax(const QByteArray &body) { return {"{\"status\":\"success\",\"data\":" + body + "}", "200 OK", {}}; }
 Response result(const QByteArray &body) { return {"{\"result\":" + body + "}", "200 OK", {}}; }
@@ -91,11 +95,16 @@ public:
                     Response response = responder ? responder(request) : Response{};
                     if (request.url.path() == QLatin1String("/rest/pull.config.get.json"))
                         response = result("{}");
-                    socket->write("HTTP/1.1 " + response.status + "\r\n" + response.extraHeaders
-                                  + "Content-Type: " + response.contentType + "\r\nConnection: close\r\nContent-Length: "
-                                  + QByteArray::number(response.advertisedLength < 0 ? response.body.size()
-                                                                                    : response.advertisedLength)
-                                  + "\r\n\r\n" + response.body);
+                    const auto wire = "HTTP/1.1 " + response.status + "\r\n" + response.extraHeaders
+                        + "Content-Type: " + response.contentType + "\r\nConnection: close\r\nContent-Length: "
+                        + QByteArray::number(response.advertisedLength < 0 ? response.body.size() : response.advertisedLength)
+                        + "\r\n\r\n" + response.body;
+                    if (response.deferred) {
+                        m_deferredSocket = socket;
+                        m_deferredResponse = wire;
+                        return;
+                    }
+                    socket->write(wire);
                     if (!response.holdOpen)
                         socket->disconnectFromHost();
                 });
@@ -119,10 +128,23 @@ public:
         return found;
     }
 
+    bool hasDeferredResponse() const { return !m_deferredSocket.isNull(); }
+    void releaseDeferredResponse()
+    {
+        if (!m_deferredSocket)
+            return;
+        m_deferredSocket->write(m_deferredResponse);
+        m_deferredSocket->disconnectFromHost();
+        m_deferredSocket.clear();
+        m_deferredResponse.clear();
+    }
+
     std::function<Response(const Request &)> responder;
     QList<Request> requests;
 private:
     QTcpServer server;
+    QPointer<QTcpSocket> m_deferredSocket;
+    QByteArray m_deferredResponse;
 };
 
 const QByteArray fileId = "n123";
@@ -138,13 +160,19 @@ class TestCloudChannels : public QObject {
 private slots:
     void searchesOutsideRecentAndLoadedHistory();
     void uploadsChatAndTaskFiles();
+    void uploadsChatImagesWithCaption_data();
+    void uploadsChatImagesWithCaption();
+    void doesNotCommitClipboardImageAfterAccountSwitch();
     void commitsFilesUsingFinalDiskId_data();
     void commitsFilesUsingFinalDiskId();
     void loadsTaskFileMetadataAndStreamsPhotoOriginal();
     void fallsBackToSmallAuthorizedTaskImageOriginals();
     void uploadFailureAndRedirectDoNotCommit();
+    void decodesForwardedMp4AndItsAuthorizedPoster();
     void previewsOnlyRegisteredImagesAndQuotes();
     void previewsSmallAuthorizedChatImageOriginals();
+    void previewsNativeResizeAndDeclaredOriginals_data();
+    void previewsNativeResizeAndDeclaredOriginals();
     void linkPreviewsRequireAnAuthorizedMatchingPortalObject();
     void decodesPortalExternalLinkMetadata();
     void labelsOnlyVerifiedTaskCreationNotices();
@@ -367,6 +395,142 @@ void TestCloudChannels::uploadsChatAndTaskFiles()
     const auto attach = QJsonDocument::fromJson(attaches.first().body).object();
     QCOMPARE(attach.value(QStringLiteral("task")).toObject().value(QStringLiteral("id")).toInt(), 42);
     QCOMPARE(attach.value(QStringLiteral("ids")).toArray().first().toString(), QString::fromLatin1(fileId));
+}
+
+void TestCloudChannels::uploadsChatImagesWithCaption_data()
+{
+    QTest::addColumn<bool>("task");
+    QTest::addColumn<QString>("caption");
+    QTest::addColumn<bool>("oversized");
+    QTest::newRow("ordinary chat") << false << QStringLiteral("Снимок + столбец & строка\nПродолжение") << false;
+    QTest::newRow("task chat") << true << QStringLiteral("Фото к задаче") << false;
+    QTest::newRow("image without a caption") << false << QString() << false;
+    QTest::newRow("caption at the limit") << true << QString(20000, QLatin1Char('a')) << false;
+    QTest::newRow("caption too long") << false << QString(20001, QLatin1Char('a')) << false;
+    QTest::newRow("image too large") << false << QString() << true;
+}
+
+void TestCloudChannels::uploadsChatImagesWithCaption()
+{
+    QFETCH(bool, task);
+    QFETCH(QString, caption);
+    QFETCH(bool, oversized);
+    Fixture fixture;
+    QVERIFY(fixture.listen());
+    fixture.responder = [](const Request &request) {
+        if (request.action() == loadAction)
+            return ajax(loadReply);
+        if (request.action() == QLatin1String("tasks.task.get"))
+            return ajax(taskReply);
+        if (request.url.path() == folderPath)
+            return result(R"({"ID":502})");
+        if (request.action() == uploadAction)
+            return ajax(R"({"token":"n123","file":{"id":6,"serverFileId":"n456"}})");
+        if (request.url.path() == commitPath)
+            return result(R"({"MESSAGE_ID":55})");
+        return ajax("{}");
+    };
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    QFile file(dir.filePath(QStringLiteral("Изображение.png")));
+    const QByteArray image = QByteArray::fromBase64(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO9Z3s0AAAAASUVORK5CYII=");
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QCOMPARE(file.write(image), qint64(image.size()));
+    if (oversized)
+        QVERIFY(file.resize(tunables::kChatClipboardPngBytes + 1));
+    file.close();
+
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy uploaded(&backend, &Backend::fileUploaded);
+    const auto scope = task ? QStringLiteral("42") : QStringLiteral("200");
+    const auto operation = (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scope;
+    QStringList errors;
+    connect(&backend, &Backend::failed, this, [&](const QString &name, const QString &reason) {
+        if (name == operation)
+            errors.append(reason);
+    });
+    backend.start();
+    backend.uploadChatImage(scope, file.fileName(), task, caption);
+    QTRY_COMPARE(uploaded.size() + errors.size(), 1);
+    if (caption.size() > 20000 || oversized) {
+        QCOMPARE(errors.size(), 1);
+        QVERIFY(fixture.matching(folderPath).isEmpty());
+        QVERIFY(fixture.matching(uploadAction).isEmpty());
+        QVERIFY(fixture.matching(commitPath).isEmpty());
+        return;
+    }
+    QCOMPARE(errors.size(), 0);
+    QCOMPARE(uploaded.first().at(0).toString(), scope);
+    QCOMPARE(uploaded.first().at(1).toString(), task ? QStringLiteral("task-chat") : QStringLiteral("chat"));
+    const auto uploads = fixture.matching(uploadAction);
+    QCOMPARE(uploads.size(), 1);
+    QCOMPARE(uploads.first().body, image);
+    QCOMPARE(uploads.first().headers.value("content-type"), QByteArray("image/png"));
+    const auto commits = fixture.matching(commitPath);
+    QCOMPARE(commits.size(), 1);
+    QCOMPARE(commits.first().field(QStringLiteral("chat_id")), QStringLiteral("321"));
+    QCOMPARE(commits.first().field(QStringLiteral("upload_id")), QStringLiteral("456"));
+    QCOMPARE(commits.first().field(QStringLiteral("as_file")), QStringLiteral("N"));
+    QCOMPARE(commits.first().field(QStringLiteral("message")), caption);
+}
+
+void TestCloudChannels::doesNotCommitClipboardImageAfterAccountSwitch()
+{
+    Fixture fixture;
+    QVERIFY(fixture.listen());
+    int userId = 11;
+    bool deferUpload = true;
+    fixture.responder = [&userId, &deferUpload](const Request &request) {
+        if (request.action() == QLatin1String("im.v2.Recent.load"))
+            return ajax("{\"userId\":" + QByteArray::number(userId) + ",\"recentItems\":[]}");
+        if (request.url.path() == folderPath)
+            return result(R"({"ID":502})");
+        if (request.action() == uploadAction) {
+            if (std::exchange(deferUpload, false)) {
+                auto response = ajax(R"({"token":"n123","file":{"id":6,"serverFileId":"n123"}})");
+                response.deferred = true;
+                return response;
+            }
+            return ajax(R"({"token":"n456","file":{"id":7,"serverFileId":"n456"}})");
+        }
+        if (request.url.path() == commitPath)
+            return result(R"({"MESSAGE_ID":55})");
+        return ajax("{}");
+    };
+    auto directory = std::make_shared<QTemporaryDir>();
+    QVERIFY(directory->isValid());
+    const auto directoryPath = directory->path();
+    QFile file(directory->filePath(QStringLiteral("Фото.png")));
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QVERIFY(file.write("synthetic PNG bytes") > 0);
+    file.close();
+
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy scopeChanged(&backend, &Backend::accountScopeChanged);
+    QSignalSpy uploaded(&backend, &Backend::fileUploaded);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(scopeChanged.size(), 1);
+    const auto dialog = QStringLiteral("chat321");
+    backend.uploadChatImage(dialog, file.fileName(), false, QStringLiteral("Старый аккаунт"), directory);
+    QTRY_VERIFY(fixture.hasDeferredResponse());
+    const std::weak_ptr<QTemporaryDir> pendingUploadDirectory = directory;
+    directory.reset();
+    QVERIFY(!pendingUploadDirectory.expired());
+    userId = 12;
+    backend.requestRecentChats();
+    QTRY_COMPARE(scopeChanged.size(), 2);
+    backend.uploadChatImage(dialog, file.fileName(), false, QStringLiteral("Новый аккаунт"));
+    QTRY_COMPARE(uploaded.size(), 1);
+    fixture.releaseDeferredResponse();
+    QTRY_VERIFY(pendingUploadDirectory.expired());
+    QVERIFY(!QFileInfo::exists(directoryPath));
+    QCOMPARE(uploaded.size(), 1);
+    const auto commits = fixture.matching(commitPath);
+    QCOMPARE(commits.size(), 1);
+    QCOMPARE(commits.first().field(QStringLiteral("message")), QStringLiteral("Новый аккаунт"));
+    QCOMPARE(commits.first().field(QStringLiteral("upload_id")), QStringLiteral("456"));
 }
 
 void TestCloudChannels::commitsFilesUsingFinalDiskId_data()
@@ -619,6 +783,94 @@ void TestCloudChannels::uploadFailureAndRedirectDoNotCommit()
     }
 }
 
+void TestCloudChannels::decodesForwardedMp4AndItsAuthorizedPoster()
+{
+    const auto ftyp = QByteArray::fromHex("00000018667479706d7034320000000069736f6d6d703432");
+    Fixture outside;
+    QVERIFY(outside.listen());
+    Fixture fixture;
+    QVERIFY(fixture.listen());
+    fixture.responder = [&](const Request &request) -> Response {
+        if (request.action() == loadAction) {
+            return ajax(R"({"chat":{"id":321},"messages":[
+                {"id":51,"forward":{"id":49,"userId":7},"files":[55,56,57,58,59,60,61,62,63]},
+                {"id":52,"replyId":51}],
+                "files":[
+                    {"id":55,"name":"forwarded.mp4","size":24,"type":"file","urlPreview":"/disk/showFile/55/",
+                     "urlDownload":"/bitrix/services/main/ajax.php?action=disk.api.file.download&SITE_ID=s1&humanRE=Y&fileId=55&exact=Y&_esd=synthetic&fileName=forwarded.mp4"},
+                    {"id":56,"name":"generic.txt","size":120,"type":"file","urlPreview":"/disk/showFile/56/","urlDownload":"/disk/downloadFile/56/"},
+                    {"id":57,"name":"cover.png","size":200,"type":"image","urlPreview":"/disk/showFile/57/"},
+                    {"id":58,"name":"remote.mp4","size":24,"type":"video","urlDownload":"https://outside.invalid/clip.mp4"},
+                    {"id":59,"name":"redirect.mp4","size":24,"type":"video","urlDownload":"/disk/downloadFile/59/"},
+                    {"id":60,"name":"arbitrary.mp4","size":24,"type":"video","urlDownload":"/different/action"},
+                    {"id":61,"name":"invalid.mp4","size":24,"type":"video","urlDownload":"/disk/downloadFile/61/"},
+                    {"id":62,"name":"remote-redirect.mp4","size":24,"type":"video","urlDownload":"/disk/downloadFile/62/"},
+                    {"id":63,"name":"alias.mp4","size":24,"type":"video",
+                     "urlDownload":"/bitrix/services/main/ajax.php?action=disk.api.file.download&fileId=63&action%5B0%5D=unsafe"}
+                ]})");
+        }
+        if (request.action() == QLatin1String("disk.api.file.download"))
+            return {ftyp, "200 OK", {}, "application/octet-stream"};
+        if (request.url.path() == QLatin1String("/disk/downloadFile/59/"))
+            return {{}, "302 Found", "Location: /different/action\r\n"};
+        if (request.url.path() == QLatin1String("/disk/downloadFile/61/"))
+            return {QByteArray(24, 'x'), "200 OK", {}, "video/mp4"};
+        if (request.url.path() == QLatin1String("/disk/downloadFile/62/"))
+            return {{}, "302 Found", "Location: " + outside.session().origin.toEncoded() + "/disk/downloadFile/62/\r\n"};
+        return ajax("{}");
+    };
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
+    QSignalSpy downloaded(&backend, &Backend::messageVideoDownloaded);
+    QSignalSpy rejected(&backend, &Backend::messageVideoDownloadFailed);
+    QSignalSpy genericDownloads(&backend, &Backend::messageFileDownloaded);
+    backend.start();
+    backend.requestChatMessages(QStringLiteral("chat321"));
+    QTRY_COMPARE(history.size(), 1);
+    const auto messages = history.first().at(1).value<QVector<Message>>();
+    QCOMPARE(messages.size(), 2);
+    QVERIFY(messages.first().forwarded);
+    const auto files = messages.first().files;
+    QCOMPARE(files.size(), 9);
+    QVERIFY(files.at(0).isVideo);
+    QCOMPARE(files.at(0).previewUrl.path(), QStringLiteral("/disk/showFile/55/"));
+    QCOMPARE(files.at(0).downloadUrl.path(), QStringLiteral("/bitrix/services/main/ajax.php"));
+    QVERIFY(!files.at(1).isVideo && files.at(1).previewUrl.isEmpty());
+    QVERIFY(files.at(2).isImage && !files.at(2).isVideo);
+    QVERIFY(files.at(3).downloadUrl.isEmpty());
+    QVERIFY(messages.last().replyFiles.first().isVideo);
+    QCOMPARE(messages.last().replyFiles.first().previewUrl, files.at(0).previewUrl);
+
+    QTemporaryDir target;
+    QVERIFY(target.isValid());
+    const auto clip = target.filePath(QStringLiteral("clip.mp4"));
+    backend.downloadMessageVideo(files.at(0).downloadUrl, clip);
+    QTRY_COMPARE(downloaded.size(), 1);
+    QCOMPARE(downloaded.first().at(0).toUrl(), files.at(0).downloadUrl);
+    QCOMPARE(downloaded.first().at(1).toString(), clip);
+    QFile saved(clip);
+    QVERIFY(saved.open(QIODevice::ReadOnly));
+    QCOMPARE(saved.readAll(), ftyp);
+    QCOMPARE(genericDownloads.size(), 0);
+    const auto videoReads = fixture.matching(QStringLiteral("disk.api.file.download"));
+    QCOMPARE(videoReads.size(), 1);
+    QCOMPARE(videoReads.first().headers.value("cookie"), QByteArray("BITRIX_TEST=synthetic"));
+    QVERIFY(!videoReads.first().headers.contains("x-bitrix-csrf-token"));
+
+    for (const int row : {1, 3, 4, 5, 6, 7, 8}) {
+        const auto failedTarget = target.filePath(QStringLiteral("failed-%1.mp4").arg(row));
+        const auto failures = rejected.size();
+        backend.downloadMessageVideo(files.at(row).downloadUrl, failedTarget);
+        QTRY_COMPARE(rejected.size(), failures + 1);
+        QCOMPARE(rejected.last().at(0).toString(), failedTarget);
+        QVERIFY(!QFileInfo::exists(failedTarget));
+    }
+    QCOMPARE(fixture.matching(QStringLiteral("/different/action")).size(), 0);
+    QCOMPARE(fixture.matching(QStringLiteral("/disk/downloadFile/56/")).size(), 0);
+    QCOMPARE(outside.matching(QStringLiteral("/disk/downloadFile/62/")).size(), 0);
+    QCOMPARE(fixture.matching(QStringLiteral("disk.api.file.download")).size(), 1);
+}
+
 void TestCloudChannels::previewsOnlyRegisteredImagesAndQuotes()
 {
     const auto png = QByteArray::fromBase64(
@@ -792,6 +1044,93 @@ void TestCloudChannels::previewsSmallAuthorizedChatImageOriginals()
     QVERIFY(fixture.matching(QStringLiteral("/disk/downloadFile/69/")).isEmpty());
     QVERIFY(fixture.matching(QStringLiteral("disk.attachedObject.download")).isEmpty());
     QVERIFY(fixture.matching(QStringLiteral("/bitrix/tools/disk/uf.php")).isEmpty());
+}
+
+void TestCloudChannels::previewsNativeResizeAndDeclaredOriginals_data()
+{
+    QTest::addColumn<bool>("nativeResize");
+    QTest::addColumn<bool>("largeOriginal");
+    QTest::newRow("download-alias-prefers-native-resize") << true << true;
+    QTest::newRow("declared-generic-image-without-suffix") << false << false;
+    QTest::newRow("download-alias-over-limit") << false << true;
+}
+
+void TestCloudChannels::previewsNativeResizeAndDeclaredOriginals()
+{
+    QFETCH(bool, nativeResize);
+    QFETCH(bool, largeOriginal);
+    const auto preview = QByteArray::fromBase64(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRYAAAAAASUVORK5CYII=");
+    auto original = preview;
+    if (largeOriginal)
+        original.append(QByteArray(512 * 1024, 'x'));
+    const auto downloadAction = QStringLiteral("disk.api.file.download");
+    const auto resizeAction = QStringLiteral("disk.api.file.showImage");
+    const auto download = QStringLiteral("/bitrix/services/main/ajax.php?action=disk.api.file.download&fileId=77&exact=N");
+    const auto resized = QStringLiteral("/bitrix/services/main/ajax.php?action=disk.api.file.showImage&fileId=77"
+                                        "&width=1280&height=1280&signature=synthetic");
+
+    Fixture fixture;
+    QVERIFY(fixture.listen());
+    fixture.responder = [&](const Request &request) -> Response {
+        if (request.action() == loadAction) {
+            QJsonObject file{{"id", 77}, {"name", "pic_179553001"}, {"size", original.size()},
+                             {"type", "image"}, {"mimeType", "application/octet-stream"}, {"urlDownload", download}};
+            if (largeOriginal) {
+                // The portal can report the same original in both native preview fields.
+                file.insert("urlPreview", fixture.session().origin.resolved(QUrl(download)).toString());
+                file.insert("mediaUrl", QJsonObject{{"preview", QJsonObject{{"250", download}}}});
+            }
+            if (nativeResize)
+                file.insert("urlShow", resized);
+            return ajax(QJsonDocument(QJsonObject{
+                {"chat", QJsonObject{{"id", 321}}},
+                {"messages", QJsonArray{QJsonObject{{"id", 51}, {"files", QJsonArray{77}}}}},
+                {"files", QJsonArray{file}}
+            }).toJson(QJsonDocument::Compact));
+        }
+        if (request.action() == resizeAction)
+            return {preview, "200 OK", {}, "image/png"};
+        if (request.action() == downloadAction)
+            return {original, "200 OK", {}, "application/octet-stream"};
+        return ajax("{}");
+    };
+
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
+    QSignalSpy fetched(&backend, &Backend::messageImageLoaded);
+    QSignalSpy saved(&backend, &Backend::messageFileDownloaded);
+    backend.start();
+    backend.requestChatMessages(QStringLiteral("chat321"));
+    QTRY_COMPARE(history.size(), 1);
+    const auto messages = history.first().at(1).value<QVector<Message>>();
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().files.size(), 1);
+    const auto photo = messages.first().files.first();
+    QVERIFY(photo.isImage);
+    QCOMPARE(photo.downloadUrl, fixture.session().origin.resolved(QUrl(download)));
+    if (nativeResize || !largeOriginal) {
+        QCOMPARE(photo.previewUrl, fixture.session().origin.resolved(QUrl(nativeResize ? resized : download)));
+        backend.requestMessageImage(photo.previewUrl);
+        QTRY_COMPARE(fetched.size(), 1);
+        QCOMPARE(fetched.first().at(1).toByteArray(), preview);
+    } else {
+        QVERIFY(photo.previewUrl.isEmpty());
+        backend.requestMessageImage(photo.downloadUrl);
+        QCOMPARE(fetched.size(), 1);
+        QVERIFY(fetched.first().at(1).toByteArray().isEmpty());
+    }
+    QCOMPARE(fixture.matching(resizeAction).size(), nativeResize ? 1 : 0);
+    QCOMPARE(fixture.matching(downloadAction).size(), largeOriginal ? 0 : 1);
+
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    const auto path = temp.filePath(QStringLiteral("photo.png"));
+    backend.downloadMessagePhoto(photo.downloadUrl, path);
+    QTRY_COMPARE(saved.size(), 1);
+    QFile downloaded(path);
+    QVERIFY(downloaded.open(QIODevice::ReadOnly));
+    QCOMPARE(downloaded.readAll(), original);
 }
 
 void TestCloudChannels::linkPreviewsRequireAnAuthorizedMatchingPortalObject()

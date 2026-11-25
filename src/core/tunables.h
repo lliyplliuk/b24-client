@@ -16,6 +16,12 @@ inline constexpr int kPageSizeProjects = 50;
 inline constexpr int kPageSizeBoardTasks = 200;
 inline constexpr int kPageSizeNotifications = 100;
 
+// Bound automatic attachment media fetches and locally opened videos.
+inline constexpr qint64 kChatVideoPreviewBytes = 16LL * 1024 * 1024;
+inline constexpr qint64 kChatVideoPlaybackBytes = 64LL * 1024 * 1024;
+inline constexpr qint64 kChatClipboardPngBytes = 16LL * 1024 * 1024;
+inline constexpr qsizetype kChatImageCaptionCharacters = 20000;
+
 // Push&Pull reconnect policy: attempt counter and delay growth.
 inline constexpr int kReconnectMaxAttempts = 10;
 inline constexpr int kReconnectBaseDelayMs = 1000;

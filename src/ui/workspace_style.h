@@ -14,6 +14,7 @@
 #include <QApplication>
 #include <QCache>
 #include <QColor>
+#include <QContextMenuEvent>
 #include <QDesktopServices>
 #include <QFontMetrics>
 #include <QHelpEvent>
@@ -379,6 +380,11 @@ public:
         m_messagePreview = std::move(source);
     }
 
+    void setVideoPreviewSource(std::function<const QPixmap *(const MessageFile &)> source)
+    {
+        m_videoPreview = std::move(source);
+    }
+
     void setLinkThumbnailSource(std::function<const QImage *(const QUrl &)> source)
     {
         m_linkThumbnail = std::move(source);
@@ -395,24 +401,68 @@ public:
     {
         m_messagePhoto = std::move(handler);
     }
+    void setMessageVideoHandler(std::function<void(const QModelIndex &, const MessageFile &)> handler)
+    {
+        m_messageVideo = std::move(handler);
+    }
     void setMessagePhotoMenuHandler(std::function<void(const QModelIndex &, const MessageFile &, const QRect &)> handler)
     {
         m_messagePhotoMenu = std::move(handler);
     }
+    QVector<MessageFile> visibleVideos(const QModelIndex &index, const QRect &row, const QRect &visible) const
+    {
+        QVector<MessageFile> result;
+        visitFileGeometry(index, row, [&](const MessageFile &file, const FileGeometry &geometry) {
+            if (file.isVideo && (geometry.control.intersects(visible) || geometry.thumbnail.intersects(visible)))
+                result.append(file);
+            return false;
+        });
+        if (const auto representative = visibleQuoteMedia(index, row, visible); representative && representative->isVideo)
+            result.append(*representative);
+        return result;
+    }
+
+    std::optional<MessageFile> visibleQuoteMedia(const QModelIndex &index, const QRect &row, const QRect &visible) const
+    {
+        if (index.data(ReplyByline).toString().isEmpty() ||
+            !quoteMediaRect(replyHeaderRect(row, index)).intersects(visible))
+            return {};
+        return replyAttachments(index).representative;
+    }
+    bool showPhotoMenuAt(const QModelIndex &index, const QPoint &point) const
+    {
+        if (!m_messagePhotoMenu || !index.isValid())
+            return false;
+        const auto target = fileAt(index, m_view->visualRect(index), point);
+        if (!target || !target->geometry.thumbnail.contains(point)
+            || photoMenuRect(target->geometry.thumbnail, target->file).isEmpty())
+            return false;
+        const auto global = m_view->viewport()->mapToGlobal(point);
+        m_messagePhotoMenu(index, target->file, QRect(global, QSize(1, 1)));
+        return true;
+    }
     QVector<MessageFile> photoOriginals(const QModelIndex &index) const
     {
         QVector<MessageFile> result;
-        for (const int role : {MessageFiles, ReplyFiles}) {
-            for (const auto &file : files(index, role)) {
-                if (preview(file) && downloadable(file) && !matchesOriginal(result, file))
-                    result.append(file);
-            }
+        for (const auto &file : files(index, MessageFiles)) {
+            if (!file.isVideo && preview(file) && downloadable(file) && !matchesOriginal(result, file))
+                result.append(file);
         }
         return result;
     }
     static bool hasOriginal(const QModelIndex &index, const MessageFile &file)
     {
         return matchesOriginal(files(index, MessageFiles), file) || matchesOriginal(files(index, ReplyFiles), file);
+    }
+    static bool hasPhotoPreview(const QModelIndex &index, const MessageFile &file)
+    {
+        return matchesOriginal(files(index, MessageFiles), file, true)
+            || matchesOriginal(files(index, ReplyFiles), file, true);
+    }
+    static bool downloadable(const MessageFile &file)
+    {
+        return file.downloadUrl.isValid() && file.downloadUrl.scheme() == QStringLiteral("https") &&
+               !file.downloadUrl.host().isEmpty() && file.downloadUrl.userInfo().isEmpty();
     }
     void setMessageViewersHandler(std::function<void(const QString &, const QPoint &)> handler)
     {
@@ -589,7 +639,8 @@ public:
             const int textHeight = detail.isEmpty() && !entries.isEmpty() ? 0 : bodyHeight(index, detail, bodyWidth);
             return QSize(0, messageRowTop + messageRowBottom + messageBodyTop + messageBodyBottom
                              + textHeight + messageHeader(index) +
-                             messageContext(index, bubbleWidth) + fileHeight(entries, bubbleWidth - 20) +
+                             messageContext(index) + fileHeight(entries, bubbleWidth - 20, AttachmentSection::Media)
+                             + fileHeight(entries, bubbleWidth - 20, AttachmentSection::Documents) +
                              linkPreviewHeight(index) +
                              messageTime(index) + messageDividers(index));
         }
@@ -646,9 +697,25 @@ public:
     {
         if (event && event->type() == QEvent::ToolTip) {
             if (const auto target = fileAt(index, option.rect, event->pos())) {
-                const auto menu = photoMenuRect(target->geometry.thumbnail, target->file);
+                const auto &geometry = target->geometry;
+                auto bounds = geometry.thumbnail.isEmpty() ? geometry.control : geometry.thumbnail;
+                auto hint = QStringLiteral("<span style=\"white-space: pre-wrap\">%1</span>")
+                                .arg(target->file.name.toHtmlEscaped());
+                const auto menu = photoMenuRect(geometry.thumbnail, target->file);
                 if (menu.contains(event->pos())) {
-                    QToolTip::showText(event->globalPos(), QStringLiteral("Действия с изображением"), view->viewport(), menu);
+                    bounds = menu;
+                    hint.prepend(target->file.isVideo ? QStringLiteral("Сохранить видео<br>")
+                                                      : QStringLiteral("Действия с изображением<br>"));
+                }
+                QToolTip::showText(event->globalPos(), QStringLiteral("<qt>%1</qt>").arg(hint), view->viewport(), bounds);
+                return true;
+            }
+            const auto quote = replyHeaderRect(option.rect, index);
+            if (!index.data(ReplyByline).toString().isEmpty() && quote.contains(event->pos())) {
+                const auto attachments = replyAttachments(index);
+                if (!attachments.representative && attachments.documents == 1) {
+                    QToolTip::showText(event->globalPos(), QStringLiteral("<qt><span style=\"white-space: pre-wrap\">%1</span></qt>")
+                        .arg(attachments.firstDocument.toHtmlEscaped()), view->viewport(), quote);
                     return true;
                 }
             }
@@ -675,17 +742,19 @@ public:
         return QStyledItemDelegate::helpEvent(event, view, option, index);
     }
 
-    // Открытие фотографии с клавиатуры: то же действие, что клик по превью.
-    bool activateImage(const QModelIndex &index)
+    // Enter opens the same media as a click on its preview.
+    bool activateMedia(const QModelIndex &index)
     {
-        if (!m_messagePhoto || !m_view)
+        if (!m_view)
             return false;
         if (m_style != Row::Message && m_style != Row::TaskContent)
             return false;
-        for (const int role : {MessageFiles, ReplyFiles}) {
-            for (const auto &file : files(index, role)) {
-                if (!preview(file) && !(file.isImage && downloadable(file)))
-                    continue;
+        for (const auto &file : files(index, MessageFiles)) {
+            if (file.isVideo && m_messageVideo && downloadable(file)) {
+                m_messageVideo(index, file);
+                return true;
+            }
+            if (!file.isVideo && m_messagePhoto && (preview(file) || (file.isImage && downloadable(file)))) {
                 m_messagePhoto(file);
                 return true;
             }
@@ -700,10 +769,12 @@ private:
     std::function<void(const MessageFile &)> m_messageDownload;
     std::function<void(const QString &)> m_messageLink;
     std::function<const QPixmap *(const QUrl &)> m_messagePreview;
+    std::function<const QPixmap *(const MessageFile &)> m_videoPreview;
     std::function<const QImage *(const QUrl &)> m_linkThumbnail;
     std::function<MessageLinkPreview(const QModelIndex &, const QString &)> m_linkPreview;
     std::function<const QPixmap *(const QUrl &)> m_linkAvatar;
     std::function<void(const MessageFile &)> m_messagePhoto;
+    std::function<void(const QModelIndex &, const MessageFile &)> m_messageVideo;
     std::function<void(const QModelIndex &, const MessageFile &, const QRect &)> m_messagePhotoMenu;
     std::function<void(const QString &, const QPoint &)> m_messageViewers;
     std::function<void(const QString &)> m_replyNavigation;
@@ -727,6 +798,9 @@ private:
     static constexpr int messageForwardHeight = 21;
     static constexpr int messageQuoteLineHeight = 19;
     static constexpr int messageQuoteHeight = 2 * messageQuoteLineHeight + 4;
+    static constexpr int messageMediaQuoteHeight = 62;
+    static constexpr int galleryWidthLimit = 432;
+    static constexpr int galleryGap = 5;
     static constexpr int messageTimeHeight = 19;
 
     static int messageWidth(int width)
@@ -775,32 +849,33 @@ private:
             const int replyWidth = available > compactMessageCap ? available - 44 : 260;
             headingWidth = qMax(headingWidth, measure.horizontalAdvance(measure.elidedText(reply, Qt::ElideRight, replyWidth)));
         }
+        const bool mediaQuote = !reply.isEmpty() && replyAttachments(index).representative.has_value();
+        if (mediaQuote)
+            headingWidth += 55; // Thumbnail and its spacing sit inside the quotation's text allowance.
         const auto detail = index.data(Detail).toString();
         const int contentLimit = detail.isEmpty() && reply.isEmpty() ? qMin(available, compactMessageCap) : available;
-        const int base = qMax(bubbleWidth(contentLimit, detail, headingWidth, index.data(MarkupBlock).toBool()),
-                              qMin(available, minimumReactionWidth(index)));
-        const auto cards = linkPreviews(index);
-        if (!cards.isEmpty()) {
-            int result = base;
-            for (const auto &card : cards)
-                result = qMax(result, minimumLinkCardWidth(card.second, available));
-            return result;
-        }
-        bool hasFiles = false;
-        for (const int role : {MessageFiles, ReplyFiles}) {
-            const auto entries = files(index, role);
-            hasFiles = hasFiles || !entries.isEmpty();
-            const auto hasImage = [this](const MessageFile &file) { return preview(file) != nullptr; };
-            if (std::any_of(entries.cbegin(), entries.cend(), hasImage))
-                return qMax(base, qMin(linkCardMinimum, available));
-        }
-        return hasFiles ? qMax(base, qMin(280, available)) : base;
+        int result = qMax(bubbleWidth(contentLimit, detail, headingWidth, index.data(MarkupBlock).toBool()),
+                          qMin(available, minimumReactionWidth(index)));
+        if (mediaQuote)
+            result = qMax(result, qMin(available, 285));
+        for (const auto &card : linkPreviews(index))
+            result = qMax(result, minimumLinkCardWidth(card.second, available));
+
+        const auto entries = files(index, MessageFiles);
+        const auto adjacentMedia = std::adjacent_find(entries.cbegin(), entries.cend(), [](const auto &first, const auto &second) {
+            return isMediaFile(first) && isMediaFile(second);
+        });
+        if (adjacentMedia != entries.cend())
+            return qMax(result, qMin(galleryWidthLimit + 20, available));
+        if (std::any_of(entries.cbegin(), entries.cend(), isMediaFile))
+            result = qMax(result, qMin(linkCardMinimum, available));
+        return entries.isEmpty() ? result : qMax(result, qMin(280, available));
     }
 
-    int messageContext(const QModelIndex &index, int bubbleWidth) const
+    int messageContext(const QModelIndex &index) const
     {
         return (index.data(ForwardByline).toString().isEmpty() ? 0 : messageForwardHeight) +
-               (index.data(ReplyByline).toString().isEmpty() ? 0 : messageQuoteHeight + 5 + fileHeight(files(index, ReplyFiles), bubbleWidth - 32));
+               (index.data(ReplyByline).toString().isEmpty() ? 0 : quoteHeight(index) + 5);
     }
 
     static int messageHeader(const QModelIndex &index)
@@ -813,7 +888,7 @@ private:
         const auto bubble = messageBubble(row, index);
         const int afterForward = index.data(ForwardByline).toString().isEmpty() ? 0 : messageForwardHeight;
         return QRect(bubble.left() + 10, bubble.top() + 5 + messageHeader(index) + afterForward,
-                     bubble.width() - 20, messageQuoteHeight);
+                     bubble.width() - 20, quoteHeight(index));
     }
 
     int messageTime(const QModelIndex &index) const
@@ -938,9 +1013,12 @@ private:
         if (index.data(Id).toString().isEmpty())
             return row.adjusted(8, 3, -8, 0);
         const auto bubble = messageBubble(row, index);
-        return bubble.adjusted(12, messageBodyTop + messageHeader(index) + messageContext(index, bubble.width()),
-                              -12, -messageBodyBottom - messageTime(index) - fileHeight(files(index, MessageFiles), bubble.width() - 20)
-                                  - linkPreviewHeight(index));
+        const auto entries = files(index, MessageFiles);
+        const auto width = bubble.width() - 20;
+        return bubble.adjusted(12, messageBodyTop + messageHeader(index) + messageContext(index)
+                                  + fileHeight(entries, width, AttachmentSection::Media),
+                              -12, -messageBodyBottom - messageTime(index)
+                                  - fileHeight(entries, width, AttachmentSection::Documents) - linkPreviewHeight(index));
     }
 
     using LinkCard = QPair<QString, MessageLinkPreview>;
@@ -1023,8 +1101,8 @@ private:
             const auto detail = noticeBodyRect(row, index);
             return QRect(detail.left(), detail.bottom() + 6, qMax(1, card.width() - 40), 1);
         }
-        auto rect = firstFileRect(row, index, MessageFiles);
-        rect.translate(0, fileHeight(files(index, MessageFiles), rect.width()));
+        auto rect = firstFileRect(row, index, AttachmentSection::Documents);
+        rect.translate(0, fileHeight(files(index, MessageFiles), rect.width(), AttachmentSection::Documents));
         return rect;
     }
 
@@ -1186,7 +1264,14 @@ private:
     bool eventFilter(QObject *object, QEvent *event) override
     {
         if (object == m_view->viewport()) {
-            if (event->type() == QEvent::MouseMove) {
+            if (event->type() == QEvent::ContextMenu && m_style == Row::TaskContent) {
+                auto *context = static_cast<QContextMenuEvent *>(event);
+                if (context->reason() == QContextMenuEvent::Mouse
+                    && showPhotoMenuAt(m_view->indexAt(context->pos()), context->pos())) {
+                    context->accept();
+                    return true;
+                }
+            } else if (event->type() == QEvent::MouseMove) {
                 const auto *mouse = static_cast<QMouseEvent *>(event);
                 const auto point = mouse->position().toPoint();
                 const auto index = m_view->indexAt(point);
@@ -1240,7 +1325,7 @@ private:
                     };
             }
         }
-        if (m_messageDownload || m_messagePhoto || m_messagePhotoMenu) {
+        if (m_messageDownload || m_messagePhoto || m_messagePhotoMenu || m_messageVideo) {
             if (const auto target = fileAt(index, row, point)) {
                 const auto &[file, geometry] = *target;
                 const auto menu = photoMenuRect(geometry.thumbnail, file);
@@ -1248,9 +1333,15 @@ private:
                     const QRect anchor(m_view->viewport()->mapToGlobal(menu.topLeft()), menu.size());
                         return [this, index, file = file, anchor] { m_messagePhotoMenu(index, file, anchor); };
                 }
-                const bool originalControl = geometry.thumbnail.isEmpty() && file.isImage &&
-                    downloadable(file) && point.y() < geometry.control.top() + fileTitleTop + fileTitleHeight;
-                if (m_messagePhoto && (geometry.thumbnail.contains(point) || originalControl))
+                const bool titleControl = geometry.thumbnail.isEmpty()
+                    && point.y() < geometry.control.top() + fileTitleTop + fileTitleHeight;
+                if (file.isVideo && m_messageVideo && downloadable(file)
+                    && (geometry.thumbnail.contains(point) || titleControl)) {
+                    return [this, index, file = file] { m_messageVideo(index, file); };
+                }
+                const bool originalControl = file.isImage && titleControl && downloadable(file);
+                const bool opensThumbnail = geometry.thumbnail.contains(point) && (preview(file) || downloadable(file));
+                if (!file.isVideo && m_messagePhoto && (opensThumbnail || originalControl))
                     return [this, file = file] { m_messagePhoto(file); };
                 if (m_messageDownload && geometry.control.contains(point) && downloadable(file))
                     return [this, file = file] { m_messageDownload(file); };
@@ -1287,31 +1378,124 @@ private:
 
     const QPixmap *preview(const MessageFile &file) const
     {
+        if (file.isVideo)
+            return m_videoPreview ? m_videoPreview(file) : nullptr;
         const auto *photo = !file.previewUrl.isEmpty() && m_messagePreview ? m_messagePreview(file.previewUrl) : nullptr;
         return photo && !photo->isNull() ? photo : nullptr;
+    }
+
+    enum class AttachmentSection { Media, Documents };
+
+    static bool isMediaFile(const MessageFile &file)
+    {
+        return file.isImage || file.isVideo || !file.previewUrl.isEmpty();
+    }
+
+    struct QuoteAttachments {
+        std::optional<MessageFile> representative;
+        int media = 0;
+        int documents = 0;
+        QString firstDocument;
+    };
+
+    QuoteAttachments replyAttachments(const QModelIndex &index) const
+    {
+        QuoteAttachments result;
+        for (const auto &entry : files(index, ReplyFiles)) {
+            if (isMediaFile(entry)) {
+                ++result.media;
+                if (!result.representative)
+                    result.representative = entry;
+            } else {
+                ++result.documents;
+                if (result.firstDocument.isEmpty())
+                    result.firstDocument = entry.name;
+            }
+        }
+        return result;
+    }
+
+    int quoteHeight(const QModelIndex &index) const
+    {
+        return replyAttachments(index).media > 0 ? messageMediaQuoteHeight : messageQuoteHeight;
+    }
+
+    static QRect quoteMediaRect(const QRect &quote)
+    {
+        if (quote.width() < 108)
+            return {};
+        return QRect(quote.left() + 11, quote.top() + (quote.height() - 40) / 2, 40, 40);
     }
 
     struct FileGeometry {
         QRect thumbnail;
         QRect control;
 
-        int nextTop() const { return thumbnail.isEmpty() ? control.top() + FileRowStep : thumbnail.bottom() + 1 + 5; }
+        QRect bounds() const { return thumbnail.isEmpty() ? control : thumbnail; }
     };
 
     struct FileTarget { MessageFile file; FileGeometry geometry; };
 
+    template<typename Visit>
+    void visitFileGeometry(const QModelIndex &index, const QRect &row, Visit visit) const
+    {
+        const auto entries = files(index, MessageFiles);
+        for (const auto section : {AttachmentSection::Media, AttachmentSection::Documents}) {
+            if (layoutFiles(entries, firstFileRect(row, index, section), section, visit, nullptr))
+                return;
+        }
+    }
+
+    template<typename Visit>
+    bool layoutFiles(const QVector<MessageFile> &entries, const QRect &area, AttachmentSection section,
+                     Visit visit, int *height) const
+    {
+        int y = area.top();
+        for (qsizetype i = 0; i < entries.size();) {
+            const auto &file = entries.at(i);
+            const bool media = isMediaFile(file);
+            if (media != (section == AttachmentSection::Media)) {
+                ++i;
+                continue;
+            }
+            qsizetype end = i + 1;
+            while (media && end < entries.size() && isMediaFile(entries.at(end)))
+                ++end;
+            if (end == i + 1) {
+                const auto geometry = fileGeometry(QRect(area.left(), y, area.width(), fileControlHeight), file);
+                if (visit(file, geometry))
+                    return true;
+                y += geometry.bounds().height() + galleryGap;
+            } else {
+                const auto width = qMin(area.width(), galleryWidthLimit);
+                const int columns = width >= 204 ? 2 : 1;
+                const int tileWidth = (width - (columns - 1) * galleryGap) / columns;
+                const int tileHeight = qBound(52, tileWidth * 9 / 16, 128);
+                for (qsizetype tile = 0; tile < end - i; ++tile) {
+                    const int x = area.left() + int(tile % columns) * (tileWidth + galleryGap);
+                    const int top = y + int(tile / columns) * (tileHeight + galleryGap);
+                    if (visit(entries.at(i + tile), FileGeometry{QRect(x, top, tileWidth, tileHeight), {}}))
+                        return true;
+                }
+                y += int((end - i + columns - 1) / columns) * (tileHeight + galleryGap);
+            }
+            i = end;
+        }
+        if (height)
+            *height = y - area.top();
+        return false;
+    }
+
     std::optional<FileTarget> fileAt(const QModelIndex &index, const QRect &row, const QPoint &point) const
     {
-        for (const int role : {MessageFiles, ReplyFiles}) {
-            auto card = firstFileRect(row, index, role);
-            for (const auto &file : files(index, role)) {
-                const auto geometry = fileGeometry(card, file);
-                if (geometry.thumbnail.contains(point) || geometry.control.contains(point))
-                    return FileTarget{file, geometry};
-                card.moveTop(geometry.nextTop());
-            }
-        }
-        return {};
+        std::optional<FileTarget> result;
+        visitFileGeometry(index, row, [&](const MessageFile &file, const FileGeometry &geometry) {
+            if (!geometry.thumbnail.contains(point) && !geometry.control.contains(point))
+                return false;
+            result = FileTarget{file, geometry};
+            return true;
+        });
+        return result;
     }
 
     FileGeometry fileGeometry(const QRect &card, const MessageFile &file) const
@@ -1324,73 +1508,88 @@ private:
         return {thumbnail, {}};
     }
 
-    int fileHeight(const QVector<MessageFile> &entries, int width) const
+    int fileHeight(const QVector<MessageFile> &entries, int width, AttachmentSection section) const
     {
         int height = 0;
-        for (const auto &file : entries) {
-            const auto geometry = fileGeometry(QRect(0, height, width, fileControlHeight), file);
-            height = geometry.nextTop();
-        }
+        layoutFiles(entries, QRect(0, 0, qMax(1, width), fileControlHeight), section,
+                    [](const auto &, const auto &) { return false; }, &height);
         return height;
     }
 
-    static bool downloadable(const MessageFile &file)
+    static bool matchesOriginal(const QVector<MessageFile> &entries, const MessageFile &file, bool preview = false)
     {
-        return file.downloadUrl.isValid() && file.downloadUrl.scheme() == QStringLiteral("https") &&
-               !file.downloadUrl.host().isEmpty() && file.downloadUrl.userInfo().isEmpty();
-    }
-
-    static bool matchesOriginal(const QVector<MessageFile> &entries, const MessageFile &file)
-    {
-        return std::any_of(entries.cbegin(), entries.cend(), [&file](const MessageFile &current) {
+        return std::any_of(entries.cbegin(), entries.cend(), [&file, preview](const MessageFile &current) {
             return current.downloadUrl == file.downloadUrl && current.id == file.id
-                && current.diskObjectId == file.diskObjectId && current.name == file.name;
+                && current.diskObjectId == file.diskObjectId && current.name == file.name
+                && (!preview || current.previewUrl == file.previewUrl);
         });
     }
 
     QRect photoMenuRect(const QRect &thumbnail, const MessageFile &file) const
     {
-        if (thumbnail.width() < 32 || !m_messagePhotoMenu || !downloadable(file))
+        if (thumbnail.width() < 32 || !m_messagePhotoMenu || (!downloadable(file) && !preview(file)))
             return {};
         return QRect(thumbnail.right() - 28, thumbnail.top() + 5, 24, 24);
     }
 
-    QRect firstFileRect(const QRect &row, const QModelIndex &index, int role) const
+    QRect firstFileRect(const QRect &row, const QModelIndex &index, AttachmentSection section) const
     {
         const auto bubble = messageBubble(row, index);
-        if (role == ReplyFiles) {
-            return QRect(bubble.left() + 16, replyHeaderRect(row, index).bottom() + 2,
-                         bubble.width() - 32, fileControlHeight);
-        }
-        const int top = messageContentRect(row, index).bottom() + 3;
-        return QRect(bubble.left() + 10, top, bubble.width() - 20, fileControlHeight);
+        const int top = section == AttachmentSection::Media
+            ? bubble.top() + messageBodyTop + messageHeader(index) + messageContext(index)
+            : messageContentRect(row, index).bottom() + 3;
+        return QRect(bubble.left() + 10, top, qMax(1, bubble.width() - 20), fileControlHeight);
     }
 
-    void paintFiles(QPainter &p, QRect start, const QVector<MessageFile> &entries) const
+    void paintMediaFrame(QPainter &p, const QRect &frame, const MessageFile &file, bool crop = false) const
     {
-        for (const auto &file : entries) {
-            const auto geometry = fileGeometry(start, file);
-            const auto &card = geometry.control;
-            if (const auto *photo = preview(file)) {
-                const auto &thumbnail = geometry.thumbnail;
-                fill(p, thumbnail, QColor("#e2ede8"), QColor("#bbd3ca"), 6);
-                QRect image(QPoint{}, photo->size().scaled(thumbnail.size(), Qt::KeepAspectRatio));
-                image.moveCenter(thumbnail.center());
-                p.save();
-                QPainterPath clip;
-                clip.addRoundedRect(thumbnail, 6, 6);
-                p.setClipPath(clip, Qt::IntersectClip);
-                p.setRenderHint(QPainter::SmoothPixmapTransform);
-                p.drawPixmap(image, *photo);
-                p.restore();
-                const auto menu = photoMenuRect(thumbnail, file);
-                if (!menu.isEmpty()) {
-                    fill(p, menu, QColor("#203945"), Qt::transparent, 5);
-                    ui::paintGlyph(p, ui::Glyph::More, QRectF(menu).adjusted(3, 3, -3, -3), Qt::white);
-                }
-                start.moveTop(geometry.nextTop());
-                continue;
+        fill(p, frame, QColor("#e2ede8"), QColor("#bbd3ca"), 6);
+        if (const auto *photo = preview(file)) {
+            const auto aspect = crop ? Qt::KeepAspectRatioByExpanding : Qt::KeepAspectRatio;
+            QRect image(QPoint{}, photo->size().scaled(frame.size(), aspect));
+            image.moveCenter(frame.center());
+            p.save();
+            QPainterPath clip;
+            clip.addRoundedRect(frame, 6, 6);
+            p.setClipPath(clip, Qt::IntersectClip);
+            p.setRenderHint(QPainter::SmoothPixmapTransform);
+            p.drawPixmap(image, *photo);
+            p.restore();
+        } else if (crop || !file.isVideo || !downloadable(file)) {
+            const auto &icon = ui::attachmentIcon(file.name);
+            const QRect glyph(0, 0, 21, 21);
+            ui::paintGlyph(p, icon.glyph, glyph.translated(frame.center() - glyph.center()), icon.ink);
+        }
+    }
+
+    void paintMediaTile(QPainter &p, const QRect &thumbnail, const MessageFile &file) const
+    {
+        paintMediaFrame(p, thumbnail, file);
+        if (file.isVideo && downloadable(file) && thumbnail.width() >= 40) {
+            const auto center = thumbnail.center();
+            p.save();
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(32, 57, 69, 218));
+            p.drawEllipse(center, 19, 19);
+            p.setBrush(Qt::white);
+            p.drawPolygon(QPolygon{center + QPoint(-4, -8), center + QPoint(9, 0), center + QPoint(-4, 8)});
+            p.restore();
+        }
+        const auto menu = photoMenuRect(thumbnail, file);
+        if (!menu.isEmpty()) {
+            fill(p, menu, QColor("#203945"), Qt::transparent, 5);
+            ui::paintGlyph(p, ui::Glyph::More, QRectF(menu).adjusted(3, 3, -3, -3), Qt::white);
+        }
+    }
+
+    void paintFiles(QPainter &p, const QRect &start, const QVector<MessageFile> &entries, AttachmentSection section) const
+    {
+        layoutFiles(entries, start, section, [&](const MessageFile &file, const FileGeometry &geometry) {
+            if (!geometry.thumbnail.isEmpty()) {
+                paintMediaTile(p, geometry.thumbnail, file);
+                return false;
             }
+            const auto &card = geometry.control;
             fill(p, card, QColor("#f6faf8"), QColor("#bbd3ca"), 6);
             const QRect icon(card.left() + 6, card.top() + 7, 34, 28);
             const auto &typeIcon = ui::attachmentIcon(file.name);
@@ -1399,16 +1598,57 @@ private:
             const int textLeft = icon.right() + 7;
             const QRect textArea(textLeft, card.top() + fileTitleTop, qMax(1, card.right() - textLeft - 5),
                                  fileTitleHeight);
-            const bool viewOriginal = geometry.thumbnail.isEmpty() && file.isImage && downloadable(file);
-            line(p, textArea, viewOriginal ? QStringLiteral("Открыть %1").arg(file.name) : file.name,
-                 ui::bodyTextPixels, viewOriginal ? Accent : Ink, true);
+            const bool opensMedia = (file.isImage || file.isVideo) && downloadable(file);
+            const auto title = !opensMedia ? file.name : (file.isVideo ? QStringLiteral("Воспроизвести %1")
+                                                                      : QStringLiteral("Открыть %1")).arg(file.name);
+            line(p, textArea, title, ui::bodyTextPixels, opensMedia ? Accent : Ink, true);
             QStringList metadata;
             if (file.size >= 0)
                 metadata.append(QLocale().formattedDataSize(file.size, 1));
             metadata.append(downloadable(file) ? QStringLiteral("Сохранить") : QStringLiteral("Скачивание недоступно"));
             line(p, textArea.translated(0, fileTitleHeight), metadata.join(QStringLiteral(" · ")),
                  ui::secondaryTextPixels, Accent);
-            start.moveTop(geometry.nextTop());
+            return false;
+        }, nullptr);
+    }
+
+    void paintQuote(QPainter &p, const QRect &quote, const QModelIndex &index, bool outgoing) const
+    {
+        fill(p, quote, outgoing ? QColor("#b5d9c9") : QColor("#e8f1ee"), Qt::transparent, 5);
+        p.setPen(QColor("#54877a"));
+        p.drawLine(quote.left() + 4, quote.top() + 5, quote.left() + 4, quote.bottom() - 5);
+        const auto attachments = replyAttachments(index);
+        const auto excerpt = index.data(ReplyPreview).toString();
+        auto text = quote.adjusted(11, 2, -6, 0);
+        text.setHeight(messageQuoteLineHeight);
+        if (attachments.representative) {
+            const auto thumbnail = quoteMediaRect(quote);
+            if (!thumbnail.isEmpty()) {
+                paintMediaFrame(p, thumbnail, *attachments.representative, true);
+                text.setLeft(thumbnail.right() + 8);
+            }
+        }
+        line(p, text, index.data(ReplyByline).toString(), ui::secondaryTextPixels, Accent, true);
+        text.translate(0, messageQuoteLineHeight);
+        const auto attachmentsOnly = excerpt == QLatin1String("Вложение");
+        if (attachments.representative) {
+            auto media = attachments.media > 1 ? QStringLiteral("Галерея · %1 медиа").arg(attachments.media)
+                : attachments.representative->isVideo ? QStringLiteral("Видео") : QStringLiteral("Фотография");
+            if (attachments.documents)
+                media += QStringLiteral(" · Файлы: %1").arg(attachments.documents);
+            line(p, text, media, ui::secondaryTextPixels, Ink, true);
+            if (!attachmentsOnly) {
+                text.translate(0, messageQuoteLineHeight);
+                quotePreview(p, text, excerpt, ConversationMetaInk);
+            }
+        } else {
+            auto caption = excerpt;
+            if (attachments.documents) {
+                const auto description = attachments.documents == 1 ? attachments.firstDocument
+                    : QStringLiteral("Файлы · %1").arg(attachments.documents);
+                caption = attachmentsOnly ? description : caption + QStringLiteral(" · ") + description;
+            }
+            quotePreview(p, text, caption, Ink);
         }
     }
 
@@ -1585,11 +1825,11 @@ private:
         p.restore();
     }
 
-    static void quotePreview(QPainter &painter, const QRect &rect, const QString &text)
+    static void quotePreview(QPainter &painter, const QRect &rect, const QString &text, const QColor &color)
     {
         const auto formats = messageEmojiFormats(text);
         if (formats.isEmpty()) {
-            line(painter, rect, text, ui::secondaryTextPixels);
+            line(painter, rect, text, ui::secondaryTextPixels, color);
             return;
         }
 
@@ -1610,7 +1850,7 @@ private:
 
         painter.save();
         painter.setClipRect(rect, Qt::IntersectClip);
-        painter.setPen(Ink);
+        painter.setPen(color);
         layout.draw(&painter, QPointF(rect.left(), rect.top() + (rect.height() - row.height()) / 2));
         painter.restore();
     }
@@ -1795,24 +2035,13 @@ private:
                  forward, ui::secondaryTextPixels, Accent, true);
             contextTop += messageForwardHeight;
         }
-        const auto reply = index.data(ReplyByline).toString();
-        if (!reply.isEmpty()) {
-            const auto entries = files(index, ReplyFiles);
-            auto quote = replyHeaderRect(r, index);
-            quote.setHeight(quote.height() + fileHeight(entries, bubble.width() - 32));
-            fill(p, quote, outgoing ? QColor("#b5d9c9") : QColor("#e8f1ee"), Qt::transparent, 5);
-            p.setPen(QColor("#54877a"));
-            p.drawLine(quote.left() + 4, quote.top() + 5, quote.left() + 4, quote.bottom() - 5);
-            line(p, QRect(quote.left() + 11, quote.top() + 2, quote.width() - 16, messageQuoteLineHeight),
-                 reply, ui::secondaryTextPixels, Accent, true);
-            quotePreview(p, QRect(quote.left() + 11, quote.top() + 2 + messageQuoteLineHeight, quote.width() - 16, messageQuoteLineHeight),
-                         index.data(ReplyPreview).toString());
-            paintFiles(p, firstFileRect(r, index, ReplyFiles), entries);
-        }
+        if (!index.data(ReplyByline).toString().isEmpty())
+            paintQuote(p, replyHeaderRect(r, index), index, outgoing);
         const auto entries = files(index, MessageFiles);
+        paintFiles(p, firstFileRect(r, index, AttachmentSection::Media), entries, AttachmentSection::Media);
         if (!detail.isEmpty() || entries.isEmpty())
             body(p, messageContentRect(r, index), index, detail, Ink);
-        paintFiles(p, firstFileRect(r, index, MessageFiles), entries);
+        paintFiles(p, firstFileRect(r, index, AttachmentSection::Documents), entries, AttachmentSection::Documents);
         if (m_linkPreview)
             paintLinkCards(p, r, index);
         const auto delivery = deliveryText(index);

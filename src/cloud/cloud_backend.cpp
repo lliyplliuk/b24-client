@@ -58,7 +58,9 @@ const QString soundMuted = QStringLiteral("soundMuted");
 const QString volumeGeneral = QStringLiteral("soundVolumeGeneral");
 const QString volumeMessages = QStringLiteral("soundVolumeMessages");
 const QString notifyScheme = QStringLiteral("notifyScheme");
-const QStringList simpleChannels{QStringLiteral("notifySchemeSendSite"), QStringLiteral("notifySchemeSendEmail"),
+const QString notifyOnComputer = QStringLiteral("notifySchemeSendSite");
+const QString simpleNotifyScheme = QStringLiteral("simple");
+const QStringList simpleChannels{notifyOnComputer, QStringLiteral("notifySchemeSendEmail"),
                                  QStringLiteral("notifySchemeSendPush")};
 constexpr qsizetype maxResponse = 2 * 1024 * 1024;
 constexpr int maxRequests = 12;
@@ -74,6 +76,18 @@ qsizetype notificationHistoryLimit(int olderPages)
 {
     constexpr auto maxPages = (std::numeric_limits<qsizetype>::max() - maxNotifications) / notificationPageSize;
     return maxNotifications + qMin<qsizetype>(olderPages, maxPages) * notificationPageSize;
+}
+
+void trimNotificationHistory(QVector<Notification> &notices, int olderPages)
+{
+    if (notices.size() <= maxNotifications)
+        return;
+    const auto historyLimit = notificationHistoryLimit(olderPages);
+    qsizetype ordinary = 0;
+    qsizetype visible = 0;
+    notices.removeIf([&](const Notification &notice) {
+        return notice.ordinaryChatMessage ? ++ordinary > maxNotifications : ++visible > historyLimit;
+    });
 }
 
 QString notificationRequestKey(quint64 scopeRevision, const QString &key)
@@ -167,6 +181,16 @@ bool isTaskChatType(const QString &type)
     const auto normalized = type.toLower();
     return normalized == QLatin1String("taskstask") || normalized == QLatin1String("tasks")
         || normalized == QLatin1String("tasks_task");
+}
+
+bool isTaskChatMetadata(const QString &kind, const QJsonObject &entity)
+{
+    return isTaskChatType(kind) || isTaskChatType(field(entity, {"type"}));
+}
+
+bool isRecentTaskChat(bool metadataTaskChat, bool listedTask, const QJsonArray &sections)
+{
+    return metadataTaskChat || listedTask || sections.contains(QStringLiteral("tasksTask"));
 }
 
 std::optional<bool> notificationFlag(const QJsonValue &value)
@@ -756,7 +780,7 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     });
     connect(&m_configExpiry, &QTimer::timeout, this, [this] { scheduleReconnect(true); });
     connect(&m_refresh, &QTimer::timeout, this, &CloudBackend::refreshDirtyViews);
-    m_historyCatchup.setInterval(60 * 1000);
+    m_historyCatchup.setInterval(15 * 1000);
     m_historyCatchup.setTimerType(Qt::VeryCoarseTimer);
     m_historyCatchup.setObjectName(QStringLiteral("active-history-catchup"));
     m_historyCatchup.setParent(this);
@@ -798,20 +822,21 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
         m_attempt = 0;
         m_watchdog.stop();
         m_heartbeat.start(heartbeatIntervalMs);
-        const bool refreshSounds = m_resumed && (!m_chatSoundSettings.isEmpty() || m_inflightOperations.contains(soundsOp));
+        const bool refreshPopupSettings = m_resumed && (!m_chatPopupSettings.isEmpty() || m_inflightOperations.contains(soundsOp));
         if (m_resumed) {
             for (auto &state : m_dialogMessageStates)
                 state.muteFromPull = false;
         }
-        if (refreshSounds) {
-            ++m_soundSettingsGeneration;
-            m_chatSoundSettings = {};
+        if (refreshPopupSettings) {
+            ++m_chatPopupSettingsGeneration;
+            m_chatPopupSettings = {};
+            m_chatPopupSettingsKnown = false;
             m_pendingChatPopups.clear();
-            m_nextSoundSettingsRequest = 0;
+            m_nextChatPopupSettingsRequest = 0;
         }
         setOnline(true);
-        if (refreshSounds)
-            loadChatSoundSettings();
+        if (refreshPopupSettings)
+            loadChatPopupSettings();
         if (m_resumed) {
             loadChatBadges();
             invalidateActiveView();
@@ -904,15 +929,16 @@ void CloudBackend::stop()
     m_configExpiry.stop();
     m_historiesWaitingForIdentity.clear();
     m_triedHistoryIdentity = false;
-    ++m_soundSettingsGeneration;
-    m_chatSoundSettings = {};
+    ++m_chatPopupSettingsGeneration;
+    m_chatPopupSettings = {};
+    m_chatPopupSettingsKnown = false;
     m_notificationSettings.clear();
     m_notificationSettingChanges.clear();
     m_notificationSettingsRevision = 0;
     m_dialogMessageStates.clear();
     m_messageViewerMembership.clear();
     m_messageViewerCounts.clear();
-    m_nextSoundSettingsRequest = 0;
+    m_nextChatPopupSettingsRequest = 0;
     m_socket.abort();
     const auto pending = m_requests;
     for (auto *reply : pending)
@@ -932,15 +958,40 @@ void CloudBackend::setForeground(bool foreground)
 {
     if (m_foreground == foreground)
         return;
+    const bool wasWatching = canAutoRefreshChats();
     m_foreground = foreground;
     if (foreground && m_activeSection == 1)
         publishProjectUnreadCounts();
     if (foreground && m_started)
         invalidateActiveView();
-    else {
+    updateChatViewActivity(wasWatching);
+}
+
+void CloudBackend::setWorkspaceVisible(bool visible)
+{
+    if (m_workspaceVisible == visible)
+        return;
+    const bool wasWatching = canAutoRefreshChats();
+    m_workspaceVisible = visible;
+    updateChatViewActivity(wasWatching);
+}
+
+void CloudBackend::updateChatViewActivity(bool wasWatching)
+{
+    const bool watching = canAutoRefreshChats();
+    if (wasWatching == watching)
+        return;
+    if (!watching) {
         m_refresh.stop();
         ++m_chatHistoryRetry.revision;
         ++m_taskHistoryRetry.revision;
+    } else if (!m_foreground && m_started) {
+        if (m_activeSection == 0) {
+            m_recentDirty = true;
+            m_chatDirty = !m_openDialog.isEmpty();
+        }
+        m_taskMessagesDirty = !m_openTask.isEmpty();
+        scheduleRefresh();
     }
     updateHistoryCatchup();
 }
@@ -981,8 +1032,10 @@ void CloudBackend::updateHistoryCatchup(bool restart)
     const bool watchingChat = m_activeSection == 0 && !m_openDialog.isEmpty();
     // A task card can be open over any workspace section.
     const bool watchingTask = !m_openTask.isEmpty();
-    const bool shouldRun = m_started && m_foreground && !m_authExpired && (watchingChat || watchingTask);
-    if (shouldRun && (restart || !m_historyCatchup.isActive()))
+    const bool shouldRun = m_started && canAutoRefreshChats() && !m_authExpired && (watchingChat || watchingTask);
+    // With two histories open, traffic in one must not postpone the safety refresh for the other.
+    const bool restartSingleHistory = restart && !(watchingChat && watchingTask);
+    if (shouldRun && (restartSingleHistory || !m_historyCatchup.isActive()))
         m_historyCatchup.start();
     else if (!shouldRun)
         m_historyCatchup.stop();
@@ -1119,17 +1172,17 @@ void CloudBackend::invalidateActiveView()
 
 void CloudBackend::scheduleRefresh()
 {
-    if (!m_started || !m_foreground || m_authExpired || m_refresh.isActive())
+    if (!m_started || !canAutoRefreshChats() || m_authExpired || m_refresh.isActive())
         return;
     const bool sectionDirty = m_activeSection == 0 ? m_recentDirty || m_chatDirty
-        : m_activeSection == 1 ? m_boardDirty : m_activeSection == 2 && m_notificationsDirty;
+        : m_foreground && (m_activeSection == 1 ? m_boardDirty : m_activeSection == 2 && m_notificationsDirty);
     if (sectionDirty || m_taskMessagesDirty)
         m_refresh.start(250);
 }
 
 void CloudBackend::refreshDirtyViews()
 {
-    if (!m_started || !m_foreground || m_authExpired)
+    if (!m_started || !canAutoRefreshChats() || m_authExpired)
         return;
     const auto takeDirty = [this](bool &dirty, const QString &operation) {
         if (!dirty || m_requests.size() >= maxRequests || m_inflightOperations.contains(operation))
@@ -1142,11 +1195,11 @@ void CloudBackend::refreshDirtyViews()
             loadRecentChats(m_showTaskChats);
         if (!m_openDialog.isEmpty() && takeDirty(m_chatDirty, QStringLiteral("chat:") + m_openDialog))
             requestChatMessages(m_openDialog);
-    } else if (m_activeSection == 1) {
+    } else if (m_foreground && m_activeSection == 1) {
         if (!m_openBoard.isEmpty() && takeDirty(m_boardDirty,
             boardReadKey(QStringLiteral("board:") + m_openBoard, m_boardPageGeneration)))
             requestProjectBoard(m_openBoard);
-    } else if (m_activeSection == 2 && takeDirty(m_notificationsDirty,
+    } else if (m_foreground && m_activeSection == 2 && takeDirty(m_notificationsDirty,
                                                 notificationRequestKey(m_accountScopeRevision, notificationsOp))) {
         requestNotifications();
     }
@@ -1218,6 +1271,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
         ? m_taskHistoryRetry : m_chatHistoryRetry).revision;
     const bool accountScoped = personLookup || operation.startsWith(currentPersonPrefix) || !mutationKey.isEmpty() || latestHistory
         || key.startsWith(notificationBatchPrefix) || key.startsWith(taskActionRequestPrefix)
+        || key.startsWith(QLatin1String(chatImageUploadRequestPrefix))
         || operation.startsWith(QLatin1String("search-task-chats:"))
         || key.startsWith(taskCardReadPrefix) || operation.startsWith(QLatin1String("task-files:"))
         || operation.startsWith(QLatin1String("project-unread:"));
@@ -1573,6 +1627,7 @@ void CloudBackend::rememberCurrentUser(const QString &id)
     if (accountChanged) {
         ++m_accountScopeRevision;
         ++m_sessionRevision;
+        clearRasterAssets();
         m_taskCardReads.clear();
         m_taskAttachmentRevisions.clear();
         cancelSessionConfirmation();
@@ -1618,7 +1673,7 @@ Chat CloudBackend::chatFromMetadata(const QString &dialog, const QJsonObject &ro
     auto entity = chat.value(QStringLiteral("entityLink")).toObject();
     if (entity.isEmpty())
         entity = row.value(QStringLiteral("entityLink")).toObject();
-    result.taskChat = isTaskChatType(result.kind) || isTaskChatType(field(entity, {"type"}));
+    result.taskChat = isTaskChatMetadata(result.kind, entity);
     if (result.taskChat)
         result.taskId = numericId(field(entity, {"id"}));
     QString avatar;
@@ -2127,7 +2182,7 @@ void CloudBackend::applyRecentPull(const QString &command, const QString &dialog
     const auto user = params.value(QStringLiteral("users")).toObject().value(dialog).toObject();
     auto candidate = chatFromMetadata(dialog, {}, chat, user);
     candidate.serverChatId = chatId.toLongLong();
-    candidate.taskChat = candidate.taskChat || listedTask || sections.contains(QStringLiteral("tasksTask"));
+    candidate.taskChat = isRecentTaskChat(candidate.taskChat, listedTask, sections);
     const bool listed = candidate.taskChat ? listedTask : listedOrdinary;
     const auto previous = m_recentOverlays.constFind(dialog);
     const bool knownRow = listed || (previous != m_recentOverlays.cend() && !previous->preview.id.isEmpty());
@@ -2267,7 +2322,7 @@ bool CloudBackend::scheduleHistoryRetry(const QString &operation, quint64 revisi
     const auto dialog = attempt.dialog;
     const auto scope = m_accountScopeRevision;
     const auto current = [this, task, key, dialog, revision, scope] {
-        return m_started && m_foreground && !m_authExpired && scope == m_accountScopeRevision
+        return m_started && canAutoRefreshChats() && !m_authExpired && scope == m_accountScopeRevision
             && !dialog.isEmpty() && (task ? m_openTask == key && m_taskDialogs.value(key) == dialog
                                          : m_activeSection == 0 && m_openDialog == dialog)
             && (task ? m_taskHistoryRetry : m_chatHistoryRetry).revision == revision;
@@ -2309,8 +2364,10 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
             return true;
         if (m_dialogMessageStates.value(dialogId).historyGeneration == generation)
             return false;
-        if (task ? m_openTask == key : m_openDialog == dialogId)
-            loadMessages(key, dialogId, task);
+        if (task ? m_openTask == key : m_openDialog == dialogId) {
+            (task ? m_taskMessagesDirty : m_chatDirty) = true;
+            scheduleRefresh();
+        }
         return true;
     };
     const auto expectedChatId = badgeChatId(dialogId);
@@ -2510,7 +2567,7 @@ void CloudBackend::requestChatMessages(const QString &dialogId)
     }
     if (m_activeSection == 0)
         updateHistoryCatchup(true);
-    if (m_activeSection == 0 && m_foreground && (m_requests.size() >= maxRequests
+    if (m_activeSection == 0 && canAutoRefreshChats() && (m_requests.size() >= maxRequests
         || m_inflightOperations.contains(QStringLiteral("chat:") + dialogId))) {
         m_chatDirty = true;
         scheduleRefresh();
@@ -3528,9 +3585,10 @@ void CloudBackend::loadLinkStage(const QString &projectId, const QString &stageI
             if (m_authExpired || settingsScope() != scope)
                 stages.reset();
             const auto entries = stages.value_or(QVector<Stage>{});
+            constexpr int stageSnapshotTtlMs = 60 * 1000;
             if (stages)
                 m_linkStageSnapshots.insert(key, new LinkStageSnapshot{
-                    entries, QDateTime::currentMSecsSinceEpoch() + m_historyCatchup.interval()});
+                    entries, QDateTime::currentMSecsSinceEpoch() + stageSnapshotTtlMs});
             for (const auto &complete : pending)
                 complete(entries);
         });
@@ -4734,7 +4792,7 @@ void CloudBackend::requestTaskMessages(const QString &taskId)
         m_taskMessagesDirty = false;
     }
     updateHistoryCatchup(true);
-    if (m_foreground && (m_requests.size() >= maxRequests
+    if (canAutoRefreshChats() && (m_requests.size() >= maxRequests
         || m_inflightOperations.contains(QStringLiteral("task-messages:") + taskId))) {
         m_taskMessagesDirty = true;
         scheduleRefresh();
@@ -4939,9 +4997,7 @@ void CloudBackend::publishNotificationPage(QVector<Notification> items)
     std::stable_sort(items.begin(), items.end(), [](const Notification &left, const Notification &right) {
         return left.createdAt > right.createdAt;
     });
-    const auto limit = notificationHistoryLimit(m_notificationOlderPages);
-    if (items.size() > limit)
-        items.resize(limit);
+    trimNotificationHistory(items, m_notificationOlderPages);
     m_notifications = std::move(items);
     emit notificationsLoaded(m_notifications);
     publishNotificationHistoryPageState();
@@ -5406,7 +5462,7 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
             remember(key);
         if (params.contains(notifyScheme))
             m_notificationSettings.clear();
-        applyChatSoundSettings(params, false);
+        applyChatPopupSettings(params, ChatPopupSettingsSource::Push);
         return;
     }
     auto dialog = validDialog(field(params, {"dialogId"}));
@@ -5624,10 +5680,14 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
         entry.text = notificationDisplayText(content);
         auto &targets = entry.targets;
         targets = notificationTargets(m_session.origin, content);
-        if (auto target = incomingMessageTarget(params, command == QLatin1String("messageChat")); target) {
+        auto target = incomingMessageTarget(params, command == QLatin1String("messageChat"), true);
+        QString taskId;
+        if (target) {
             const auto chatMap = params.value(QStringLiteral("chat")).toObject();
             const auto targetChatId = QString::number(groupDialogChatId(target->id));
             auto eventChat = chatMap.value(targetChatId).toObject();
+            if (eventChat.isEmpty() && numericId(field(chatMap, {"id", "chatId", "CHAT_ID"})) == targetChatId)
+                eventChat = chatMap;
             const auto knownDialog = oneOf(eventChat, {"dialogId"});
             if (!knownDialog.isUndefined() && validDialog(string(knownDialog)) != target->id)
                 eventChat = {};
@@ -5638,12 +5698,21 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
                     break;
                 }
             }
-            const auto taskId = target->id.startsWith(QLatin1String("chat"))
+            taskId = target->id.startsWith(QLatin1String("chat"))
                 ? notificationTaskId(target->id, eventChat) : QString();
-            target->taskChat = !taskId.isEmpty() || isTaskChatType(field(eventChat, {"type", "kind"}))
+            const bool listedTask = std::any_of(m_recentTaskChatItems.cbegin(), m_recentTaskChatItems.cend(),
+                [&target](const Chat &chat) { return chat.id == target->id; });
+            const auto sections = params.value(QStringLiteral("recentConfig")).toObject().value(QStringLiteral("sections")).toArray();
+            const bool metadataTaskChat = isTaskChatMetadata(field(eventChat, {"type", "kind"}),
+                eventChat.value(QStringLiteral("entityLink")).toObject())
+                || isTaskChatType(field(eventChat, {"entityType", "entity_type"}));
+            target->taskChat = !taskId.isEmpty() || isRecentTaskChat(metadataTaskChat, listedTask, sections)
                 || std::any_of(m_taskDialogs.cbegin(), m_taskDialogs.cend(), [&target](const auto &known) {
                     return known == target->id;
                 });
+            entry.ordinaryChatMessage = !target->taskChat;
+        }
+        if (target && !target->messageId.isEmpty()) {
             if (!taskId.isEmpty()) {
                 const auto taskLink = QStringLiteral("[URL=/tasks/task/view/%1/]Задача #%1[/URL]").arg(taskId);
                 const auto plainMessage = entry.text;
@@ -5684,9 +5753,7 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
             entry.text = entry.title;
     }
     m_notifications.prepend(entry);
-    const auto limit = notificationHistoryLimit(m_notificationOlderPages);
-    if (m_notifications.size() > limit)
-        m_notifications.resize(limit);
+    trimNotificationHistory(m_notifications, m_notificationOlderPages);
     emit notificationsLoaded(m_notifications);
     if (m_portalStatus == QLatin1String("dnd"))
         return;
@@ -5710,7 +5777,7 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
     if (!fresh || (!published.isValid() && !hasAge) || author.isEmpty() || dialog.isEmpty()
         || notify == false || messageNotify == false || (!important && notify != true))
         return;
-    if (chatSoundEnabled() == false)
+    if (chatPopupsEnabled() == false)
         return;
 
     const auto pullChats = params.value(QStringLiteral("chat")).toObject();
@@ -5727,7 +5794,7 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
         m_pendingChatPopups.enqueue(std::move(popup));
         deliverChatPopups();
         if (!m_pendingChatPopups.isEmpty())
-            loadChatSoundSettings();
+            loadChatPopupSettings();
     }
 }
 
@@ -5752,13 +5819,21 @@ bool CloudBackend::chatMuted(const ChatPopup &popup) const
         || (state != m_dialogMessageStates.cend() && (state->muted.value_or(false) || mutedListContains(state->muteList, m_userId)));
 }
 
-std::optional<bool> CloudBackend::chatSoundEnabled() const
+std::optional<bool> CloudBackend::chatPopupsEnabled() const
 {
-    const auto isMuted = notificationFlag(m_chatSoundSettings.value(soundMuted));
+    const auto scheme = m_chatPopupSettings.value(notifyScheme);
+    if (scheme == simpleNotifyScheme) {
+        if (const auto desktop = notificationFlag(m_chatPopupSettings.value(notifyOnComputer)))
+            return desktop;
+    }
+    if (!m_chatPopupSettingsKnown && scheme != QLatin1String("expert"))
+        return std::nullopt;
+
+    const auto isMuted = notificationFlag(m_chatPopupSettings.value(soundMuted));
     bool generalKnown = false;
     bool messagesKnown = false;
-    const auto general = m_chatSoundSettings.value(volumeGeneral).toVariant().toDouble(&generalKnown);
-    const auto messages = m_chatSoundSettings.value(volumeMessages).toVariant().toDouble(&messagesKnown);
+    const auto general = m_chatPopupSettings.value(volumeGeneral).toVariant().toDouble(&generalKnown);
+    const auto messages = m_chatPopupSettings.value(volumeMessages).toVariant().toDouble(&messagesKnown);
     if (isMuted == true || (generalKnown && general <= 0) || (messagesKnown && messages <= 0))
         return false;
     if (isMuted == false && generalKnown && messagesKnown)
@@ -5766,12 +5841,27 @@ std::optional<bool> CloudBackend::chatSoundEnabled() const
     return std::nullopt;
 }
 
-void CloudBackend::applyChatSoundSettings(const QJsonObject &settings, bool snapshot)
+void CloudBackend::applyChatPopupSettings(const QJsonObject &settings, ChatPopupSettingsSource source)
 {
-    for (const auto *key : {&soundMuted, &volumeGeneral, &volumeMessages}) {
+    const bool push = source == ChatPopupSettingsSource::Push;
+    const bool initial = source == ChatPopupSettingsSource::InitialSnapshot;
+    if (settings.value(notifyScheme) == simpleNotifyScheme && !notificationFlag(settings.value(notifyOnComputer))) {
+        if (push && m_chatPopupSettings.value(notifyScheme) != simpleNotifyScheme) {
+            // A scheme change can omit the computer setting. Refresh it before displaying a banner.
+            m_chatPopupSettings.remove(notifyOnComputer);
+            m_chatPopupSettingsKnown = false;
+            ++m_chatPopupSettingsGeneration;
+            m_nextChatPopupSettingsRequest = 0;
+        } else if (source == ChatPopupSettingsSource::RefreshSnapshot) {
+            m_chatPopupSettings.remove(notifyOnComputer);
+        }
+    }
+    if (!push && !settings.isEmpty())
+        m_chatPopupSettingsKnown = true;
+    for (const auto *key : {&notifyScheme, &notifyOnComputer, &soundMuted, &volumeGeneral, &volumeMessages}) {
         const auto setting = settings.value(*key);
-        if (!setting.isUndefined() && (!snapshot || !m_chatSoundSettings.contains(*key)))
-            m_chatSoundSettings.insert(*key, setting);
+        if (!setting.isUndefined() && (!initial || !m_chatPopupSettings.contains(*key)))
+            m_chatPopupSettings.insert(*key, setting);
     }
     deliverChatPopups();
 }
@@ -5803,7 +5893,7 @@ void CloudBackend::deliverChatPopups()
         m_pendingChatPopups.clear();
         return;
     }
-    const auto enabled = chatSoundEnabled();
+    const auto enabled = chatPopupsEnabled();
     if (enabled == false) {
         m_pendingChatPopups.clear();
         return;
@@ -5831,9 +5921,10 @@ void CloudBackend::requestNotificationSettings(const QString &operation, const Q
                                                std::optional<quint64> started)
 {
     const auto before = started.value_or(m_notificationSettingsRevision);
-    withCurrentUser(operation, [this, operation, updated, expected, before](qint64 userId) {
+    const auto popupGeneration = m_chatPopupSettingsGeneration;
+    withCurrentUser(operation, [this, operation, updated, expected, before, popupGeneration](qint64 userId) {
         ajax(QStringLiteral("im.v2.Settings.General.list"), {{QStringLiteral("userId"), QString::number(userId)}},
-             operation, [this, operation, updated, expected, before](QJsonValue result) {
+             operation, [this, operation, updated, expected, before, popupGeneration](QJsonValue result) {
             auto data = result.toObject();
             for (auto entry = m_notificationSettingChanges.cbegin(); entry != m_notificationSettingChanges.cend(); ++entry)
                 if (entry.value().first > before)
@@ -5847,17 +5938,18 @@ void CloudBackend::requestNotificationSettings(const QString &operation, const Q
                 if (ok && value >= 0 && value <= 100)
                     settings.insert(name, value);
             }
-            if (data.value(notifyScheme) == QLatin1String("simple")) {
+            if (data.value(notifyScheme) == simpleNotifyScheme) {
                 for (const auto &channel : simpleChannels)
                     if (const auto enabled = notificationFlag(data.value(channel)))
                         settings.insert(channel, *enabled);
             }
             m_notificationSettings = settings;
+            if (popupGeneration == m_chatPopupSettingsGeneration)
+                applyChatPopupSettings(data, ChatPopupSettingsSource::RefreshSnapshot);
             if (settings.isEmpty())
                 return failShape(operation);
             if (!updated.isEmpty() && settings.contains(updated) && data.contains(updated))
                 m_notificationSettingChanges.insert(updated, {++m_notificationSettingsRevision, data.value(updated)});
-            applyChatSoundSettings(data, false);
             emit notificationSettingsLoaded(settings, updated);
             if (!updated.isEmpty() && (!settings.contains(updated) || settings.value(updated).toInt() != expected)) {
                 emit failed(operation, QStringLiteral("Портал не подтвердил изменение настройки"));
@@ -5888,17 +5980,17 @@ void CloudBackend::updateNotificationSetting(const QString &name, int value)
     });
 }
 
-void CloudBackend::loadChatSoundSettings()
+void CloudBackend::loadChatPopupSettings()
 {
     const auto now = QDateTime::currentMSecsSinceEpoch();
-    if (m_inflightOperations.contains(soundsOp) || now < m_nextSoundSettingsRequest)
+    if (m_inflightOperations.contains(soundsOp) || now < m_nextChatPopupSettingsRequest)
         return;
-    m_nextSoundSettingsRequest = now + 3000;
+    m_nextChatPopupSettingsRequest = now + 3000;
     const bool hadUser = !m_userId.isEmpty();
-    const auto generation = m_soundSettingsGeneration;
+    const auto generation = m_chatPopupSettingsGeneration;
     withCurrentUser(soundsOp, [this, hadUser, generation](qint64 userId) {
-        if (generation != m_soundSettingsGeneration) {
-            loadChatSoundSettings();
+        if (generation != m_chatPopupSettingsGeneration) {
+            loadChatPopupSettings();
             return;
         }
         if (!hadUser) {
@@ -5910,10 +6002,11 @@ void CloudBackend::loadChatSoundSettings()
         }
         ajax(QStringLiteral("im.v2.Settings.General.list"), {{QStringLiteral("userId"), QString::number(userId)}},
              soundsOp, [this, generation](QJsonValue data) {
-            if (generation == m_soundSettingsGeneration)
-                applyChatSoundSettings(data.toObject(), true);
-            else
-                loadChatSoundSettings();
+            if (generation != m_chatPopupSettingsGeneration) {
+                loadChatPopupSettings();
+                return;
+            }
+            applyChatPopupSettings(data.toObject(), ChatPopupSettingsSource::InitialSnapshot);
         });
     });
 }

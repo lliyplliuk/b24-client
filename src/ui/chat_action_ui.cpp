@@ -26,6 +26,14 @@
 
 namespace bx {
 
+namespace {
+bool editableMessage(const QModelIndex &message)
+{
+    return message.isValid() && !message.data(workspace::ReceiptMessageId).toString().isEmpty()
+        && message.data(workspace::Outgoing).toBool() && !message.data(workspace::SystemMessage).toBool();
+}
+} // namespace
+
 QWidget *MainWindow::messageActionOwner(const QAbstractItemModel *model, const QString &dialog)
 {
     if (!model || dialog.isEmpty())
@@ -36,6 +44,40 @@ QWidget *MainWindow::messageActionOwner(const QAbstractItemModel *model, const Q
         && m_chatMessages->isVisible() && m_chatMessages->model() == model)
         return this;
     return nullptr;
+}
+
+bool MainWindow::beginMessageEdit(const QPersistentModelIndex &message, const QString &dialog)
+{
+    if (!writable() || m_backend->isDemo() || m_backend->portalOrigin().host().isEmpty() || !editableMessage(message))
+        return false;
+    auto *owner = messageActionOwner(message.model(), dialog);
+    if (!owner)
+        return false;
+    const bool cardHistory = owner == m_card;
+    auto *composer = cardHistory ? m_card->composer() : m_chatComposer;
+    if (!composer || composer->input()->isReadOnly() || !m_pendingUpload.isEmpty()
+        || (cardHistory ? !m_pendingTaskId.isEmpty() : !m_pendingChatId.isEmpty()))
+        return false;
+    const auto id = message.data(workspace::ReceiptMessageId).toString();
+    const auto resolve = messageActionTarget(message, dialog);
+    composer->beginMessageEdit(dialog, id, message.data(workspace::RawMessageBody).toString(),
+                              [this, resolve, dialog, id](const QString &text) {
+        if (writable() && editableMessage(resolve()))
+            m_backend->changeMessage(dialog, id, MessageAction::Edit, text);
+    });
+    return true;
+}
+
+bool MainWindow::editLatestMessage(const ui::HistoryList *history, const QString &dialog)
+{
+    if (!history->showingLiveHistory())
+        return false;
+    for (int row = history->count() - 1; row >= 0; --row) {
+        const auto message = history->model()->index(row, 0);
+        if (editableMessage(message))
+            return beginMessageEdit(message, dialog);
+    }
+    return false;
 }
 
 std::function<QPersistentModelIndex()> MainWindow::messageActionTarget(const QPersistentModelIndex &message,
@@ -295,26 +337,10 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
     connect(favorites->addAction(QStringLiteral("Убрать из избранного")), &QAction::triggered,
             this, [invoke] { invoke(MessageAction::Unfavorite); });
 
-    if (!message.data(workspace::Outgoing).toBool() || message.data(workspace::SystemMessage).toBool())
+    if (!editableMessage(message))
         return;
-    connect(menu.addAction(QStringLiteral("Редактировать…")), &QAction::triggered, this, [this, resolve, dialog, id] {
-        const auto message = resolve();
-        if (!writable() || !message.isValid() || !message.data(workspace::Outgoing).toBool()
-            || message.data(workspace::SystemMessage).toBool())
-            return;
-        const bool cardHistory = messageActionOwner(message.model(), dialog) == m_card;
-        auto *composer = cardHistory ? m_card->composer() : m_chatComposer;
-        if (!composer || composer->input()->isReadOnly() || !m_pendingUpload.isEmpty()
-            || (cardHistory ? !m_pendingTaskId.isEmpty() : !m_pendingChatId.isEmpty()))
-            return;
-        composer->beginMessageEdit(dialog, id, message.data(workspace::RawMessageBody).toString(),
-                                  [this, resolve, dialog, id](const QString &text) {
-            const auto message = resolve();
-            if (writable() && message.isValid() && message.data(workspace::Outgoing).toBool()
-                && !message.data(workspace::SystemMessage).toBool())
-                m_backend->changeMessage(dialog, id, MessageAction::Edit, text);
-        });
-    });
+    connect(menu.addAction(QStringLiteral("Редактировать…")), &QAction::triggered,
+            this, [this, resolve, dialog] { beginMessageEdit(resolve(), dialog); });
     connect(menu.addAction(QStringLiteral("Удалить…")), &QAction::triggered, this, [this, resolve, dialog, id] {
         const auto currentOwner = [this, resolve, dialog, id]() -> QWidget * {
             const auto message = resolve();
@@ -416,7 +442,11 @@ void MainWindow::showChatAssets(const QString &scope, QWidget *parent)
             const auto &asset = page.rows.at(row);
             if (!asset.link.isEmpty())
                 openMessageLink(asset.link.toString(QUrl::FullyEncoded));
-            else if (asset.file.isImage && (!asset.file.previewUrl.isEmpty() || !asset.file.downloadUrl.isEmpty())) {
+            else if (asset.file.isVideo && workspace::RowPainter::downloadable(asset.file)) {
+                playMessageVideo(asset.file, dialog, [owner = QPointer<QDialog>(dialog)] {
+                    return owner && owner->isVisible();
+                });
+            } else if (asset.file.isImage && (!asset.file.previewUrl.isEmpty() || !asset.file.downloadUrl.isEmpty())) {
                 QVector<MessageFile> loaded;
                 if (i == int(ChatAssetKind::Media)) {
                     for (const auto &candidate : page.rows)

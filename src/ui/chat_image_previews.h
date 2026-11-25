@@ -73,6 +73,12 @@ public:
 
     const QPixmap *photo(const QUrl &url) const { return m_images.object(url); }
     bool failed(const QUrl &url) const { return m_failures.contains(url); }
+    void clear()
+    {
+        m_pending.clear();
+        m_images.clear();
+        m_failures.clear();
+    }
 
 private:
     QSet<QUrl> m_pending;

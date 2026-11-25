@@ -46,6 +46,8 @@ public:
     void downloadMessageFile(const QUrl &url, const QString &targetPath) override;
     void downloadMessagePhoto(const QUrl &url, const QString &targetPath) override;
     void cancelMessagePhoto(const QString &targetPath) override;
+    void downloadMessageVideo(const QUrl &url, const QString &targetPath) override;
+    void cancelMessageVideo(const QString &targetPath) override;
     void requestAvatar(const QUrl &url) override;
     void requestMessageViewers(const QString &scopeId, const QString &messageId, bool task,
                                MessageViewersHandler complete) override;
@@ -114,9 +116,12 @@ public:
     void searchProjectTasks(const QString &projectId, const QString &query) override;
     void searchMessages(const QString &scopeId, const QString &query, bool task) override;
     void uploadChatFile(const QString &scopeId, const QString &localPath, bool task) override;
+    void uploadChatImage(const QString &scopeId, const QString &localPath, bool task, const QString &caption,
+                         std::shared_ptr<QTemporaryDir> temporaryDirectory = {}) override;
     void attachTaskFile(const QString &taskId, const QString &localPath) override;
 
     void setForeground(bool foreground);
+    void setWorkspaceVisible(bool visible);
     void setActiveSection(int section);
     void clearOpenHistory(bool task);
     void recoverSession(const Session &candidate, std::function<bool()> stillAllowed = {});
@@ -249,8 +254,9 @@ private:
     void connectPull();
     void receivePull(const QString &frame);
     void handlePullEvent(const QJsonObject &event);
-    void loadChatSoundSettings();
-    void applyChatSoundSettings(const QJsonObject &settings, bool snapshot);
+    void loadChatPopupSettings();
+    enum class ChatPopupSettingsSource { Push, InitialSnapshot, RefreshSnapshot };
+    void applyChatPopupSettings(const QJsonObject &settings, ChatPopupSettingsSource source);
     void requestNotificationSettings(const QString &operation, const QString &updated = {}, int expected = -1,
                                      std::optional<quint64> started = {});
     void readPortalStatus(const QString &operation, std::function<void(const QString &, bool)> onStatus);
@@ -266,11 +272,13 @@ private:
     QString m_portalStatus;
     quint64 m_portalStatusRevision = 0;
     qint64 m_lastPortalStatusPushTime = 0;
-    std::optional<bool> chatSoundEnabled() const;
+    std::optional<bool> chatPopupsEnabled() const;
     void deliverChatPopups();
     void scheduleReconnect(bool immediately = false);
     void invalidateActiveView();
     void updateHistoryCatchup(bool restart = false);
+    bool canAutoRefreshChats() const { return m_foreground || m_workspaceVisible; }
+    void updateChatViewActivity(bool wasWatching);
     void rejectSession();
     void confirmSession(quint64 revision, std::function<void(bool)> onConfirmed = {});
     void cancelSessionConfirmation();
@@ -343,16 +351,28 @@ private:
     struct MessageFileSource {
         qint64 size;
         bool photo;
+        QString videoObjectId;
+        QString videoAttachmentId;
+        quint64 accountRevision;
     };
-    QUrl registerMessageFileUrl(const QString &value, qint64 size, bool photo) const;
+    QUrl registerMessageFileUrl(const QString &value, qint64 size, bool photo,
+                                const QString &videoObjectId = {}, const QString &videoAttachmentId = {}) const;
+    enum class MessageDownloadMode { File, Photo, Video };
     struct MessageDownload;
-    void beginMessageDownload(const QUrl &url, const QString &targetPath, bool photo);
-    void failMessageDownload(const QString &targetPath, const QString &reason, bool photo);
+    using MediaDownloads = QHash<QString, std::shared_ptr<MessageDownload>>;
+    MediaDownloads &mediaDownloads(MessageDownloadMode mode);
+    void cancelMessageMedia(MessageDownloadMode mode, const QString &targetPath);
+    void beginMessageDownload(const QUrl &url, const QString &targetPath, MessageDownloadMode mode);
+    void failMessageDownload(const QString &targetPath, const QString &reason, MessageDownloadMode mode);
     void streamMessageFile(const QUrl &url, const std::shared_ptr<MessageDownload> &download);
     mutable QHash<QUrl, MessageFileSource> m_registeredMessageFileUrls;
     QSet<QString> m_downloadTargets;
-    QHash<QString, std::shared_ptr<MessageDownload>> m_photoDownloads;
+    MediaDownloads m_photoDownloads;
+    MediaDownloads m_videoDownloads;
     void loadTaskAttachments(Task task, const QJsonObject &row);
+    static constexpr auto chatImageUploadRequestPrefix = "chat-image-upload:";
+    void uploadChatAttachment(const QString &scopeId, const QString &localPath, bool task, bool image,
+                              const QString &caption, std::shared_ptr<QTemporaryDir> temporaryDirectory = {});
     std::shared_ptr<Upload> openUpload(const QString &scopeId, const QString &localPath,
                                        const QString &kind, const QString &operation);
     void uploadChunk(const std::shared_ptr<Upload> &upload, qint64 offset);
@@ -393,13 +413,14 @@ private:
     DialogMessageState &dialogMessageState(const QString &dialog);
     bool chatMuted(const ChatPopup &popup) const;
     QHash<QString, DialogMessageState> m_dialogMessageStates;
-    QJsonObject m_chatSoundSettings;
+    QJsonObject m_chatPopupSettings;
     QVariantMap m_notificationSettings;
     QHash<QString, QPair<quint64, QJsonValue>> m_notificationSettingChanges;
     quint64 m_notificationSettingsRevision = 0;
     QQueue<ChatPopup> m_pendingChatPopups;
-    qint64 m_nextSoundSettingsRequest = 0;
-    quint64 m_soundSettingsGeneration = 0;
+    qint64 m_nextChatPopupSettingsRequest = 0;
+    quint64 m_chatPopupSettingsGeneration = 0;
+    bool m_chatPopupSettingsKnown = false;
 
     Session m_session;
     bool m_allowLoopback;
@@ -412,6 +433,7 @@ private:
     quint64 m_sessionConfirmationRevision = 0;
     std::function<void(bool)> m_sessionConfirmationCallback;
     bool m_foreground = true;
+    bool m_workspaceVisible = false;
     int m_activeSection = 0;
     bool m_recentDirty = false;
     bool m_chatDirty = false;

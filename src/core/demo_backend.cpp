@@ -277,9 +277,10 @@ void DemoBackend::requestTaskMessages(const QString &taskId)
 void DemoBackend::requestNotifications() {
     emitLater([this] {
         QVector<Notification> notifications;
-        notifications.append({QStringLiteral("n-1"), QStringLiteral("message"),
-                             QStringLiteral("Новое сообщение"),
-                             QStringLiteral("Ирина Соколова написала в чат «Отдел продаж»."), ago(3), false});
+        Notification chatMessage{QStringLiteral("n-1"), QStringLiteral("message"), QStringLiteral("Новое сообщение"),
+                                 QStringLiteral("Ирина Соколова написала в чат «Отдел продаж»."), ago(3)};
+        chatMessage.ordinaryChatMessage = true;
+        notifications.append(std::move(chatMessage));
         notifications.append({QStringLiteral("n-2"), QStringLiteral("task"),
                              QStringLiteral("Задача переведена в работу"),
                              QStringLiteral("«Собрать тестовый стенд» переведена в «В работе»."), ago(60), true});
@@ -742,7 +743,29 @@ void DemoBackend::searchMessages(const QString &scopeId, const QString &query, b
 
 void DemoBackend::uploadChatFile(const QString &scopeId, const QString &localPath, bool task)
 {
-    emitLater([this, scopeId, localPath, task] {
+    uploadChatAttachment(scopeId, localPath, task, {});
+}
+
+void DemoBackend::uploadChatImage(const QString &scopeId, const QString &localPath, bool task, const QString &caption,
+                                  std::shared_ptr<QTemporaryDir> temporaryDirectory)
+{
+    const auto operation = (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scopeId;
+    if (caption.size() > tunables::kChatImageCaptionCharacters) {
+        emit failed(operation, QStringLiteral("Подпись к изображению может содержать не больше 20 000 символов"));
+        return;
+    }
+    if (QFileInfo(localPath).size() > tunables::kChatClipboardPngBytes) {
+        emit failed(operation, QStringLiteral("Изображение превышает 16 МиБ"));
+        return;
+    }
+    uploadChatAttachment(scopeId, localPath, task, caption, std::move(temporaryDirectory));
+}
+
+void DemoBackend::uploadChatAttachment(const QString &scopeId, const QString &localPath, bool task,
+                                       const QString &caption, std::shared_ptr<QTemporaryDir> temporaryDirectory)
+{
+    emitLater([this, scopeId, localPath, task, caption, temporaryDirectory = std::move(temporaryDirectory)] {
+        Q_UNUSED(temporaryDirectory);
         auto &history = task ? m_taskMessages : m_chatMessages;
         const QFileInfo file(localPath);
         if (!file.isFile() || !file.isReadable() || !history.contains(scopeId)) {
@@ -751,7 +774,7 @@ void DemoBackend::uploadChatFile(const QString &scopeId, const QString &localPat
             return;
         }
         const auto id = QStringLiteral("demo-%1").arg(++m_nextMessageId);
-        history[scopeId].append({id, QStringLiteral("Вы"), {}, QDateTime::currentDateTimeUtc(), true, {file.fileName()}});
+        history[scopeId].append({id, QStringLiteral("Вы"), caption, QDateTime::currentDateTimeUtc(), true, {file.fileName()}});
         emit fileUploaded(scopeId, task ? QStringLiteral("task-chat") : QStringLiteral("chat"));
     });
 }

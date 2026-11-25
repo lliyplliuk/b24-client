@@ -238,7 +238,9 @@ public:
     bool portalStatusFixture = false;
     mutable QString portalStatus = QStringLiteral("online");
     mutable int serverGeneralVolume = 100;
+    int serverMessageVolume = 100;
     mutable bool serverSiteDelivery = true;
+    bool omitDesktopDelivery = false;
     QString serverNotificationScheme;
     bool ignoreSoundUpdate = false;
     QString holdNotificationReply;
@@ -772,10 +774,11 @@ private:
                 + QByteArray::number(currentUserId) + "}}]");
         if (action == QStringLiteral("im.v2.Settings.General.list")) {
             QJsonObject sound{{"soundMuted", serverSoundMuted}, {"soundVolumeGeneral", serverGeneralVolume},
-                              {"soundVolumeMessages", 100}};
+                              {"soundVolumeMessages", serverMessageVolume}};
             if (!serverNotificationScheme.isEmpty()) {
                 sound.insert("notifyScheme", serverNotificationScheme);
-                sound.insert("notifySchemeSendSite", serverSiteDelivery);
+                if (!omitDesktopDelivery)
+                    sound.insert("notifySchemeSendSite", serverSiteDelivery);
                 sound.insert("notifySchemeSendPush", true);
             }
             return ajaxResult(QJsonDocument(sound).toJson(QJsonDocument::Compact));
@@ -1133,6 +1136,7 @@ private slots:
     void decodesRichNotificationsFromHistoryAndPush();
     void resolvesNoticeAuthorFromMatchingUserOnly();
     void linksTaskChatEventsAndMarksSyntheticRowsLocally();
+    void classifiesOrdinaryChatPushesWithoutSuppressingPopups();
     void marksExactNoticeIdsAsReadAfterBatchConfirmation();
     void ignoresNotificationRepliesFromPreviousAccount_data();
     void ignoresNotificationRepliesFromPreviousAccount();
@@ -1153,6 +1157,8 @@ private slots:
     void refreshesSavedCsrfBeforeOpeningWorkspace();
     void recoversOnlyTheSameAccount();
     void catchesUpWhenAnActiveChatStopsReceivingPush();
+    void refreshesVisibleInactiveHistory_data();
+    void refreshesVisibleInactiveHistory();
     void refusesToFollowRedirectWithSession();
     void sendsTaskEditsAndKanbanMutations();
     void confirmedKanbanMoveSupersedesOutstandingBoardRead();
@@ -1174,6 +1180,11 @@ private slots:
     void createsTasksWithSelectedRequisites();
     void derivesUnreadAndRefreshesOnReadEvents();
     void gatesChatPopupsBySoundAndMessageSettings();
+    void chatPopupsRespectExplicitDesktopDelivery_data();
+    void chatPopupsRespectExplicitDesktopDelivery();
+    void refreshesDesktopDeliveryWhenReturningToSimpleScheme_data();
+    void refreshesDesktopDeliveryWhenReturningToSimpleScheme();
+    void deliversChatPopupsWithExpertSettingsFromPush();
     void separatesChatScopesAndUsesPortalMetadata();
     void searchesTaskChatsByAccessibleTaskTitleAndNumber();
     void usesPortalPinActionsAndTheirAcknowledgements();
@@ -3325,6 +3336,119 @@ void TestCloudBackend::gatesChatPopupsBySoundAndMessageSettings()
     fixture.pushMessage(QStringLiteral("muted-while-disconnected"), QStringLiteral("910"));
     QTest::qWait(100);
     QCOMPARE(popups.size(), 2);
+}
+
+void TestCloudBackend::chatPopupsRespectExplicitDesktopDelivery_data()
+{
+    QTest::addColumn<bool>("desktopDelivery");
+    QTest::addColumn<int>("messageVolume");
+    QTest::newRow("desktop on, sound volume zero") << true << 0;
+    QTest::newRow("desktop off, sound volume positive") << false << 100;
+}
+
+void TestCloudBackend::chatPopupsRespectExplicitDesktopDelivery()
+{
+    QFETCH(bool, desktopDelivery);
+    QFETCH(int, messageVolume);
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    fixture.serverNotificationScheme = QStringLiteral("simple");
+    fixture.serverSiteDelivery = desktopDelivery;
+    fixture.serverMessageVolume = messageVolume;
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy online(&backend, &Backend::connectionChanged);
+    QSignalSpy entries(&backend, &Backend::notificationsLoaded);
+    QSignalSpy popups(&backend, &CloudBackend::notificationReceived);
+    backend.setForeground(false);
+    backend.start();
+    QTRY_COMPARE(online.size(), 1);
+    fixture.pushMessage(QStringLiteral("desktop-before-toggle"), QStringLiteral("901"));
+    QTRY_COMPARE(entries.size(), 1);
+    QTRY_COMPARE(fixture.requestsFor(QStringLiteral("im.v2.Settings.General.list")).size(), 1);
+    if (desktopDelivery)
+        QTRY_COMPARE_WITH_TIMEOUT(popups.size(), 1, 500);
+    else
+        QTest::qWait(120);
+    QCOMPARE(popups.size(), desktopDelivery ? 1 : 0);
+
+    fixture.pushIm(QStringLiteral("desktop-settings-toggle"), QStringLiteral("settingsUpdate"),
+                   {{"notifySchemeSendSite", !desktopDelivery}});
+    fixture.pushMessage(QStringLiteral("desktop-after-toggle"), QStringLiteral("902"));
+    QTRY_COMPARE(entries.size(), 2);
+    QTRY_COMPARE(popups.size(), 1);
+    const auto notice = popups.first().first().value<Notification>();
+    QCOMPARE(notice.id, desktopDelivery ? QStringLiteral("message:901") : QStringLiteral("message:902"));
+}
+
+void TestCloudBackend::refreshesDesktopDeliveryWhenReturningToSimpleScheme_data()
+{
+    QTest::addColumn<bool>("usePush");
+    QTest::newRow("scheme-only Push") << true;
+    QTest::newRow("settings snapshots") << false;
+}
+
+void TestCloudBackend::refreshesDesktopDeliveryWhenReturningToSimpleScheme()
+{
+    QFETCH(bool, usePush);
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    fixture.serverNotificationScheme = QStringLiteral("simple");
+    fixture.serverMessageVolume = 0;
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy online(&backend, &Backend::connectionChanged);
+    QSignalSpy entries(&backend, &Backend::notificationsLoaded);
+    QSignalSpy popups(&backend, &CloudBackend::notificationReceived);
+    QSignalSpy settings(&backend, &Backend::notificationSettingsLoaded);
+    backend.setForeground(false);
+    backend.start();
+    const auto list = QStringLiteral("im.v2.Settings.General.list");
+    QTRY_COMPARE(online.size(), 1);
+    fixture.pushMessage(QStringLiteral("desktop-on"), QStringLiteral("901"));
+    QTRY_COMPARE(popups.size(), 1);
+    QCOMPARE(fixture.requestsFor(list).size(), 1);
+
+    if (usePush) {
+        fixture.pushIm(QStringLiteral("desktop-use-expert"), QStringLiteral("settingsUpdate"),
+                       {{"notifyScheme", "expert"}});
+        fixture.serverSiteDelivery = false;
+        fixture.pushIm(QStringLiteral("desktop-return-to-simple"), QStringLiteral("settingsUpdate"),
+                       {{"notifyScheme", "simple"}});
+    } else {
+        fixture.omitDesktopDelivery = true;
+        fixture.serverNotificationScheme = QStringLiteral("expert");
+        backend.requestNotificationSettings();
+        QTRY_COMPARE(settings.size(), 1);
+        fixture.serverNotificationScheme = QStringLiteral("simple");
+        backend.requestNotificationSettings();
+        QTRY_COMPARE(settings.size(), 2);
+    }
+    fixture.pushMessage(QStringLiteral("desktop-disabled"), QStringLiteral("902"));
+    QTRY_COMPARE(entries.size(), 2);
+    QTRY_COMPARE_WITH_TIMEOUT(fixture.requestsFor(list).size(), usePush ? 2 : 3, 500);
+    QCOMPARE(popups.size(), 1);
+}
+
+void TestCloudBackend::deliversChatPopupsWithExpertSettingsFromPush()
+{
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    const auto settingsRequest = QStringLiteral("im.v2.Settings.General.list");
+    fixture.holdNotificationReply = settingsRequest;
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy online(&backend, &Backend::connectionChanged);
+    QSignalSpy recent(&backend, &Backend::recentChatsLoaded);
+    QSignalSpy popups(&backend, &CloudBackend::notificationReceived);
+    backend.setForeground(false);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(online.size(), 1);
+    QTRY_VERIFY(!recent.isEmpty());
+    fixture.pushIm(QStringLiteral("desktop-expert-settings"), QStringLiteral("settingsUpdate"),
+                   {{"notifyScheme", "expert"}, {"soundMuted", false},
+                    {"soundVolumeGeneral", 100}, {"soundVolumeMessages", 100}});
+    fixture.pushMessage(QStringLiteral("desktop-expert-message"), QStringLiteral("901"));
+    QTRY_COMPARE_WITH_TIMEOUT(popups.size(), 1, 500);
+    QVERIFY(fixture.requestsFor(settingsRequest).isEmpty());
 }
 
 void TestCloudBackend::resolvesCurrentCreationOwnerWithoutRecentIdentity()
@@ -5588,6 +5712,101 @@ void TestCloudBackend::linksTaskChatEventsAndMarksSyntheticRowsLocally()
     QCOMPARE(unconfirmed.targets.first().kind, NotificationTargetKind::Chat);
 }
 
+void TestCloudBackend::classifiesOrdinaryChatPushesWithoutSuppressingPopups()
+{
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    backend.setForeground(false);
+    QSignalSpy online(&backend, &Backend::connectionChanged);
+    QSignalSpy loaded(&backend, &Backend::notificationsLoaded);
+    QSignalSpy popups(&backend, &CloudBackend::notificationReceived);
+    backend.start();
+    QTRY_COMPARE(online.size(), 1);
+    fixture.pushIm(QStringLiteral("personal-chat"), QStringLiteral("message"),
+                   {{"dialogId", "103"}, {"chatId", 93}, {"notify", true},
+                    {"message", QJsonObject{{"id", 901}, {"chatId", 93}, {"senderId", 103},
+                        {"text", "[URL=/tasks/task/view/501/]Ссылка на задачу[/URL]"}}}});
+    QTRY_COMPARE(popups.size(), 1);
+    const auto personal = popups.first().first().value<Notification>();
+    QCOMPARE(personal.id, QStringLiteral("message:901"));
+    QVERIFY(personal.ordinaryChatMessage);
+    QCOMPARE(personal.targets.first().id, QStringLiteral("103"));
+    QCOMPARE(personal.targets.first().messageId, QStringLiteral("901"));
+    QVERIFY(std::any_of(personal.targets.cbegin(), personal.targets.cend(), [](const auto &target) {
+        return target.kind == NotificationTargetKind::Task;
+    }));
+
+    fixture.pushMessage(QStringLiteral("group-chat"), QStringLiteral("902"));
+    QTRY_COMPARE(popups.size(), 2);
+    const auto group = popups.last().first().value<Notification>();
+    QCOMPARE(group.id, QStringLiteral("message:902"));
+    QCOMPARE(group.targets.first().id, QStringLiteral("chat91"));
+    QCOMPARE(group.targets.first().messageId, QStringLiteral("902"));
+    QVERIFY(group.ordinaryChatMessage);
+    fixture.pushMessage(QStringLiteral("group-chat-retry"), QStringLiteral("902"));
+    fixture.pushIm(QStringLiteral("group-no-id"), QStringLiteral("messageChat"),
+                   {{"dialogId", "chat91"}, {"chatId", 91}, {"notify", true},
+                    {"message", QJsonObject{{"authorId", 22}, {"text", "Missing message ID"}}}});
+    QTRY_COMPARE(popups.size(), 3);
+    const auto noId = popups.last().first().value<Notification>();
+    QCOMPARE(noId.id, QStringLiteral("push:group-no-id"));
+    QVERIFY(noId.ordinaryChatMessage && noId.targets.isEmpty());
+
+    fixture.pushIm(QStringLiteral("task-chat"), QStringLiteral("messageChat"),
+                   {{"dialogId", "chat86761"}, {"chatId", 86761}, {"notify", true},
+                    {"chat", QJsonObject{{"86761", QJsonObject{{"id", 86761}, {"type", "tasksTask"},
+                                                               {"entityType", "TASKS"}, {"entityId", 501}}}}},
+                    {"message", QJsonObject{{"id", 903}, {"authorId", 22}, {"text", "Task message"}}}});
+    fixture.pushIm(QStringLiteral("portal-notification"), QStringLiteral("notifyAdd"),
+                   {{"id", 904}, {"text", "[URL=/online/?IM_DIALOG=chat91&IM_MESSAGE=902]Настоящее уведомление[/URL]"}});
+    QTRY_COMPARE(loaded.size(), 5);
+    const auto records = loaded.last().first().value<QVector<Notification>>();
+    QCOMPARE(records.size(), 5);
+    QCOMPARE(records.at(0).id, QStringLiteral("904"));
+    QVERIFY(!records.at(0).ordinaryChatMessage);
+    QCOMPARE(records.at(0).targets.first().id, QStringLiteral("chat91"));
+    QCOMPARE(records.at(1).id, QStringLiteral("message:903"));
+    QVERIFY(!records.at(1).ordinaryChatMessage);
+    QVERIFY(records.at(1).targets.first().taskChat);
+    QVERIFY(records.at(2).ordinaryChatMessage && records.at(3).ordinaryChatMessage && records.at(4).ordinaryChatMessage);
+    QTRY_COMPARE(popups.size(), 5);
+
+    fixture.pushIm(QStringLiteral("task-chat-sections"), QStringLiteral("messageChat"),
+                   {{"dialogId", "chat86762"}, {"chatId", 86762},
+                    {"recentConfig", QJsonObject{{"sections", QJsonArray{"tasksTask"}}}},
+                    {"message", QJsonObject{{"id", 905}, {"authorId", 22}, {"text", "Task message with no task ID"}}}});
+    QTRY_COMPARE(loaded.size(), 6);
+    const auto sectionTask = loaded.last().first().value<QVector<Notification>>().first();
+    QCOMPARE(sectionTask.id, QStringLiteral("message:905"));
+    QVERIFY(!sectionTask.ordinaryChatMessage);
+    QVERIFY(sectionTask.targets.first().taskChat);
+
+    for (int id = 1100; id <= 1200; ++id) {
+        const auto value = QString::number(id);
+        fixture.pushMessage(QStringLiteral("quiet-chat-") + value, value, 91, 22, false, 60);
+    }
+    QTRY_COMPARE(loaded.size(), 107);
+    const auto visibleIds = [&loaded] {
+        QStringList ids;
+        for (const auto &row : loaded.last().first().value<QVector<Notification>>())
+            if (!row.ordinaryChatMessage)
+                ids.append(row.id);
+        return ids;
+    };
+    QStringList visible{QStringLiteral("message:905"), QStringLiteral("904"), QStringLiteral("message:903")};
+    QCOMPARE(visibleIds(), visible);
+    QCOMPARE(loaded.last().first().value<QVector<Notification>>().size(), 103);
+    QCOMPARE(popups.size(), 5);
+    fixture.noticeFixture = QJsonArray{QJsonObject{{"id", 906}, {"notify_type", 2}, {"notify_module", "tasks"},
+        {"text", "Portal history row"}, {"date", QDateTime::currentDateTimeUtc().addSecs(-120).toString(Qt::ISODate)}}};
+    backend.requestNotifications();
+    QTRY_COMPARE(loaded.size(), 108);
+    visible.append(QStringLiteral("906"));
+    QCOMPARE(visibleIds(), visible);
+    QCOMPARE(loaded.last().first().value<QVector<Notification>>().size(), 104);
+}
+
 void TestCloudBackend::marksExactNoticeIdsAsReadAfterBatchConfirmation()
 {
     CloudFixture fixture;
@@ -6280,6 +6499,71 @@ void TestCloudBackend::catchesUpWhenAnActiveChatStopsReceivingPush()
     QVERIFY(timer->isActive());
     backend.setActiveSection(2);
     QVERIFY(!timer->isActive());
+}
+
+void TestCloudBackend::refreshesVisibleInactiveHistory_data()
+{
+    QTest::addColumn<bool>("task");
+    QTest::newRow("ordinary conversation") << false;
+    QTest::newRow("task conversation over another section") << true;
+}
+
+void TestCloudBackend::refreshesVisibleInactiveHistory()
+{
+    QFETCH(bool, task);
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy online(&backend, &Backend::connectionChanged);
+    QSignalSpy history(&backend, task ? &Backend::taskMessagesLoaded : &Backend::chatMessagesLoaded);
+    QSignalSpy recent(&backend, &Backend::recentChatsLoaded);
+    backend.setForeground(false);
+    backend.setWorkspaceVisible(true);
+    if (task)
+        backend.setActiveSection(1);
+    backend.start();
+    QTRY_COMPARE(online.size(), 1);
+    if (task) {
+        backend.requestTaskMessages(QStringLiteral("42"));
+    } else {
+        backend.requestRecentChats();
+        QTRY_VERIFY(!recent.isEmpty());
+        backend.requestChatMessages(QStringLiteral("chat91"));
+    }
+    QTRY_COMPARE(history.size(), 1);
+    const auto recentReads = fixture.requestsFor(QStringLiteral("im.v2.Recent.load")).size();
+    const auto push = [&](const QString &suffix, const QString &id) {
+        fixture.pushMessage(QStringLiteral("workspace-visible-") + suffix, id, task ? 73 : 91);
+    };
+    push(QStringLiteral("one"), QStringLiteral("901"));
+    push(QStringLiteral("two"), QStringLiteral("902"));
+    push(QStringLiteral("three"), QStringLiteral("903"));
+    QTRY_COMPARE_WITH_TIMEOUT(history.size(), 2, 1500);
+    QTest::qWait(350);
+    QCOMPARE(history.size(), 2);
+    QCOMPARE(fixture.requestsFor(QStringLiteral("im.v2.Recent.load")).size(), recentReads + (task ? 0 : 1));
+
+    auto *timer = backend.findChild<QTimer *>(QStringLiteral("active-history-catchup"));
+    QVERIFY(timer && timer->isActive());
+    QCOMPARE(timer->interval(), 15000);
+    QVERIFY(QMetaObject::invokeMethod(timer, "timeout"));
+    QTRY_COMPARE(history.size(), 3);
+
+    backend.setWorkspaceVisible(false);
+    QVERIFY(!timer->isActive());
+    push(QStringLiteral("hidden"), QStringLiteral("904"));
+    QTest::qWait(400);
+    QCOMPARE(history.size(), 3);
+    backend.setWorkspaceVisible(true);
+    QTRY_COMPARE(history.size(), 4);
+    QVERIFY(timer->isActive());
+    backend.clearOpenHistory(task);
+    QVERIFY(!timer->isActive());
+    push(QStringLiteral("closed"), QStringLiteral("905"));
+    QTest::qWait(400);
+    QCOMPARE(history.size(), 4);
+    QVERIFY(fixture.requestsFor(QStringLiteral("im.v2.Chat.Message.read")).isEmpty());
+    QVERIFY(fixture.requestsFor(QStringLiteral("applyFilter")).isEmpty());
 }
 
 void TestCloudBackend::refusesToFollowRedirectWithSession()

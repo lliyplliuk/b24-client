@@ -476,7 +476,8 @@ void decodeNotificationContent(Notification &notification, const QUrl &portal, c
     }
 }
 
-std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &params, bool groupEvent)
+std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &params, bool groupEvent,
+                                                        bool allowMissingMessageId)
 {
     const auto message = params.value(QStringLiteral("message")).toObject();
     const auto messageId = valueId(message.value(QStringLiteral("id")));
@@ -492,7 +493,7 @@ std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &param
         chatId = messageChat;
     if (dialog.isEmpty() && !params.contains(QStringLiteral("dialogId")) && groupEvent && !chatId.isEmpty())
         dialog = QStringLiteral("chat") + chatId;
-    if (dialog.isEmpty() || messageId.isEmpty()
+    if (dialog.isEmpty() || (!allowMissingMessageId && messageId.isEmpty())
         || (groupEvent && !dialog.startsWith(QLatin1String("chat")))
         || (dialog.startsWith(QLatin1String("chat")) && !chatId.isEmpty() && dialog.mid(4) != chatId))
         return std::nullopt;

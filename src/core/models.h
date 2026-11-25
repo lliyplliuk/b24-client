@@ -43,6 +43,7 @@ struct MessageFile {
     QSize previewSize{};
     QString diskObjectId{};
     bool isImage = false;
+    bool isVideo = false;
 };
 
 enum class ChatAssetKind { Media, Files, Links };
@@ -275,6 +276,7 @@ struct Notification {
     bool read = false;
     QVector<NotificationTarget> targets{};
     QString markup{};
+    bool ordinaryChatMessage = false;
 };
 
 } // namespace bx

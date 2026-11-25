@@ -3,6 +3,7 @@
 #include "ui/portal_dnd_control.h"
 #include "ui/board_widget.h"
 #include "ui/chat_photo_viewer.h"
+#include "ui/chat_video_previews.h"
 #include "ui/chat_widgets.h"
 #include "ui/task_dialogs.h"
 #include "ui/task_gantt.h"
@@ -11,6 +12,7 @@
 #include "ui/saved_file_offer.h"
 #include "ui/workspace_style.h"
 #include "ui/worktime_panel.h"
+#include "core/download_target.h"
 #include "core/notification_targets.h"
 #include "core/origin_guard.h"
 
@@ -44,6 +46,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QResizeEvent>
+#include <QSaveFile>
 #include <QScrollBar>
 #include <QScopedValueRollback>
 #include <QSignalBlocker>
@@ -112,7 +115,8 @@ PhotoGallery photoGallery(const MessageFile &opened, const QVector<MessageFile> 
         return qsizetype(-1);
     };
     for (const auto &file : loaded) {
-        if ((file.downloadUrl.isEmpty() && file.previewUrl.isEmpty()) || (!file.isImage && file.previewUrl.isEmpty()))
+        if (file.isVideo || (file.downloadUrl.isEmpty() && file.previewUrl.isEmpty())
+            || (!file.isImage && file.previewUrl.isEmpty()))
             continue;
         const auto keys = photoKeys(file);
         auto index = indexOf(keys);
@@ -157,6 +161,12 @@ QImage readMessagePhoto(const QString &path)
 QString tooltip(const QString &text)
 {
     return QStringLiteral("<qt>%1</qt>").arg(text.toHtmlEscaped());
+}
+
+QVector<Notification> listedNotifications(QVector<Notification> notifications)
+{
+    notifications.removeIf([](const Notification &notice) { return notice.ordinaryChatMessage; });
+    return notifications;
 }
 
 QString actionLabel(const NotificationTarget &target)
@@ -218,16 +228,31 @@ void switchDraft(ui::ChatComposer *composer, QHash<QString, ui::ChatDraft> &draf
             drafts.insert(from, draft);
         }
     }
-    composer->setDraft(drafts.value(to));
+    composer->setDraft(drafts.take(to));
 }
 
 void clearSentDraft(ui::ChatComposer *composer, QHash<QString, ui::ChatDraft> &drafts,
                     const QString &current, const QString &pending, const ui::ChatDraft &sent)
 {
-    if (composer && current == pending && composer->draft() == sent)
-        composer->setDraft({});
-    if (drafts.value(pending) == sent)
-        drafts.remove(pending);
+    auto sentWithoutImage = sent;
+    sentWithoutImage.image.reset();
+    if (composer && current == pending) {
+        const auto currentDraft = composer->draft();
+        if (currentDraft == sent || (sent.image && currentDraft == sentWithoutImage))
+            composer->setDraft({});
+        else if (sent.image && currentDraft.image == sent.image)
+            composer->clearDraftImage();
+    }
+    const auto saved = drafts.find(pending);
+    if (saved == drafts.end())
+        return;
+    if (*saved == sent || (sent.image && *saved == sentWithoutImage)) {
+        drafts.erase(saved);
+    } else if (sent.image && saved->image == sent.image) {
+        saved->image.reset();
+        if (saved->isEmpty())
+            drafts.erase(saved);
+    }
 }
 
 void selectAvailable(QListWidget *list, QListWidgetItem *selection)
@@ -317,6 +342,16 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
       m_publicLinkRequest(std::move(publicLinkRequest))
 {
     m_chatPhotoDecodePool.setMaxThreadCount(1);
+    m_chatVideoPreviews = std::make_unique<ui::ChatVideoPreviews>(backend, [this](bool posterChanged) {
+        if (posterChanged)
+            refreshChatMediaRows();
+        scheduleAvatars();
+    }, [this](QWidget *parent, const QString &error) {
+        if (m_card && parent == m_card)
+            m_card->setStatus(error);
+        else
+            setStatus(error);
+    });
     setWindowTitle(QStringLiteral("Битрикс24"));
     setMinimumSize(720, 500);
     resize(1100, 710);
@@ -440,6 +475,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
         const auto scope = m_backend->settingsScope();
         if (scope != m_reactionAccountScope) {
             if (!m_reactionAccountScope.isEmpty()) {
+                clearPastedChatImages();
                 resetNotificationAccount();
                 m_pendingCreateTask.clear();
                 m_pendingCreateSubtask.clear();
@@ -792,16 +828,8 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     connect(m_backend, &Backend::messageImageLoaded, this, [this](const QUrl &url, const QByteArray &bytes) {
         if (!m_chatImagePreviews.complete(url, bytes))
             return;
-        if (m_chatImagePreviews.photo(url)) {
-            for (auto *list : {m_chatMessages, m_card ? m_card->messageList() : nullptr}) {
-                if (list && list->isVisible())
-                    static_cast<ui::HistoryList *>(list)->refreshRowSizes();
-            }
-            if (m_card) {
-                m_card->descriptionList()->requestHeight();
-                m_card->attachmentList()->requestHeight();
-            }
-        }
+        if (m_chatImagePreviews.photo(url))
+            refreshChatMediaRows();
         scheduleAvatars();
     });
     const auto resetLinkPreviewAccess = [this](bool available) {
@@ -966,18 +994,19 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     });
 
     connect(m_backend, &Backend::notificationsLoaded, this, [this](const QVector<Notification> &notifications) {
+        auto listed = listedNotifications(notifications);
         bool newUnread = false;
         if (m_lastSection == 2) {
             QSet<QString> previouslyUnread;
             for (const auto &notice : m_noticeHistory)
                 if (!notice.read)
                     previouslyUnread.insert(notice.id);
-            newUnread = std::any_of(notifications.cbegin(), notifications.cend(), [&previouslyUnread](const auto &notice) {
+            newUnread = std::any_of(listed.cbegin(), listed.cend(), [&previouslyUnread](const auto &notice) {
                 return !notice.read && !previouslyUnread.contains(notice.id);
             });
         }
         m_noticeHistoryState = NoticeHistoryState::Ready;
-        m_noticeHistory = notifications;
+        m_noticeHistory = std::move(listed);
         updateNotificationRailBadge();
         if (m_lastSection == 2)
             showNotifications(newUnread);
@@ -987,7 +1016,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
         if (query != m_noticeQuery || query != m_noticeSearch->text().trimmed())
             return;
         m_noticeSearchPending = false;
-        m_noticeSearchResults = notifications;
+        m_noticeSearchResults = listedNotifications(notifications);
         showNotifications();
     });
     connect(m_backend, &Backend::notificationHistoryPageStateChanged, this, [this](bool hasMore, bool loading) {
@@ -1042,6 +1071,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
             }
             m_pendingTaskId.clear();
             m_pendingTaskDraft = {};
+            updateWriteAvailability();
         }
         updateComposers();
     });
@@ -1404,6 +1434,7 @@ QWidget *MainWindow::buildChatPanel()
     m_chatComposer = new ui::ChatComposer(reading, QStringLiteral("Текст сообщения"),
         QStringLiteral("Эмодзи в чате"), QStringLiteral("Прикрепить файл в чат"), QStringLiteral("Отправить сообщение"));
     m_chatInput = m_chatComposer->input();
+    m_chatComposer->setEditLatest([this, history] { return editLatestMessage(history, m_currentChatId); });
     m_chatComposer->setTypingActions([this] {
         return writable() && m_lastSection == 0 && isActiveWindow() ? m_currentChatId : QString();
     }, [this](const QString &dialog) { m_backend->notifyChatTyping(dialog); });
@@ -1428,6 +1459,8 @@ QWidget *MainWindow::buildChatPanel()
     connect(m_chatSend, &QPushButton::clicked, this, &MainWindow::onSendChat);
     connect(m_chatInput, &QPlainTextEdit::textChanged, this, &MainWindow::updateComposers);
     m_chatComposer->setEditStateChanged([this] { updateComposers(); });
+    m_chatComposer->setImageDraftHandlers([this] { updateComposers(); },
+                                          [this](const QString &error) { setStatus(error); });
     m_chatComposer->setMentionSearchHandler([this](const QString &id, const QString &query) {
         if (!m_currentChatId.isEmpty())
             m_backend->searchPeople(id, query, m_currentChatId);
@@ -2370,8 +2403,14 @@ void MainWindow::onSendChat()
     if (m_chatComposer->submitMessageEdit())
         return;
     const auto text = m_chatComposer->wireText().trimmed();
-    if (!writable() || !m_pendingChatId.isEmpty() || m_currentChatId.isEmpty() || text.isEmpty() ||
-        text.size() > 20000)
+    if (!writable() || !m_pendingChatId.isEmpty() || m_currentChatId.isEmpty() || text.size() > 20000
+        || pastedChatImagePending(m_currentChatId, false))
+        return;
+    if (m_chatComposer->hasDraftImage()) {
+        uploadPastedChatImage(m_chatComposer, m_currentChatId, false, text);
+        return;
+    }
+    if (text.isEmpty())
         return;
     m_chatComposer->cancelTyping();
     m_pendingChatId = m_currentChatId;
@@ -2667,6 +2706,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         const auto scope = m_pendingUpload.section(QLatin1Char(':'), 1);
         const bool task = !m_pendingUpload.startsWith(QStringLiteral("upload-chat:"));
         m_pendingUpload.clear();
+        m_pendingPastedChatImage = {};
         const auto name = m_uploadName;
         m_uploadName.clear();
         if (m_taskForm && m_taskForm->createdTask() == scope && operation.startsWith(QStringLiteral("attach-task:"))) {
@@ -2830,13 +2870,16 @@ void MainWindow::updateComposers()
     const bool enabled = writable() && !m_currentChatId.isEmpty();
     const bool editing = m_chatComposer->editingMessage();
     const bool saving = m_chatComposer->messageEditPending();
+    const bool hasImage = m_chatComposer->hasDraftImage();
+    const bool sending = !m_pendingChatId.isEmpty() || pastedChatImagePending(m_currentChatId, false);
     m_chatInput->setReadOnly(m_readOnly || m_currentChatId.isEmpty() || saving);
-    const bool canSubmit = editing ? m_chatComposer->canSaveMessageEdit(wire)
-                                   : m_pendingChatId.isEmpty() && !text.isEmpty() && text.size() <= 20000;
+    const bool canSubmit = editing ? m_chatComposer->canSaveMessageEdit(wire) : !sending
+        && text.size() <= 20000 && (hasImage ? m_pendingUpload.isEmpty() : !text.isEmpty());
     m_chatSend->setEnabled(enabled && canSubmit);
     m_chatSend->setToolTip(editing ? (saving ? QStringLiteral("Сохраняем сообщение…") : QStringLiteral("Сохранить сообщение"))
         : text.size() > 20000 ? QStringLiteral("Максимум 20 000 символов")
-        : m_pendingChatId.isEmpty() ? QStringLiteral("Отправить сообщение") : QStringLiteral("Отправка…"));
+        : sending || (hasImage && !m_pendingUpload.isEmpty()) ? QStringLiteral("Отправка…")
+        : QStringLiteral("Отправить сообщение"));
     m_chatEmoji->setEnabled(enabled && !saving);
     m_chatFile->setEnabled(enabled && !editing && m_pendingUpload.isEmpty());
 }
@@ -2985,7 +3028,8 @@ void MainWindow::updateWriteAvailability()
     if (m_card) {
         const bool deleting = !m_pendingTaskDelete.isEmpty();
         m_card->setWriteState(writable() && m_cardDetailsReady && !deleting, !m_pendingTaskEdit.isEmpty() || deleting,
-                              !m_pendingBoardEdit.isEmpty(), !m_pendingTaskId.isEmpty(),
+                              !m_pendingBoardEdit.isEmpty(),
+                              !m_pendingTaskId.isEmpty() || pastedChatImagePending(m_card->taskId(), true),
                               !m_pendingUpload.isEmpty());
     }
     if (m_stageManager)
@@ -3173,6 +3217,9 @@ void MainWindow::openTaskCardForProject(const QString &taskId, const QString &pr
         return m_card == card && m_cardDetailsReady && writable() && card->isActiveWindow()
             ? card->taskChatDialogId() : QString();
     }, [this](const QString &dialog) { m_backend->notifyChatTyping(dialog); });
+    card->composer()->setEditLatest([this, card, history] {
+        return m_card == card && m_cardDetailsReady && editLatestMessage(history, card->taskChatDialogId());
+    });
     history->setMessageMenu([this, card](QMenu &menu, const QPersistentModelIndex &index, const QString &href) {
         if (m_card == card && m_cardDetailsReady)
             addMessageActions(menu, index, card->taskChatDialogId(), true, href);
@@ -3249,10 +3296,16 @@ void MainWindow::openTaskCardForProject(const QString &taskId, const QString &pr
         saveTaskEdit(edit);
     });
     card->setOnSend([this, card](const QString &body) {
-        if (!writable() || !m_pendingTaskId.isEmpty())
+        if (!writable() || !m_pendingTaskId.isEmpty() || pastedChatImagePending(card->taskId(), true))
             return;
         const auto text = body.trimmed();
-        if (text.isEmpty() || text.size() > 20000)
+        if (text.size() > 20000)
+            return;
+        if (card->composer()->hasDraftImage()) {
+            uploadPastedChatImage(card->composer(), card->taskId(), true, text);
+            return;
+        }
+        if (text.isEmpty())
             return;
         m_pendingTaskId = card->taskId();
         m_pendingTaskDraft = card->composer()->draft();
@@ -3849,6 +3902,15 @@ void MainWindow::onFileUploaded(const QString &scope, const QString &kind)
           : QStringLiteral("upload-chat:"))) + scope;
     if (m_pendingUpload != operation)
         return;
+    if (m_pendingPastedChatImage.image) {
+        const auto sent = std::exchange(m_pendingPastedChatImage, {});
+        if (kind == QStringLiteral("task-chat")) {
+            clearSentDraft(m_card ? m_card->composer() : nullptr, m_taskDrafts,
+                           m_card ? m_card->taskId() : QString{}, scope, sent);
+        } else {
+            clearSentDraft(m_chatComposer, m_chatDrafts, m_currentChatId, scope, sent);
+        }
+    }
     if (kind == QStringLiteral("task") && m_taskForm && m_taskForm->createdTask() == scope) {
         m_pendingUpload.clear();
         m_uploadName.clear();
@@ -4545,6 +4607,18 @@ bool MainWindow::isCurrentTaskLink(const QListWidget *history, const QUrl &url) 
     return !currentTaskId.isEmpty() && ui::taskReference(url).taskId == currentTaskId;
 }
 
+void MainWindow::refreshChatMediaRows()
+{
+    for (auto *list : {m_chatMessages, m_card ? m_card->messageList() : nullptr}) {
+        if (list && list->isVisible())
+            static_cast<ui::HistoryList *>(list)->refreshRowSizes();
+    }
+    if (m_card) {
+        m_card->descriptionList()->requestHeight();
+        m_card->attachmentList()->requestHeight();
+    }
+}
+
 void MainWindow::loadVisibleChatPreviews()
 {
     const auto load = [this](QListWidget *list) {
@@ -4594,14 +4668,25 @@ void MainWindow::loadVisibleChatPreviews()
                     }
                 }
             }
-            for (const int role : {workspace::MessageFiles, workspace::ReplyFiles}) {
-                const auto files = item->data(role).value<QVector<MessageFile>>();
-                for (const auto &file : files) {
-                    if (taskContent && file.previewUrl == file.downloadUrl && !bounds.intersects(visible))
-                        continue;
-                    if (m_chatImagePreviews.begin(file.previewUrl))
-                        m_backend->requestMessageImage(file.previewUrl);
-                }
+            const auto loadImage = [this, taskContent, &bounds, &visible](const MessageFile &file) {
+                if (file.isVideo)
+                    return;
+                if (taskContent && file.previewUrl == file.downloadUrl && !bounds.intersects(visible))
+                    return;
+                if (m_chatImagePreviews.begin(file.previewUrl))
+                    m_backend->requestMessageImage(file.previewUrl);
+            };
+            const auto files = item->data(workspace::MessageFiles).value<QVector<MessageFile>>();
+            for (const auto &file : files)
+                loadImage(file);
+            if (chatHistory && bounds.intersects(visible) && m_sessionRecovery->isHidden()) {
+                const auto *delegate = static_cast<const workspace::RowPainter *>(list->itemDelegate());
+                const auto index = list->model()->index(row, 0);
+                if (const auto representative = delegate->visibleQuoteMedia(index, bounds, visible))
+                    loadImage(*representative);
+                const auto videos = delegate->visibleVideos(index, bounds, visible);
+                for (const auto &file : videos)
+                    m_chatVideoPreviews->request(file);
             }
         }
         if (chatHistory) {
@@ -5460,6 +5545,14 @@ void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
         openMessageViewers(list, id, anchor);
     });
     delegate->setMessagePreviewSource([this](const QUrl &url) { return m_chatImagePreviews.photo(url); });
+    delegate->setVideoPreviewSource([this](const MessageFile &file) { return m_chatVideoPreviews->poster(file); });
+    delegate->setMessageVideoHandler([this, list](const QModelIndex &index, const MessageFile &file) {
+        playMessageVideo(file, list->window(), [list = QPointer<QListWidget>(list),
+                         current = QPersistentModelIndex(index), file] {
+            return list && list->isVisible() && current.isValid()
+                && workspace::RowPainter::hasOriginal(current, file);
+        });
+    });
     delegate->setMessagePhotoHandler([this, list](const MessageFile &file) {
         QVector<MessageFile> loaded;
         if (dynamic_cast<ui::HistoryList *>(list)) {
@@ -5467,28 +5560,51 @@ void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
                 const auto *item = list->item(row);
                 if (item->isHidden())
                     continue;
-                for (const auto role : {workspace::ReplyFiles, workspace::MessageFiles})
-                    loaded += item->data(role).value<QVector<MessageFile>>();
+                loaded += item->data(workspace::MessageFiles).value<QVector<MessageFile>>();
             }
         }
         openMessagePhoto(file, list->window(), loaded);
     });
     const auto open = [this, list](const MessageFile &file) { saveMessageFile(file, list->window()); };
     delegate->setMessageDownloadHandler(open);
-    delegate->setMessagePhotoMenuHandler([this, list, open](const QModelIndex &index, const MessageFile &file,
-                                                           const QRect &anchor) {
-        auto *menu = new QMenu(list);
-        menu->setObjectName(QStringLiteral("photoOriginalMenu"));
-        connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+    delegate->setMessagePhotoMenuHandler([this, list](const QModelIndex &index, const MessageFile &file,
+                                                      const QRect &anchor) {
+        const auto *thumb = file.isVideo ? nullptr : m_chatImagePreviews.photo(file.previewUrl);
+        const auto pixels = thumb ? thumb->toImage() : QImage();
+        const auto samePhoto = [this, list, current = QPersistentModelIndex(index), file,
+                                account = m_backend->settingsScope()] {
+            return account == m_backend->settingsScope() && list->isVisible() && current.isValid()
+                && workspace::RowPainter::hasPhotoPreview(current, file);
+        };
+        std::function<void()> download;
+        if (workspace::RowPainter::downloadable(file) || !pixels.isNull()) {
+            download = [this, list, samePhoto, file, pixels] {
+                if (samePhoto())
+                    saveMessageFile(file, list->window(), pixels);
+            };
+        }
+        std::function<QImage()> copy;
+        if (!pixels.isNull())
+            copy = [samePhoto, pixels] { return samePhoto() ? pixels : QImage(); };
+        QMenu *menu = nullptr;
+        if (file.isVideo) {
+            menu = new QMenu(list);
+            connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+            auto *save = menu->addAction(QStringLiteral("Сохранить видео"));
+            save->setEnabled(bool(download));
+            if (download)
+                connect(save, &QAction::triggered, menu, std::move(download));
+        } else {
+            menu = ui::createImageContextMenu(list, std::move(download), std::move(copy));
+        }
         connect(m_backend, &Backend::accountScopeChanged, menu, &QMenu::close);
         connect(list->model(), &QAbstractItemModel::modelReset, menu, &QMenu::close);
-        auto *download = menu->addAction(QStringLiteral("Скачать оригинал"));
-        connect(download, &QAction::triggered, list,
-                [this, list, open, current = QPersistentModelIndex(index), file, account = m_backend->settingsScope()] {
-            if (account == m_backend->settingsScope() && list->isVisible() && current.isValid()
-                && workspace::RowPainter::hasOriginal(current, file))
-                open(file);
-        });
+        const auto closeIfStale = [menu, samePhoto] {
+            if (!samePhoto())
+                menu->close();
+        };
+        connect(list->model(), &QAbstractItemModel::rowsRemoved, menu, closeIfStale);
+        connect(list->model(), &QAbstractItemModel::dataChanged, menu, closeIfStale);
         ui::showMessageMenuWindow(*menu, anchor);
     });
     delegate->setMessageLinkHandler([this, list](const QString &href) { openMessageLink(href, list); });
@@ -5538,11 +5654,10 @@ void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
     }
     connect(list, &QListWidget::itemActivated, this, [open, list, delegate](QListWidgetItem *item) {
         auto files = item->data(workspace::MessageFiles).value<QVector<MessageFile>>();
-        files += item->data(workspace::ReplyFiles).value<QVector<MessageFile>>();
         const auto index = list->model()->index(list->row(item), 0);
         const auto photos = delegate->photoOriginals(index);
         files.erase(std::remove_if(files.begin(), files.end(), [&photos](const MessageFile &file) {
-            return file.downloadUrl.isEmpty() || std::any_of(photos.cbegin(), photos.cend(), [&file](const auto &photo) {
+            return file.isVideo || file.downloadUrl.isEmpty() || std::any_of(photos.cbegin(), photos.cend(), [&file](const auto &photo) {
                 return photo.downloadUrl == file.downloadUrl;
             });
         }), files.end());
@@ -5555,7 +5670,7 @@ void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
                 connect(menu->addAction(file.name), &QAction::triggered, list, [open, file] { open(file); });
             menu->popup(list->viewport()->mapToGlobal(list->visualItemRect(item).center()));
         } else if (!photos.isEmpty()) {
-            delegate->activateImage(index);
+            delegate->activateMedia(index);
         }
     });
 }
@@ -5649,8 +5764,9 @@ void MainWindow::openMessagePhoto(const MessageFile &file, QWidget *parent, cons
         cancel();
         m_chatPhotoDecodePool.clear();
         const auto &file = gallery->files.at(gallery->index);
-        viewer->setPhoto(file.name, gallery->index, gallery->files.size(), !file.downloadUrl.isEmpty());
-        if (file.downloadUrl.isEmpty()) {
+        const bool hasOriginal = workspace::RowPainter::downloadable(file);
+        viewer->setPhoto(file.name, gallery->index, gallery->files.size(), hasOriginal);
+        if (!hasOriginal) {
             const auto &url = file.previewUrl;
             if (!url.isValid() || url.scheme() != QStringLiteral("https") || url.host().isEmpty() ||
                 !url.userInfo().isEmpty() || url.hasFragment()) {
@@ -5679,29 +5795,41 @@ void MainWindow::openMessagePhoto(const MessageFile &file, QWidget *parent, cons
             show();
         }
     });
-    viewer->setSaveAction([this, viewer, gallery, scope] {
+    viewer->setSaveAction([this, viewer, gallery, scope](const QImage &preview) {
         if (m_chatPhoto == viewer && m_backend->settingsScope() == scope)
-            saveMessageFile(gallery->files.at(gallery->index), viewer);
+            saveMessageFile(gallery->files.at(gallery->index), viewer, preview);
     });
-    viewer->open();
+    viewer->show();
     show();
 }
 
-void MainWindow::saveMessageFile(const MessageFile &file, QWidget *parent)
+void MainWindow::playMessageVideo(const MessageFile &file, QWidget *parent, std::function<bool()> stillVisible)
 {
-    if (!file.downloadUrl.isValid() || file.downloadUrl.scheme() != QStringLiteral("https") ||
-        file.downloadUrl.host().isEmpty() || !file.downloadUrl.userInfo().isEmpty() ||
-        m_messageSaveDialog || !m_messageDownloadUrl.isEmpty())
+    m_chatVideoPreviews->play(file, parent, std::move(stillVisible));
+}
+
+void MainWindow::saveMessageFile(const MessageFile &file, QWidget *parent, const QImage &preview)
+{
+    const bool hasOriginal = workspace::RowPainter::downloadable(file);
+    if ((!hasOriginal && preview.isNull()) || m_messageSaveDialog || !m_messageDownloadUrl.isEmpty())
         return;
     auto *dialog = new QFileDialog(parent, QStringLiteral("Сохранить вложение"));
     dialog->setObjectName(QStringLiteral("messageFileSaveDialog"));
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->setAcceptMode(QFileDialog::AcceptSave);
     dialog->setFileMode(QFileDialog::AnyFile);
-    const auto name = ui::attachmentNames({file.name}).value(0);
+    auto name = ui::attachmentNames({file.name}).value(0);
+    if (!hasOriginal) {
+        dialog->setDefaultSuffix(QStringLiteral("png"));
+        dialog->setNameFilter(QStringLiteral("Изображения PNG (*.png)"));
+        const auto stem = QFileInfo(name).completeBaseName();
+        name = (stem.isEmpty() || stem == QStringLiteral(".") || stem == QStringLiteral("..")
+                ? QStringLiteral("Изображение") : stem) + QStringLiteral(".png");
+    }
     if (!name.isEmpty() && name != QStringLiteral(".") && name != QStringLiteral(".."))
         dialog->selectFile(name);
     m_messageSaveDialog = dialog;
+    connect(m_backend, &Backend::accountScopeChanged, dialog, &QDialog::reject);
     connect(dialog, &QDialog::finished, this, [this, dialog] {
         if (m_messageSaveDialog == dialog)
             m_messageSaveDialog = nullptr;
@@ -5711,9 +5839,24 @@ void MainWindow::saveMessageFile(const MessageFile &file, QWidget *parent)
             m_messageSaveDialog = nullptr;
     });
     connect(dialog, &QFileDialog::fileSelected, this,
-            [this, url = file.downloadUrl, parent = QPointer<QWidget>(parent)](const QString &path) {
-        if (path.isEmpty())
+            [this, url = file.downloadUrl, parent = QPointer<QWidget>(parent),
+             account = m_backend->settingsScope(), preview = hasOriginal ? QImage() : preview](const QString &path) {
+        if (path.isEmpty() || account != m_backend->settingsScope())
             return;
+        if (!preview.isNull()) {
+            const auto target = QDir::cleanPath(path);
+            QSaveFile output(target);
+            output.setDirectWriteFallback(false);
+            const bool opened = safeDownloadTarget(target) && output.open(QIODevice::WriteOnly);
+            const bool encoded = opened && safeDownloadTarget(target) && preview.save(&output, "PNG");
+            const bool saved = encoded && safeDownloadTarget(target) && output.commit();
+            const auto status = saved ? QStringLiteral("Изображение сохранено")
+                                      : QStringLiteral("Не удалось сохранить изображение");
+            setStatus(status);
+            if (m_card && parent == m_card)
+                m_card->setStatus(status);
+            return;
+        }
         m_messageDownloadUrl = url;
         m_messageDownloadPath = path;
         m_messageDownloadParent = parent;
@@ -5723,6 +5866,60 @@ void MainWindow::saveMessageFile(const MessageFile &file, QWidget *parent)
         m_backend->downloadMessageFile(url, path);
     });
     dialog->open();
+}
+
+void MainWindow::uploadPastedChatImage(ui::ChatComposer *composer, const QString &scope, bool task, const QString &caption)
+{
+    if (!m_pendingUpload.isEmpty())
+        return;
+    const auto draft = composer->draft();
+    if (!draft.image)
+        return;
+    const auto feedback = [this, task, &scope](const QString &status, bool loading = false) {
+        if (task && m_card && m_card->taskId() == scope)
+            m_card->setStatus(status, loading);
+        else
+            setStatus(status, loading);
+    };
+    if (!draft.reply.id.isEmpty()) {
+        feedback(QStringLiteral("Чтобы отправить изображение, отмените ответ или удалите изображение из черновика"));
+        return;
+    }
+    composer->cancelTyping();
+    m_pendingUpload = (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scope;
+    m_pendingPastedChatImage = draft;
+    m_uploadName = QFileInfo(draft.image->path).fileName();
+    feedback(QStringLiteral("Отправляем изображение…"), true);
+    updateComposers();
+    updateWriteAvailability();
+    m_backend->uploadChatImage(scope, draft.image->path, task, caption, draft.image->directory);
+}
+
+bool MainWindow::pastedChatImagePending(const QString &scope, bool task) const
+{
+    return m_pendingPastedChatImage.image && m_pendingUpload ==
+        (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scope;
+}
+
+void MainWindow::clearPastedChatImages()
+{
+    if (m_pendingPastedChatImage.image) {
+        m_pendingPastedChatImage = {};
+        m_pendingUpload.clear();
+        m_uploadName.clear();
+    }
+    for (auto *drafts : {&m_chatDrafts, &m_taskDrafts}) {
+        for (auto entry = drafts->begin(); entry != drafts->end();) {
+            entry->image.reset();
+            if (entry->isEmpty())
+                entry = drafts->erase(entry);
+            else
+                ++entry;
+        }
+    }
+    m_chatComposer->forgetDraftImages();
+    if (m_card)
+        m_card->composer()->forgetDraftImages();
 }
 
 void MainWindow::pickFile(const QString &scope, const QString &kind)

@@ -80,6 +80,7 @@ inline bool isLocalNotificationId(const QString &id)
     }
     return id.startsWith(QLatin1String("push:")) && id.size() > 5 && id.size() <= 133;
 }
-std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &params, bool groupEvent);
+std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &params, bool groupEvent,
+                                                        bool allowMissingMessageId = false);
 
 } // namespace bx

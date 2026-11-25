@@ -51,9 +51,13 @@ public:
     void searchProjectTasks(const QString &projectId, const QString &query) override;
     void searchMessages(const QString &scopeId, const QString &query, bool task) override;
     void uploadChatFile(const QString &scopeId, const QString &localPath, bool task) override;
+    void uploadChatImage(const QString &scopeId, const QString &localPath, bool task, const QString &caption,
+                         std::shared_ptr<QTemporaryDir> temporaryDirectory = {}) override;
     void attachTaskFile(const QString &taskId, const QString &localPath) override;
 
 private:
+    void uploadChatAttachment(const QString &scopeId, const QString &localPath, bool task, const QString &caption,
+                              std::shared_ptr<QTemporaryDir> temporaryDirectory = {});
     void emitLater(const std::function<void()> &fn);
     Task *findTask(const QString &taskId);
     void createTaskInBoard(const QString &projectId, const QString &parentId, const TaskEdit &edit);

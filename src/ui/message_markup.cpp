@@ -6,10 +6,15 @@
 #include <QLocale>
 #include <QRegularExpression>
 
+#include <algorithm>
+
 namespace bx::workspace {
 namespace {
 
 using namespace Qt::StringLiterals;
+
+constexpr qsizetype maxMarkupCharacters = 65536;
+const auto replyDelimiter = u"------------------------------------------------------"_s;
 
 enum class Tag { Unknown, Inline, Block, Label, Leaf, Code, List, Item, Table, Row, Cell, Quote, Arrow, Break };
 
@@ -237,6 +242,39 @@ public:
         if (result.block && result.plain.endsWith(u'\n') && !m_source.endsWith(u'\n'))
             result.plain.chop(1);
         return result;
+    }
+
+    std::optional<AttributedMessageQuote> leadingAttributedQuote() const
+    {
+        if (m_tokens.isEmpty() || m_tokens.first().tag != Tag::Quote || m_tokens.first().begin != 0)
+            return std::nullopt;
+        const auto close = m_tokens.first().pair;
+        if (close <= 2 || m_tokens[close - 1].tag != Tag::Break || m_tokens[close - 1].end != m_tokens[close].begin)
+            return std::nullopt;
+        if (close + 1 == m_tokens.size() || m_tokens[close + 1].tag != Tag::Break
+            || m_tokens[close + 1].begin != m_tokens[close].end)
+            return std::nullopt;
+        const auto bodyBegin = m_tokens[close + 1].end;
+        const auto header = replyHeader(0);
+        if (!header.match.hasMatch())
+            return std::nullopt;
+        static const QRegularExpression clock(uR"((?:^|[ ,])(?:[01]?[0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9])?\s*$)"_s);
+        if (!clock.match(header.match.captured(3)).hasMatch())
+            return std::nullopt;
+        if (std::any_of(m_tokens.cbegin() + header.first, m_tokens.cbegin() + close, [](const Token &token) {
+                return token.tag == Tag::Quote || token.tag == Tag::Arrow || token.name == u"quote";
+            }))
+            return std::nullopt;
+        const auto author = markupPlainText(header.match.captured(2).left(512)).simplified();
+        auto excerpt = range(header.first, close, header.begin, m_tokens[close].begin, 1).plain.simplified();
+        constexpr qsizetype maxExcerpt = 240;
+        if (excerpt.size() > maxExcerpt)
+            excerpt.truncate(excerpt[maxExcerpt - 1].isHighSurrogate() ? maxExcerpt - 1 : maxExcerpt);
+        if (author.isEmpty() || excerpt.isEmpty())
+            return std::nullopt;
+        if (range(close + 2, m_tokens.size(), bodyBegin, m_source.size(), 0).plain.trimmed().isEmpty())
+            return std::nullopt;
+        return AttributedMessageQuote{author, excerpt, m_source.mid(bodyBegin)};
     }
 
 private:
@@ -509,29 +547,39 @@ private:
         return body;
     }
 
-    Part replyQuote(qsizetype index, int depth) const
+    struct ReplyHeader {
+        QRegularExpressionMatch match;
+        qsizetype first;
+        qsizetype begin;
+    };
+
+    ReplyHeader replyHeader(qsizetype index) const
     {
-        static const QRegularExpression author(uR"(^(.* \[[^\]\r\n]+\])(?: #(?:chat\d+|\d+:\d+)/\d+)?$)"_s);
+        static const QRegularExpression author(uR"(^((.*) \[([^\]\r\n]+)\])(?: #(?:chat\d+|\d+:\d+)/\d+)?$)"_s);
         const auto &opening = m_tokens[index];
-        const auto &closing = m_tokens[opening.pair];
-        auto first = index + 2; // The tokenizer admits a reply delimiter only before a line break.
-        auto begin = m_tokens[index + 1].end;
-        Part header;
+        const auto first = index + 2; // The tokenizer admits a reply delimiter only before a line break.
+        const auto begin = m_tokens[index + 1].end;
         for (auto i = first; i < opening.pair; ++i) {
             if (m_tokens[i].tag != Tag::Break)
                 continue;
-            const auto match = author.match(text(begin, m_tokens[i].begin));
-            if (match.hasMatch()) {
-                const auto caption = match.captured(1);
-                header = {caption + u'\n', u"<b>"_s + escaped(caption) + u"</b><br>"_s};
-                first = i + 1;
-                begin = m_tokens[i].end;
-            }
+            auto match = author.match(text(begin, m_tokens[i].begin));
+            if (match.hasMatch())
+                return {std::move(match), i + 1, m_tokens[i].end};
             break;
         }
-        auto body = range(first, opening.pair, begin, closing.begin, depth + 1);
-        body.plain.prepend(header.plain);
-        body.html.prepend(header.html);
+        return {{}, first, begin};
+    }
+
+    Part replyQuote(qsizetype index, int depth) const
+    {
+        const auto close = m_tokens[index].pair;
+        const auto header = replyHeader(index);
+        auto body = range(header.first, close, header.begin, m_tokens[close].begin, depth + 1);
+        if (header.match.hasMatch()) {
+            const auto caption = header.match.captured(1);
+            body.plain.prepend(caption + u'\n');
+            body.html.prepend(u"<b>"_s + escaped(caption) + u"</b><br>"_s);
+        }
         return quote(body);
     }
 };
@@ -540,13 +588,12 @@ private:
 
 MessageMarkup parseMessageMarkup(const QString &source)
 {
-    constexpr int maxCharacters = 65536;
-    const auto message = source.size() <= maxCharacters ? source
-        : source.left(source[maxCharacters - 1].isHighSurrogate() ? maxCharacters - 1 : maxCharacters) + u'…';
+    const auto message = source.size() <= maxMarkupCharacters ? source
+        : source.left(source[maxMarkupCharacters - 1].isHighSurrogate() ? maxMarkupCharacters - 1 : maxMarkupCharacters) + u'…';
     const bool action = message.startsWith(u"/me ");
     const bool loud = message.startsWith(u"/loud ");
     if (!action && !loud && !message.contains(u'[') && !message.contains(u">>")
-        && !message.contains(u"------------------------------------------------------") && !webLinks().match(message).hasMatch())
+        && !message.contains(replyDelimiter) && !webLinks().match(message).hasMatch())
         return {message, {}, false};
     if (action || loud) {
         const auto body = message.mid(action ? 4 : 6);
@@ -557,6 +604,13 @@ MessageMarkup parseMessageMarkup(const QString &source)
     }
     auto result = Parser(message).render();
     return {result.plain, result.changed ? result.html : QString{}, result.block, result.links};
+}
+
+std::optional<AttributedMessageQuote> leadingAttributedMessageQuote(const QString &source)
+{
+    if (!source.startsWith(replyDelimiter) || source.size() > maxMarkupCharacters)
+        return std::nullopt;
+    return Parser(source).leadingAttributedQuote();
 }
 
 QString markupPlainText(const QString &source)

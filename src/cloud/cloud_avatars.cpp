@@ -121,7 +121,33 @@ bool matchesRasterType(const QByteArray &mime, const QByteArray &bytes)
     return mime == "image/gif" && (bytes.startsWith("GIF87a") || bytes.startsWith("GIF89a"));
 }
 
+bool exactQueryId(const QUrlQuery &query, const QString &parameter, const QString &expected)
+{
+    const auto ids = query.allQueryItemValues(parameter, QUrl::FullyDecoded);
+    return ids.size() == 1 && exactFileId(ids.first(), expected);
+}
+
 } // namespace
+
+bool cloud::isPortalDiskDownload(const QUrl &url, const QString &attachmentId, const QString &objectId)
+{
+    const auto path = url.path(QUrl::FullyDecoded);
+    if (path == QLatin1String("/bitrix/tools/disk/uf.php") || path == QLatin1String("/bitrix/services/main/ajax.php")) {
+        const QUrlQuery query(url);
+        const auto actions = query.allQueryItemValues(QStringLiteral("action"), QUrl::FullyDecoded);
+        if (actions.size() != 1)
+            return false;
+        if (path == QLatin1String("/bitrix/tools/disk/uf.php"))
+            return actions.first() == QLatin1String("download")
+                && exactQueryId(query, QStringLiteral("attachedId"), attachmentId);
+        return (actions.first() == QLatin1String("disk.attachedObject.download")
+                && exactQueryId(query, QStringLiteral("attachedObjectId"), attachmentId))
+            || (actions.first() == QLatin1String("disk.api.file.download")
+                && exactQueryId(query, QStringLiteral("fileId"), objectId));
+    }
+    static const QRegularExpression downloadFile(QStringLiteral("^/disk/downloadFile/([0-9]+)/?$"));
+    return exactFileId(downloadFile.match(path).captured(1), objectId);
+}
 
 QUrl cloud::avatarCdnRedirect(const QUrl &portal, const QUrl &source, int status, const QUrl &target)
 {
@@ -190,25 +216,12 @@ QUrl CloudBackend::taskImageUrlFromPortal(const QString &value, const QString &a
         return {};
     const auto path = url.path(QUrl::FullyDecoded);
     const QUrlQuery query(url);
+    const bool attached = path == QLatin1String("/bitrix/tools/disk/uf.php");
     const auto actions = query.allQueryItemValues(QStringLiteral("action"), QUrl::FullyDecoded);
-    const auto matchesId = [&query](const QString &parameter, const QString &expected) {
-        const auto ids = query.allQueryItemValues(parameter, QUrl::FullyDecoded);
-        return ids.size() == 1 && exactFileId(ids.first(), expected);
-    };
-    if (path == QLatin1String("/bitrix/tools/disk/uf.php") && actions.size() == 1
-        && (actions.first() == QLatin1String("download") || (!original && actions.first() == QLatin1String("show")))
-        && matchesId(QStringLiteral("attachedId"), attachmentId))
+    if (!original && attached && actions.size() == 1 && actions.first() == QLatin1String("show")
+        && exactQueryId(query, QStringLiteral("attachedId"), attachmentId))
         return registerRasterAsset(url, m_messageImageAssets);
-    if (!original)
-        return {};
-    if (path == QLatin1String("/bitrix/services/main/ajax.php") && actions.size() == 1
-        && ((actions.first() == QLatin1String("disk.attachedObject.download")
-                && matchesId(QStringLiteral("attachedObjectId"), attachmentId))
-            || (actions.first() == QLatin1String("disk.api.file.download")
-                && matchesId(QStringLiteral("fileId"), objectId))))
-        return registerRasterAsset(url, m_messageImageAssets);
-    static const QRegularExpression downloadFile(QStringLiteral("^/disk/downloadFile/([0-9]+)/?$"));
-    if (exactFileId(downloadFile.match(path).captured(1), objectId))
+    if ((original || attached) && cloud::isPortalDiskDownload(url, attachmentId, objectId))
         return registerRasterAsset(url, m_messageImageAssets);
     return {};
 }

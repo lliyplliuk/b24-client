@@ -12,7 +12,10 @@
 #include <QVariantMap>
 #include <QVector>
 #include <functional>
+#include <memory>
 #include <optional>
+
+class QTemporaryDir;
 
 namespace bx {
 
@@ -65,6 +68,11 @@ public:
         emit messagePhotoDownloadFailed(targetPath, QStringLiteral("Оригинал изображения недоступен"));
     }
     virtual void cancelMessagePhoto(const QString &) {}
+    virtual void downloadMessageVideo(const QUrl &, const QString &targetPath)
+    {
+        emit messageVideoDownloadFailed(targetPath, QStringLiteral("Видео недоступно"));
+    }
+    virtual void cancelMessageVideo(const QString &) {}
     virtual void requestChatMessages(const QString &chatId) = 0;
     virtual void requestOlderChatMessages(const QString &scopeId, const QString &beforeId, bool task)
     {
@@ -208,6 +216,16 @@ public:
     virtual void searchMessages(const QString &scopeId, const QString &query, bool task) = 0;
     virtual void uploadChatFile(const QString &scopeId, const QString &localPath, bool task) = 0;
     virtual void attachTaskFile(const QString &taskId, const QString &localPath) = 0;
+    virtual void uploadChatImage(const QString &scopeId, const QString &localPath, bool task, const QString &caption,
+                                 std::shared_ptr<QTemporaryDir> = {})
+    {
+        if (caption.isEmpty()) {
+            uploadChatFile(scopeId, localPath, task);
+            return;
+        }
+        emit failed((task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scopeId,
+                    QStringLiteral("Отправка изображения с подписью недоступна"));
+    }
 
 signals:
     void workdayLoaded(const WorkdayStatus &status);
@@ -225,6 +243,8 @@ signals:
     void messageLinkPreviewAccessChanged(bool available);
     void messageFileDownloaded(const QUrl &url, const QString &targetPath);
     void messagePhotoDownloadFailed(const QString &targetPath, const QString &reason);
+    void messageVideoDownloaded(const QUrl &url, const QString &targetPath);
+    void messageVideoDownloadFailed(const QString &targetPath, const QString &reason);
     void chatMessagesLoaded(const QString &chatId, const QVector<Message> &messages);
     void pinnedMessagesLoaded(const QString &dialogId, const QVector<Message> &messages);
     void chatContactChanged(const QString &dialogId, const QDateTime &onlineUntil, const QString &position);

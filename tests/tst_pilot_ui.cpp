@@ -48,6 +48,7 @@
 #include <QStandardPaths>
 #include <QTest>
 #include <QTemporaryFile>
+#include <QTextDocument>
 #include <QTextEdit>
 #include <QTimer>
 #include <QUrlQuery>
@@ -141,6 +142,17 @@ public:
         const auto bytes = messageImages.value(url);
         QTimer::singleShot(0, this, [this, url, bytes] { emit messageImageLoaded(url, bytes); });
     }
+    void downloadMessageVideo(const QUrl &url, const QString &path) override
+    {
+        videoRequests.append({url, path});
+    }
+    void cancelMessageVideo(const QString &path) override
+    {
+        cancelledVideos.append(path);
+    }
+    QVector<QPair<QUrl, QString>> videoRequests;
+    QStringList cancelledVideos;
+
     void requestMessageLinkPreview(const QUrl &url, LinkPreviewHandler complete) override
     {
         if (holdLinkPreviews)
@@ -501,6 +513,14 @@ public:
         if (!holdUpload)
             emit fileUploaded(scopeId, task ? QStringLiteral("task-chat") : QStringLiteral("chat"));
     }
+    void uploadChatImage(const QString &scopeId, const QString &localPath, bool task, const QString &caption,
+                         std::shared_ptr<QTemporaryDir>) override
+    {
+        ++imageUploadRequests;
+        uploadedCaption = caption;
+        imageUploadForTask = task;
+        uploadChatFile(scopeId, localPath, task);
+    }
     void attachTaskFile(const QString &taskId, const QString &localPath) override
     {
         attachedPath = localPath;
@@ -617,6 +637,9 @@ public:
     bool searchedTask = false;
     QString uploadedPath;
     QString uploadedScope;
+    QString uploadedCaption;
+    int imageUploadRequests = 0;
+    bool imageUploadForTask = false;
     QString attachedPath;
     QString attachmentEmbedId;
     QString attachedTask;
@@ -1534,6 +1557,110 @@ private slots:
         QCOMPARE(taskComposer->input()->toPlainText(), QStringLiteral("Черновик задачи"));
     }
 
+    void upEditsLatestEligibleMessageOnlyFromEmptyComposer()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->demoMode = false;
+        backend->chats.first().id = QStringLiteral("chat91");
+        backend->stages.first().tasks.first().chatDialogId = QStringLiteral("chat67");
+        const auto now = QDateTime::currentDateTime();
+        Message earlier{QStringLiteral("701"), QStringLiteral("Я"), QStringLiteral("Раннее"), now.addSecs(-40), true};
+        Message latest{QStringLiteral("702"), QStringLiteral("Я"), QStringLiteral("Последнее своё"), now.addSecs(-30), true};
+        Message incoming{QStringLiteral("703"), QStringLiteral("Другой"), QStringLiteral("Входящее"), now.addSecs(-20)};
+        Message system{QStringLiteral("704"), {}, QStringLiteral("Системное"), now.addSecs(-10), true};
+        system.system = true;
+        backend->messages = {earlier, latest, incoming, system};
+        backend->taskMessages = {earlier, latest, incoming};
+        MainWindow window(backend.get());
+        window.resize(960, 650);
+        window.show();
+        QApplication::setActiveWindow(&window);
+        emit backend->connectionChanged(true);
+
+        auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
+        auto *composer = window.findChild<ui::ChatComposer *>(QStringLiteral("chatComposer"));
+        QVERIFY(history && composer);
+        QTRY_COMPARE(history->count(), 4);
+        auto *input = composer->input();
+        history->setCurrentRow(3);
+        QTest::keyClick(history, Qt::Key_Up);
+        QCOMPARE(history->currentRow(), 2);
+        QVERIFY(!composer->editingMessage());
+        input->setFocus();
+        QTest::keyClick(input, Qt::Key_Up, Qt::ShiftModifier);
+        QVERIFY(!composer->editingMessage());
+        input->setPlainText(QStringLiteral("Черновик"));
+        QTest::keyClick(input, Qt::Key_Up);
+        QCOMPARE(input->toPlainText(), QStringLiteral("Черновик"));
+        QVERIFY(!composer->editingMessage());
+        input->clear();
+        ui::ChatReply reply;
+        reply.id = incoming.id;
+        reply.preview = incoming.text;
+        composer->setReply(reply);
+        QTest::keyClick(input, Qt::Key_Up);
+        QVERIFY(!composer->editingMessage());
+        QCOMPARE(composer->reply().id, reply.id);
+        composer->setReply({});
+        QInputMethodEvent preedit(QStringLiteral("か"), {});
+        QApplication::sendEvent(input, &preedit);
+        QTest::keyClick(input, Qt::Key_Up);
+        QVERIFY(!composer->editingMessage());
+        QInputMethodEvent endPreedit;
+        QApplication::sendEvent(input, &endPreedit);
+        QTest::keyClick(input, Qt::Key_Up);
+        QVERIFY(composer->matchesEdit(QStringLiteral("chat91"), latest.id));
+        QCOMPARE(input->toPlainText(), latest.text);
+        QTest::keyClick(input, Qt::Key_Escape);
+        QVERIFY(input->toPlainText().isEmpty());
+        QVERIFY(backend->messageActionId.isEmpty());
+
+        window.openTaskCard(QStringLiteral("501"));
+        auto *card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
+        QVERIFY(card);
+        QApplication::setActiveWindow(card);
+        auto *taskHistory = findAccessible<QListWidget>(card, QStringLiteral("Чат карточки"));
+        auto *taskComposer = card->findChild<ui::ChatComposer *>(QStringLiteral("chatComposer"));
+        QVERIFY(taskHistory && taskComposer);
+        QTRY_COMPARE(taskHistory->count(), 3);
+        taskComposer->input()->setFocus();
+        QTest::keyClick(taskComposer->input(), Qt::Key_Up);
+        QVERIFY(taskComposer->matchesEdit(QStringLiteral("chat67"), latest.id));
+        QCOMPARE(taskComposer->input()->toPlainText(), latest.text);
+    }
+
+    void growsComposerForVisualLinesAndShrinksAfterResize()
+    {
+        QWidget host;
+        auto *layout = new QVBoxLayout(&host);
+        auto *composer = new ui::ChatComposer(&host, QStringLiteral("Input"), QStringLiteral("Emoji"),
+                                               QStringLiteral("File"), QStringLiteral("Send"));
+        layout->addWidget(composer);
+        layout->addStretch();
+        host.resize(420, 440);
+        host.show();
+        auto *input = composer->input();
+        QVERIFY(input->isVisible());
+        const auto minimum = input->height();
+        QTest::keyClick(input, Qt::Key_Return, Qt::ShiftModifier);
+        QTRY_VERIFY(input->height() > minimum);
+        input->clear();
+        QTRY_COMPARE(input->height(), minimum);
+        input->setPlainText(QStringLiteral("wrapped word ").repeated(9));
+        QCOMPARE(input->document()->blockCount(), 1);
+        QTRY_VERIFY(input->height() > minimum);
+        const auto wrapped = input->height();
+        host.resize(1200, 440);
+        QTRY_VERIFY(input->height() < wrapped);
+        input->setPlainText(QStringLiteral("line\n").repeated(35));
+        QTRY_VERIFY(input->verticalScrollBar()->maximum() > 0);
+        const auto capped = input->height();
+        input->appendPlainText(QStringLiteral("line\n").repeated(20));
+        QTRY_COMPARE(input->height(), capped);
+        input->clear();
+        QTRY_COMPARE(input->height(), minimum);
+    }
+
     void reportsOnlyCommittedUserTextToTypingIndicator()
     {
         ui::ChatTextEdit input(nullptr);
@@ -2064,7 +2191,8 @@ private slots:
         QTest::keyClick(&window, Qt::Key_3, Qt::AltModifier);
         auto *notifications = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
         QVERIFY(notifications);
-        QTRY_COMPARE(notifications->count(), 2);
+        QTRY_COMPARE(notifications->count(), 1);
+        QCOMPARE(notifications->item(0)->data(workspace::Id).toString(), QStringLiteral("n-2"));
     }
 
     void scopesTimeoutRecoveryToTheAffectedOperation_data()
@@ -2266,22 +2394,60 @@ private slots:
             return scroll->value() - start;
         };
         const int nativeNotch = movement(native, {0, -120});
-        const int chatNotch = movement(history, {0, -120});
-        QVERIFY(nativeNotch > 2);
-        QVERIFY(chatNotch > 0);
-        QVERIFY2(qAbs(2 * chatNotch - nativeNotch) <= 1,
-                 qPrintable(QStringLiteral("chat moved %1 px, native moved %2 px").arg(chatNotch).arg(nativeNotch)));
+        QVERIFY(nativeNotch > 3);
+        const int chatNotch = qRound(nativeNotch / 8.0);
+        auto *scroll = history.verticalScrollBar();
+        const int middle = scroll->maximum() / 2;
+        scroll->setValue(middle);
+        send(history, {0, -120});
+        QCOMPARE(scroll->value(), middle);
+        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), middle + chatNotch, 500);
+        send(history, {0, 120});
+        QCOMPARE(scroll->value(), middle + chatNotch);
+        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), middle, 500);
+
+        send(history, {0, -120});
+        send(history, {0, -120});
+        QCOMPARE(scroll->value(), middle);
+        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), middle + 2 * chatNotch, 500);
+
+        const int beforeChange = scroll->value();
+        send(history, {0, -120});
+        send(history, {0, 120});
+        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), beforeChange - chatNotch, 500);
+
         const auto precisePixels = QPoint(0, -17);
-        QCOMPARE(movement(history, {0, -120}, precisePixels, Qt::ScrollUpdate),
-                 movement(native, {0, -120}, precisePixels, Qt::ScrollUpdate));
+        const int preciseMovement = movement(native, {0, -120}, precisePixels, Qt::ScrollUpdate);
+        const int beforePrecise = scroll->value();
+        send(history, {0, -120});
+        send(history, {0, -120}, precisePixels, Qt::ScrollUpdate);
+        QCOMPARE(scroll->value(), beforePrecise + preciseMovement);
+        QTest::qWait(150);
+        QCOMPARE(scroll->value(), beforePrecise + preciseMovement);
+
+        send(history, {0, -120});
+        scroll->setValue(middle);
+        QTest::qWait(150);
+        QCOMPARE(scroll->value(), middle);
         QVERIFY(qAbs(movement(history, {0, -30}) - movement(native, {0, -30})) <= 1);
         QCOMPARE(movement(history, {0, -120}, {}, Qt::NoScrollPhase, Qt::ControlModifier),
                  movement(native, {0, -120}, {}, Qt::NoScrollPhase, Qt::ControlModifier));
 
         QStringList older;
         history.setOnOlder([&older](const QString &before) { older.append(before); });
-        history.verticalScrollBar()->setValue(history.verticalScrollBar()->minimum());
+        const int nearTop = scroll->minimum() + qMax(1, chatNotch / 2);
+        scroll->setValue(nearTop);
         send(history, {0, 120});
+        send(history, {0, 120});
+        send(history, {0, -120});
+        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), nearTop + chatNotch, 500);
+        QVERIFY(older.isEmpty());
+
+        scroll->setValue(nearTop);
+        send(history, {0, 120});
+        send(history, {0, 120});
+        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), scroll->minimum(), 500);
+        QTRY_COMPARE_WITH_TIMEOUT(older, QStringList{QStringLiteral("101")}, 500);
         send(history, {0, 120});
         QCOMPARE(older, QStringList{QStringLiteral("101")});
     }
@@ -4410,8 +4576,16 @@ private slots:
         if (!capture.isEmpty())
             QVERIFY(card->grab().save(capture));
         const auto rect = description->visualItemRect(description->item(1));
+        const QPoint photoPoint(rect.left() + 32, rect.top() + 30);
+        QContextMenuEvent photoMenuEvent(QContextMenuEvent::Mouse, photoPoint,
+                                         description->viewport()->mapToGlobal(photoPoint));
+        QCoreApplication::sendEvent(description->viewport(), &photoMenuEvent);
+        QTRY_VERIFY(visibleMessageMenu(QStringLiteral("imageContextMenu")));
+        visibleMessageMenu(QStringLiteral("imageContextMenu"))->actions().last()->trigger();
+        QTRY_VERIFY(!visibleMessageMenu(QStringLiteral("imageContextMenu")));
+        QCOMPARE(QGuiApplication::clipboard()->image().pixelColor(3, 3), fill);
         QTest::mouseClick(description->viewport(), Qt::LeftButton, Qt::NoModifier,
-                          QPoint(rect.left() + 32, rect.top() + 30));
+                          photoPoint);
         QTRY_VERIFY(card->findChild<QDialog *>(QStringLiteral("chatPhotoViewer")));
         QCOMPARE(backend->photoUrl, photo.downloadUrl);
         card->findChild<QDialog *>(QStringLiteral("chatPhotoViewer"))->reject();
@@ -5618,6 +5792,65 @@ private slots:
         QCOMPARE(backend->noticeReadBatches.size(), 2);
     }
 
+    void ordinaryChatPopupsDoNotAppearInEventsOrSearch()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->chats.first().unread = 4;
+        Notification ordinary;
+        ordinary.id = QStringLiteral("push:ordinary-message");
+        ordinary.title = QStringLiteral("Техническая поддержка");
+        ordinary.text = QStringLiteral("Событие разговора с поддержкой");
+        ordinary.targets = {{NotificationTargetKind::Chat, QStringLiteral("chat95"), QStringLiteral("801")},
+                            {NotificationTargetKind::Task, QStringLiteral("501")}};
+        ordinary.ordinaryChatMessage = true;
+        Notification task;
+        task.id = QStringLiteral("message:802");
+        task.title = QStringLiteral("Чат задачи");
+        task.text = QStringLiteral("Событие чата задачи");
+        task.targets = {{NotificationTargetKind::Chat, QStringLiteral("chat96"), QStringLiteral("802"), {}, {}, true}};
+        Notification notice;
+        notice.id = QStringLiteral("803");
+        notice.type = QStringLiteral("im");
+        notice.title = QStringLiteral("Уведомление портала");
+        notice.text = QStringLiteral("Событие портала");
+        notice.targets = {ordinary.targets.first()};
+        backend->notifications = {ordinary, task, notice};
+        MainWindow window(backend.get());
+        window.resize(900, 700);
+        window.show();
+        QApplication::setActiveWindow(&window);
+        auto *sections = window.findChild<QListWidget *>(QStringLiteral("sections"));
+        auto *list = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
+        auto *search = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск уведомлений"));
+        QVERIFY(sections && list && search);
+        QTRY_COMPARE(sections->item(0)->data(ui::SectionUnreadCount).toLongLong(), 4);
+        QTRY_COMPARE(sections->item(2)->data(ui::SectionUnreadCount).toLongLong(), 2);
+        sections->setCurrentRow(2);
+        const auto listedIds = [list] {
+            QStringList ids;
+            for (int row = 0; row < list->count(); ++row)
+                ids.append(list->item(row)->data(workspace::Id).toString());
+            ids.sort();
+            return ids;
+        };
+        const QStringList expected{notice.id, task.id};
+        QCOMPARE(listedIds(), expected);
+        QTRY_COMPARE(backend->noticeReadBatches.size(), 1);
+        auto read = backend->noticeReadBatches.first();
+        read.sort();
+        QCOMPARE(read, expected);
+
+        search->setText(QStringLiteral("т"));
+        QTRY_COMPARE(listedIds(), expected);
+        search->setText(QStringLiteral("событие"));
+        QTRY_COMPARE(backend->noticeQuery, search->text());
+        emit backend->notificationsFound(search->text(), {ordinary, task, notice});
+        QCOMPARE(listedIds(), expected);
+        emit backend->notificationsFound(search->text(), {ordinary});
+        QVERIFY(listedIds().isEmpty());
+        QCOMPARE(sections->item(2)->data(ui::SectionUnreadCount).toLongLong(), 2);
+    }
+
     void marksVisibleSyntheticNoticeThroughTheSameViewportBatch()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());
@@ -6000,6 +6233,250 @@ private slots:
         auto *projects = findAccessible<QListWidget>(&window, QStringLiteral("Проекты"));
         QVERIFY(projects && projects->currentItem());
         QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), QStringLiteral("101"));
+    }
+
+    void forwardedVideoShowsPosterAndOpensLocalOriginal_data()
+    {
+        QTest::addColumn<bool>("clickWhileDownloading");
+        QTest::newRow("poster-only-until-click") << false;
+        QTest::newRow("click-before-poster") << true;
+    }
+
+    void forwardedVideoShowsPosterAndOpensLocalOriginal()
+    {
+        QFETCH(bool, clickWhileDownloading);
+        const auto ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        if (ffmpeg.isEmpty())
+            QSKIP("FFmpeg is optional for automatic video posters");
+        QTemporaryDir sample;
+        QVERIFY(sample.isValid());
+        const auto original = sample.filePath(QStringLiteral("sample.mp4"));
+        QProcess generate;
+        generate.start(ffmpeg, {QStringLiteral("-nostdin"), QStringLiteral("-v"), QStringLiteral("error"),
+            QStringLiteral("-f"), QStringLiteral("lavfi"), QStringLiteral("-i"),
+            QStringLiteral("color=c=magenta:s=64x48:r=4"), QStringLiteral("-frames:v"), QStringLiteral("1"),
+            QStringLiteral("-c:v"), QStringLiteral("mpeg4"), QStringLiteral("-threads"), QStringLiteral("1"), original});
+        QVERIFY(generate.waitForFinished(5000));
+        QCOMPARE(generate.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(generate.exitCode(), 0);
+        const QFileInfo fixture(original);
+        QVERIFY(fixture.isFile() && fixture.size() > 0);
+
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        MessageFile video;
+        video.id = QStringLiteral("98");
+        video.name = QStringLiteral("forwarded.mp4");
+        video.size = fixture.size();
+        video.downloadUrl = backend->portalOrigin().resolved(QUrl(QStringLiteral("/disk/downloadFile/98/")));
+        video.isVideo = true;
+        auto &message = backend->messages.first();
+        message.files = {video};
+        message.forwarded = true;
+        message.forwardedAuthor = QStringLiteral("Сотрудник");
+
+        LocalFileOpener player;
+        MainWindow window(backend.get());
+        window.resize(960, 650);
+        window.show();
+        auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
+        QVERIFY(history);
+        QTRY_COMPARE(backend->videoRequests.size(), 1);
+        QCOMPARE(player.opened.size(), 0);
+        const auto [url, path] = backend->videoRequests.first();
+        QCOMPARE(url, video.downloadUrl);
+        QVERIFY(QFileInfo(path).isAbsolute());
+        QCOMPARE(QFileInfo(path).fileName(), QStringLiteral("clip.mp4"));
+
+        const auto findPixel = [&](const std::function<bool(const QColor &)> &match) {
+            const auto pixels = history->viewport()->grab().toImage();
+            const auto bounds = history->visualItemRect(history->item(0)).intersected(history->viewport()->rect());
+            for (int y = bounds.top(); y <= bounds.bottom(); ++y) {
+                for (int x = bounds.left(); x <= bounds.right(); ++x) {
+                    if (match(pixels.pixelColor(x, y)))
+                        return QPoint(x, y);
+                }
+            }
+            return QPoint();
+        };
+        if (clickWhileDownloading) {
+            const auto tile = [&] { return findPixel([](const QColor &color) { return color == QColor("#f6faf8"); }); };
+            QTRY_VERIFY(!tile().isNull());
+            QTest::mouseClick(history->viewport(), Qt::LeftButton, Qt::NoModifier, tile());
+            QCOMPARE(backend->videoRequests.size(), 1);
+            QCOMPARE(player.opened.size(), 0);
+        }
+        QVERIFY(QFile::copy(original, path));
+        emit backend->messageVideoDownloaded(url, path);
+        const auto poster = [&] {
+            return findPixel([](const QColor &color) { return color.red() > 220 && color.green() < 35 && color.blue() > 220; });
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(!poster().isNull(), 10000);
+        if (!clickWhileDownloading) {
+            QCOMPARE(player.opened.size(), 0);
+            QTest::mouseClick(history->viewport(), Qt::LeftButton, Qt::NoModifier, poster());
+        }
+        QTRY_COMPARE(player.opened.size(), 1);
+        QCOMPARE(player.opened.first(), QUrl::fromLocalFile(path));
+        QCOMPARE(backend->videoRequests.size(), 1);
+    }
+
+    void messageGalleryUsesOneBubbleAndCompactClickableQuote()
+    {
+        QListWidget list;
+        auto *delegate = workspace::configureRows(&list, workspace::Row::Message);
+        list.resize(650, 660);
+        const QColor firstColor("#ce4261");
+        const QColor secondColor("#3bad77");
+        QPixmap first(160, 92);
+        QPixmap second(160, 92);
+        first.fill(firstColor);
+        second.fill(secondColor);
+        const QUrl firstUrl(QStringLiteral("https://example.bitrix24.ru/one.png"));
+        const QUrl secondUrl(QStringLiteral("https://example.bitrix24.ru/two.png"));
+        delegate->setMessagePreviewSource([&](const QUrl &url) -> const QPixmap * {
+            return url == firstUrl ? &first : url == secondUrl ? &second : nullptr;
+        });
+        QStringList opened;
+        delegate->setMessagePhotoHandler([&](const MessageFile &file) { opened.append(file.id); });
+        delegate->setReplyNavigation([&](const QString &id) { opened.append(QStringLiteral("reply:") + id); });
+        delegate->setMessagePhotoMenuHandler([](const QModelIndex &, const MessageFile &, const QRect &) {});
+
+        Message gallery;
+        gallery.id = QStringLiteral("101");
+        gallery.author = QStringLiteral("Анна");
+        gallery.text = QStringLiteral("[URL=https://example.bitrix24.ru/attachment-note]Описание галереи[/URL]");
+        gallery.files = {{QStringLiteral("11"), QStringLiteral("Первая.png"), 3000, {}, firstUrl},
+                         {QStringLiteral("12"), QStringLiteral("Вторая.png"), 3200, {}, secondUrl}};
+        Message reply;
+        reply.id = QStringLiteral("102");
+        reply.replyId = gallery.id;
+        reply.text = QStringLiteral("Принято");
+        QLabel state;
+        ui::presentMessages(&list, &state, {gallery, reply});
+        list.show();
+        QTRY_COMPARE(list.count(), 2);
+        QTRY_VERIFY(list.visualItemRect(list.item(1)).isValid());
+
+        const auto grab = list.viewport()->grab();
+        const auto capture = qEnvironmentVariable("B24_CHAT_GALLERY_SCREENSHOT");
+        if (!capture.isEmpty())
+            QVERIFY(grab.save(capture));
+        auto pixels = grab.toImage();
+        const auto colorBounds = [&](int row, const QColor &color) {
+            const auto bounds = list.visualItemRect(list.item(row)).intersected(list.viewport()->rect());
+            QRect painted;
+            for (int y = bounds.top(); y <= bounds.bottom(); ++y) {
+                for (int x = bounds.left(); x <= bounds.right(); ++x) {
+                    if (pixels.pixelColor(x, y) == color)
+                        painted |= QRect(x, y, 1, 1);
+                }
+            }
+            return painted;
+        };
+        const auto firstTile = colorBounds(0, firstColor);
+        const auto secondTile = colorBounds(0, secondColor);
+        QVERIFY(firstTile.isValid() && secondTile.isValid());
+        QVERIFY(firstTile.right() < secondTile.left());
+        QVERIFY(qAbs(firstTile.top() - secondTile.top()) <= 4);
+
+        const auto original = list.model()->index(0, 0);
+        const auto row = list.visualRect(original);
+        const auto bubble = delegate->receiptArea(original, row);
+        QPoint link;
+        for (int y = bubble.top(); y < bubble.bottom() && link.isNull(); ++y) {
+            const QPoint candidate(bubble.left() + 22, y);
+            if (delegate->anchorAt(original, row, candidate).endsWith(QStringLiteral("/attachment-note")))
+                link = candidate;
+        }
+        QVERIFY(!link.isNull());
+        QVERIFY(link.y() > qMax(firstTile.bottom(), secondTile.bottom()));
+
+        const auto quotePreview = colorBounds(1, firstColor);
+        QVERIFY(quotePreview.isValid());
+        QVERIFY(quotePreview.width() <= 44 && quotePreview.height() <= 44);
+        QVERIFY(colorBounds(1, secondColor).isEmpty());
+        const auto quoted = list.model()->index(1, 0);
+        const auto quoteRow = list.visualRect(quoted);
+        QVERIFY(quoteRow.height() < 135);
+        QVERIFY(delegate->receiptArea(quoted, quoteRow).width() >= 285);
+        QVERIFY(!delegate->showPhotoMenuAt(quoted, quotePreview.center()));
+
+        for (const auto &point : {firstTile.center(), secondTile.center(), quotePreview.center()})
+            QTest::mouseClick(list.viewport(), Qt::LeftButton, Qt::NoModifier, point);
+        QCOMPARE(opened, (QStringList{QStringLiteral("11"), QStringLiteral("12"), QStringLiteral("reply:101")}));
+
+        list.resize(215, 660);
+        list.doItemsLayout();
+        const auto narrowGrab = list.viewport()->grab();
+        const auto narrowCapture = qEnvironmentVariable("B24_CHAT_GALLERY_NARROW_SCREENSHOT");
+        if (!narrowCapture.isEmpty())
+            QVERIFY(narrowGrab.save(narrowCapture));
+        pixels = narrowGrab.toImage();
+        const auto firstNarrow = colorBounds(0, firstColor);
+        const auto secondNarrow = colorBounds(0, secondColor);
+        QVERIFY(firstNarrow.isValid() && secondNarrow.isValid());
+        QVERIFY(firstNarrow.bottom() < secondNarrow.top());
+        QVERIFY(qAbs(firstNarrow.left() - secondNarrow.left()) <= 4);
+        QVERIFY(delegate->receiptArea(quoted, list.visualRect(quoted)).right() < list.viewport()->width());
+    }
+
+    void chatAttachmentTooltipsShowEscapedFullNames()
+    {
+        QListWidget list;
+        auto *delegate = workspace::configureRows(&list, workspace::Row::Message);
+        list.resize(420, 420);
+        const QUrl preview(QStringLiteral("https://example.bitrix24.ru/preview.png"));
+        const QColor photoColor("#518faf");
+        QPixmap photo(120, 80);
+        photo.fill(photoColor);
+        delegate->setMessagePreviewSource([&](const QUrl &url) { return url == preview ? &photo : nullptr; });
+        delegate->setMessagePhotoMenuHandler([](const QModelIndex &, const MessageFile &, const QRect &) {});
+
+        Message document;
+        document.id = QStringLiteral("document");
+        const auto docName = QStringLiteral("Подробный отчёт для бухгалтерии за  целый год <b>Q&А</b>.xlsx");
+        document.files = {{QStringLiteral("1"), docName, 36152, {}}};
+        Message quote;
+        quote.id = QStringLiteral("quote");
+        quote.replyId = document.id;
+        quote.text = QStringLiteral("Получила файл");
+        Message picture;
+        picture.id = QStringLiteral("picture");
+        const auto photoName = QStringLiteral("Очень длинное имя снимка <i>корпус  & этаж</i>.png");
+        picture.files = {{QStringLiteral("2"), photoName, 41000, {}, preview}};
+        QLabel state;
+        ui::presentMessages(&list, &state, {document, quote, picture});
+        list.show();
+        QTRY_COMPARE(list.count(), 3);
+        QTRY_VERIFY(list.visualItemRect(list.item(2)).isValid());
+        const auto pixels = list.viewport()->grab().toImage();
+        const auto locate = [&](int row, const QColor &color) {
+            const auto bounds = list.visualItemRect(list.item(row)).intersected(list.viewport()->rect());
+            for (int y = bounds.top(); y <= bounds.bottom(); ++y) {
+                for (int x = bounds.left(); x <= bounds.right(); ++x) {
+                    if (pixels.pixelColor(x, y) == color)
+                        return QPoint(x, y);
+                }
+            }
+            return QPoint();
+        };
+        const auto hint = [&](const QPoint &point) {
+            QHelpEvent event(QEvent::ToolTip, point, list.viewport()->mapToGlobal(point));
+            QApplication::sendEvent(list.viewport(), &event);
+            QTextDocument text;
+            text.setHtml(QToolTip::text());
+            return text.toPlainText();
+        };
+        const auto documentPoint = locate(0, QColor("#f6faf8"));
+        const auto quotePoint = locate(1, QColor("#e8f1ee"));
+        const auto photoPoint = locate(2, photoColor);
+        QVERIFY(!documentPoint.isNull());
+        QVERIFY(!quotePoint.isNull());
+        QVERIFY(!photoPoint.isNull());
+        QCOMPARE(hint(documentPoint), docName);
+        QCOMPARE(hint(quotePoint), docName);
+        QCOMPARE(hint(photoPoint), photoName);
+        QToolTip::hideText();
     }
 
     void fileCardsSaveToExplicitPathAndReuseQuotedFiles()
@@ -6917,12 +7394,162 @@ private slots:
         QTRY_COMPARE(backend->externalLinkPreviewRequests.size(), 3);
     }
 
+    void imageContextMenuUsesTheClickedPhoto_data()
+    {
+        QTest::addColumn<bool>("viewer");
+        QTest::addColumn<bool>("hasOriginal");
+        QTest::newRow("inline original") << false << true;
+        QTest::newRow("original viewer") << true << true;
+        QTest::newRow("inline preview only") << false << false;
+        QTest::newRow("preview only viewer") << true << false;
+    }
+
+    void imageContextMenuUsesTheClickedPhoto()
+    {
+        QFETCH(bool, viewer);
+        QFETCH(bool, hasOriginal);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        auto &message = backend->messages.first();
+        message.id = QStringLiteral("92");
+        const QColor previewColor("#518faf");
+        const QColor viewerColor("#294563");
+        const QSize previewSize(120, 75);
+        const QSize originalSize(600, 375);
+        for (const int id : {1, 2}) {
+            MessageFile file;
+            file.id = QString::number(id);
+            file.name = QStringLiteral("Фото %1.jpg").arg(id);
+            file.previewUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/preview/%1").arg(id));
+            if (id == 1 || hasOriginal)
+                file.downloadUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/download/%1").arg(id));
+            file.previewSize = previewSize;
+            file.isImage = true;
+            message.files.append(file);
+            QByteArray bytes;
+            QBuffer buffer(&bytes);
+            QVERIFY(buffer.open(QIODevice::WriteOnly));
+            QImage image(previewSize, QImage::Format_RGB32);
+            image.fill(id == 1 ? QColor("#87593b") : previewColor);
+            QVERIFY(image.save(&buffer, "PNG"));
+            backend->messageImages.insert(file.previewUrl, bytes);
+        }
+        const auto photo = message.files.last();
+        MainWindow window(backend.get());
+        window.resize(1000, 760);
+        window.show();
+        QApplication::setActiveWindow(&window);
+        auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
+        QVERIFY(history);
+        QTRY_COMPARE(backend->imageRequests.count(photo.previewUrl), 1);
+        const auto pointInPreview = [&] {
+            const auto pixels = history->viewport()->grab().toImage();
+            for (int y = 0; y < pixels.height(); ++y)
+                for (int x = 0; x < pixels.width(); ++x)
+                    if (pixels.pixelColor(x, y) == previewColor)
+                        return QPoint(x, y);
+            return QPoint();
+        };
+        QTRY_VERIFY(!pointInPreview().isNull());
+        QWidget *target = history->viewport();
+        auto point = pointInPreview();
+        const auto openContext = [](QWidget *widget, const QPoint &pos) {
+            QContextMenuEvent event(QContextMenuEvent::Mouse, pos, widget->mapToGlobal(pos));
+            QCoreApplication::sendEvent(widget, &event);
+        };
+        if (viewer) {
+            QTest::mouseClick(target, Qt::LeftButton, Qt::NoModifier, point);
+            auto *dialog = window.findChild<QDialog *>(QStringLiteral("chatPhotoViewer"));
+            QVERIFY(dialog);
+            if (hasOriginal) {
+                auto *state = findAccessible<QLabel>(dialog, QStringLiteral("Состояние загрузки фотографии"));
+                QVERIFY(state && state->isVisible());
+                openContext(state, state->rect().center());
+                QTRY_VERIFY(visibleMessageMenu(QStringLiteral("imageContextMenu")));
+                auto *loadingMenu = visibleMessageMenu(QStringLiteral("imageContextMenu"));
+                QVERIFY(loadingMenu->actions().first()->isEnabled());
+                QVERIFY(!loadingMenu->actions().last()->isEnabled());
+                loadingMenu->close();
+                QCOMPARE(backend->photoUrl, photo.downloadUrl);
+                QImage original(originalSize, QImage::Format_RGB32);
+                original.fill(viewerColor);
+                QVERIFY(original.save(backend->photoPath, "PNG"));
+                emit backend->messageFileDownloaded(backend->photoUrl, backend->photoPath);
+            }
+            target = dialog->findChild<QWidget *>(QStringLiteral("chatPhotoCanvas"));
+            QTRY_VERIFY(target && target->isVisible());
+            auto *zoom = findAccessible<QPushButton>(dialog, QStringLiteral("Увеличить фотографию"));
+            QVERIFY(zoom && zoom->isEnabled());
+            zoom->click();
+            point = target->rect().center();
+        } else if (hasOriginal) {
+            const auto row = history->visualItemRect(history->item(0));
+            openContext(target, QPoint(row.right() - 5, row.top() + 12));
+            QTRY_VERIFY(visibleMessageMenu());
+            visibleMessageMenu()->close();
+        }
+        auto *clipboard = QGuiApplication::clipboard();
+        clipboard->setText(QStringLiteral("clipboard sentinel"));
+        openContext(target, point);
+        QTRY_VERIFY(visibleMessageMenu(QStringLiteral("imageContextMenu")));
+        auto *menu = visibleMessageMenu(QStringLiteral("imageContextMenu"));
+        QCOMPARE(menu->actions().size(), 2);
+        QCOMPARE(menu->actions().first()->text(), QStringLiteral("Скачать изображение"));
+        QCOMPARE(menu->actions().last()->text(), QStringLiteral("Скопировать изображение"));
+        QVERIFY(menu->actions().last()->isEnabled());
+        menu->actions().last()->trigger();
+        QTRY_VERIFY(!visibleMessageMenu(QStringLiteral("imageContextMenu")));
+        const auto pixels = clipboard->image();
+        const bool showOriginal = viewer && hasOriginal;
+        QCOMPARE(pixels.size(), showOriginal ? originalSize : previewSize);
+        QCOMPARE(pixels.pixelColor(3, 3), showOriginal ? viewerColor : previewColor);
+        openContext(target, point);
+        QTRY_VERIFY(visibleMessageMenu(QStringLiteral("imageContextMenu")));
+        menu = visibleMessageMenu(QStringLiteral("imageContextMenu"));
+        QVERIFY(menu->actions().first()->isEnabled());
+        menu->actions().first()->trigger();
+        auto *save = window.findChild<QFileDialog *>(QStringLiteral("messageFileSaveDialog"));
+        QTRY_VERIFY(save && save->isVisible());
+        QCOMPARE(QFileInfo(save->selectedFiles().value(0)).fileName(),
+                 hasOriginal ? photo.name : QStringLiteral("Фото 2.png"));
+        QTemporaryDir folder;
+        QVERIFY(folder.isValid());
+#ifdef Q_OS_UNIX
+        if (!hasOriginal) {
+            QFile protectedFile(folder.filePath(QStringLiteral("protected.txt")));
+            QVERIFY(protectedFile.open(QIODevice::WriteOnly));
+            QCOMPARE(protectedFile.write("keep this file"), qint64(14));
+            protectedFile.close();
+            const auto link = folder.filePath(QStringLiteral("symlink.png"));
+            QVERIFY(QFile::link(protectedFile.fileName(), link));
+            QVERIFY(QFileInfo(link).isSymLink());
+            QVERIFY(QMetaObject::invokeMethod(save, "fileSelected", Qt::DirectConnection, Q_ARG(QString, link)));
+            QVERIFY(QFileInfo(link).isSymLink());
+            QVERIFY(protectedFile.open(QIODevice::ReadOnly));
+            QCOMPARE(protectedFile.readAll(), QByteArray("keep this file"));
+        }
+#endif
+        const auto path = folder.filePath(hasOriginal ? QStringLiteral("original.jpg") : QStringLiteral("preview.png"));
+        save->selectFile(path);
+        QVERIFY(QMetaObject::invokeMethod(save, "accept"));
+        if (hasOriginal) {
+            QTRY_COMPARE(backend->downloadedUrl, photo.downloadUrl);
+            QCOMPARE(backend->downloadedPath, path);
+        } else {
+            QTRY_VERIFY(QFileInfo::exists(path));
+            QVERIFY(backend->downloadedUrl.isEmpty());
+            const QImage saved(path);
+            QCOMPARE(saved.size(), previewSize);
+            QCOMPARE(saved.pixelColor(3, 3), previewColor);
+        }
+    }
+
     void chatPreviewsLoadOnlyNearVisibleRowsAndShowInsideQuotes()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());
         const QUrl visible(QStringLiteral("https://example.bitrix24.ru/preview/2"));
         const QUrl distant(QStringLiteral("https://example.bitrix24.ru/preview/1"));
         const QUrl unavailable(QStringLiteral("https://example.bitrix24.ru/preview/3"));
+        const QUrl omittedQuotePreview(QStringLiteral("https://example.bitrix24.ru/preview/4"));
         const QColor photoColor("#b85038");
         QByteArray photoBytes;
         {
@@ -6966,6 +7593,7 @@ private slots:
         backend->messages.append(own);
         auto quoted = makeMessage(QStringLiteral("92"), QStringLiteral("Спасибо за снимок"));
         quoted.replyId = own.id;
+        quoted.replyFiles = {own.files.front(), makeFile(QStringLiteral("4"), omittedQuotePreview)};
         quoted.forwarded = true;
         quoted.forwardedAuthor = QStringLiteral("Михаил");
         backend->messages.append(quoted);
@@ -6978,17 +7606,18 @@ private slots:
         QTRY_COMPARE(backend->imageRequests.count(visible), 1);
         QTRY_COMPARE(backend->imageRequests.count(unavailable), 1);
         QCOMPARE(backend->imageRequests.count(distant), 0);
+        QCOMPARE(backend->imageRequests.count(omittedQuotePreview), 0);
         const auto *last = history->item(history->count() - 1);
         const auto *previous = history->item(history->count() - 2);
-        QTRY_VERIFY(history->visualItemRect(last).height() > 180);
+        QTRY_VERIFY(history->visualItemRect(last).height() < 165);
         QTRY_VERIFY(history->visualItemRect(previous).height() > 180);
         QCOMPARE(last->data(workspace::ReplyFiles).value<QVector<MessageFile>>().front().previewUrl, visible);
 
         const auto capture = qEnvironmentVariable("B24_CHAT_PREVIEW_SCREENSHOT");
         if (!capture.isEmpty())
             QVERIFY(window.grab().save(capture));
-        const auto screenshot = history->viewport()->grab().toImage();
-        const auto photoPixel = [photoColor, &screenshot](const QRect &row) {
+        const auto photoPixel = [photoColor, history](const QRect &row) {
+            const auto screenshot = history->viewport()->grab().toImage();
             const auto area = row.intersected(screenshot.rect());
             for (int y = area.top(); y <= area.bottom(); ++y)
                 for (int x = area.left(); x <= area.right(); ++x)
@@ -6998,13 +7627,21 @@ private slots:
         };
         const auto quotedPhoto = photoPixel(history->visualItemRect(last));
         QVERIFY(!quotedPhoto.isNull());
-        const auto ownPhoto = photoPixel(history->visualItemRect(previous));
-        QVERIFY(!ownPhoto.isNull());
         QCOMPARE(backend->photoDownloads, 0);
         QTest::mouseClick(history->viewport(), Qt::LeftButton, Qt::NoModifier, quotedPhoto);
+        QTRY_COMPARE(history->currentItem(), previous);
+        QVERIFY(!window.findChild<QDialog *>(QStringLiteral("chatPhotoViewer")));
+        QCOMPARE(backend->photoDownloads, 0);
+        const auto ownPhoto = photoPixel(history->visualItemRect(previous));
+        QVERIFY(!ownPhoto.isNull());
+        QTest::mouseClick(history->viewport(), Qt::LeftButton, Qt::NoModifier, ownPhoto);
         QTRY_VERIFY(window.findChild<QDialog *>(QStringLiteral("chatPhotoViewer")));
         auto *viewer = window.findChild<QDialog *>(QStringLiteral("chatPhotoViewer"));
-        QVERIFY(viewer->isModal());
+        QCOMPARE(viewer->parentWidget(), static_cast<QWidget *>(&window));
+        const auto *selectedBeforeViewerKey = history->currentItem();
+        QTest::keyClick(history, Qt::Key_Up);
+        QCOMPARE(history->currentItem(), selectedBeforeViewerKey);
+        QVERIFY(viewer->isVisible());
         auto *originalState = findAccessible<QLabel>(viewer, QStringLiteral("Состояние загрузки фотографии"));
         QVERIFY(originalState && originalState->isVisible());
         QCOMPARE(originalState->text(), QStringLiteral("Загружаем оригинал фотографии…"));
@@ -7085,7 +7722,7 @@ private slots:
         QTest::keyClick(viewer, Qt::Key_Escape);
         QTRY_VERIFY(!window.findChild<QDialog *>(QStringLiteral("chatPhotoViewer")));
 
-        QTest::mouseClick(history->viewport(), Qt::LeftButton, Qt::NoModifier, quotedPhoto);
+        QTest::mouseClick(history->viewport(), Qt::LeftButton, Qt::NoModifier, ownPhoto);
         QTRY_VERIFY(window.findChild<QDialog *>(QStringLiteral("chatPhotoViewer")));
         viewer = window.findChild<QDialog *>(QStringLiteral("chatPhotoViewer"));
         auto *previousPhoto = findAccessible<QPushButton>(viewer, QStringLiteral("Предыдущая фотография"));
@@ -7226,7 +7863,18 @@ private slots:
         QCOMPARE(backend->imageRequests.count(preview.file.previewUrl), 1);
         auto *previous = findAccessible<QPushButton>(viewer, QStringLiteral("Предыдущая фотография"));
         QVERIFY(previous);
+        const auto center = canvas->rect().center();
+        QContextMenuEvent photoMenuEvent(QContextMenuEvent::Mouse, center, canvas->mapToGlobal(center));
+        QCoreApplication::sendEvent(canvas, &photoMenuEvent);
+        QTRY_VERIFY(visibleMessageMenu(QStringLiteral("imageContextMenu")));
+        const QPointer<QAction> oldCopy(visibleMessageMenu(QStringLiteral("imageContextMenu"))->actions().last());
+        auto *clipboard = QGuiApplication::clipboard();
+        clipboard->setText(QStringLiteral("previous frame sentinel"));
         previous->click();
+        QVERIFY(!visibleMessageMenu(QStringLiteral("imageContextMenu")));
+        if (oldCopy)
+            oldCopy->trigger();
+        QCOMPARE(clipboard->text(), QStringLiteral("previous frame sentinel"));
         QCOMPARE(backend->photoUrl, last.file.downloadUrl);
         const auto canceled = backend->photoPath;
         backend->accountScope = QStringLiteral("fixture/photo-account-changed");
@@ -8742,6 +9390,254 @@ private slots:
         window.setLogoutAvailable(false);
         logout->click();
         QCOMPARE(requests.size(), 1);
+    }
+
+    void pastedChatPictureWaitsInComposer()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        MainWindow window(backend.get());
+        window.resize(960, 650);
+        window.show();
+        auto *input = findAccessible<QPlainTextEdit>(&window, QStringLiteral("Текст сообщения"));
+        QVERIFY(input);
+
+        QImage image(80, 40, QImage::Format_ARGB32);
+        image.fill(QColor("#42788f"));
+        auto *clipboard = QApplication::clipboard();
+        auto *mime = new QMimeData;
+        mime->setImageData(image);
+        clipboard->setMimeData(mime);
+        const auto clearClipboard = qScopeGuard([clipboard] { clipboard->clear(); });
+        QTest::keyClick(input, Qt::Key_V, Qt::ControlModifier);
+
+        auto *preview = findAccessible<QLabel>(&window, QStringLiteral("Изображение из буфера"));
+        QVERIFY(preview && preview->isVisible());
+        QVERIFY(!preview->pixmap().isNull());
+        QVERIFY(backend->uploadedPath.isEmpty());
+        QVERIFY(input->toPlainText().isEmpty());
+    }
+
+    void pastedChatPictureUploadsWithItsOwnDraft_data()
+    {
+        QTest::addColumn<bool>("taskChat");
+        QTest::newRow("ordinary chat with caption") << false;
+        QTest::newRow("task chat without caption") << true;
+    }
+
+    void pastedChatPictureUploadsWithItsOwnDraft()
+    {
+        QFETCH(bool, taskChat);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->holdUpload = true;
+        backend->chats.append({QStringLiteral("c-2"), QStringLiteral("Другой чат")});
+        auto secondTask = backend->stages.first().tasks.first();
+        secondTask.id = QStringLiteral("502");
+        backend->stages.first().tasks.append(secondTask);
+        MainWindow window(backend.get());
+        window.resize(960, 650);
+        window.show();
+        const auto activeTaskCard = [&]() -> ui::TaskCardDialog * {
+            const auto dialogs = window.findChildren<ui::TaskCardDialog *>(QStringLiteral("taskCardDialog"));
+            for (auto *dialog : dialogs)
+                if (dialog->isVisible())
+                    return dialog;
+            return nullptr;
+        };
+        auto *chats = findAccessible<QListWidget>(&window, QStringLiteral("Недавние чаты"));
+        QVERIFY(chats);
+        QTRY_COMPARE(chats->count(), 2);
+
+        QWidget *owner = &window;
+        if (taskChat) {
+            window.openTaskCard(QStringLiteral("501"));
+            QTRY_VERIFY(activeTaskCard());
+            owner = activeTaskCard();
+        }
+        const auto inputName = taskChat ? QStringLiteral("Текст в чате карточки") : QStringLiteral("Текст сообщения");
+        auto *input = findAccessible<QPlainTextEdit>(owner, inputName);
+        QVERIFY(input);
+        auto *clipboard = QApplication::clipboard();
+        const auto clearClipboard = qScopeGuard([clipboard] { clipboard->clear(); });
+        auto *html = new QMimeData;
+        html->setHtml(QStringLiteral("<b>Подпись</b>"));
+        html->setText(QStringLiteral("Подпись"));
+        html->setData(QStringLiteral("application/x-qt-image"), QByteArray("invalid optional image representation"));
+        clipboard->setMimeData(html);
+        QTest::keyClick(input, Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(input->toPlainText(), QStringLiteral("Подпись"));
+        if (taskChat)
+            input->clear();
+        const auto caption = input->toPlainText();
+
+        const QColor color("#477f9d");
+        QImage image(80, 40, QImage::Format_ARGB32);
+        image.fill(color);
+        if (taskChat) {
+            QByteArray png;
+            QBuffer buffer(&png);
+            QVERIFY(buffer.open(QIODevice::WriteOnly));
+            QVERIFY(image.save(&buffer, "PNG"));
+            auto *raw = new QMimeData;
+            raw->setData(QStringLiteral("image/png"), png);
+            clipboard->setMimeData(raw);
+        } else {
+            clipboard->setImage(image);
+        }
+        QTest::keyClick(input, Qt::Key_V, Qt::ControlModifier);
+        auto *preview = findAccessible<QLabel>(owner, QStringLiteral("Изображение из буфера"));
+        QVERIFY(preview && preview->isVisible());
+        QCOMPARE(backend->imageUploadRequests, 0);
+
+        if (taskChat) {
+            auto *card = activeTaskCard();
+            QVERIFY(card);
+            card->setDiscardConfirmation([] { return true; });
+            QVERIFY(card->close());
+            window.openTaskCard(QStringLiteral("502"));
+            QTRY_VERIFY(activeTaskCard());
+            QCOMPARE(activeTaskCard()->taskId(), QStringLiteral("502"));
+            auto *otherPreview = findAccessible<QLabel>(activeTaskCard(), QStringLiteral("Изображение из буфера"));
+            QVERIFY(otherPreview && !otherPreview->isVisible());
+            QVERIFY(activeTaskCard()->close());
+            window.openTaskCard(QStringLiteral("501"));
+            QTRY_VERIFY(activeTaskCard());
+            owner = activeTaskCard();
+            input = findAccessible<QPlainTextEdit>(owner, inputName);
+            preview = findAccessible<QLabel>(owner, QStringLiteral("Изображение из буфера"));
+        } else {
+            chats->setCurrentRow(1);
+            QVERIFY(!preview->isVisible());
+            QVERIFY(input->toPlainText().isEmpty());
+            chats->setCurrentRow(0);
+        }
+        QVERIFY(input && preview && preview->isVisible());
+        QCOMPARE(input->toPlainText(), caption);
+
+        const auto capture = qEnvironmentVariable("B24_CHAT_PASTE_SCREENSHOT");
+        if (!capture.isEmpty() && !taskChat)
+            QVERIFY(input->parentWidget()->grab().save(capture));
+        auto *composer = static_cast<ui::ChatComposer *>(input->parentWidget());
+        const auto restoredPath = composer->draft().image->path;
+        auto *remove = findAccessible<QPushButton>(owner, QStringLiteral("Удалить изображение из черновика"));
+        QVERIFY(remove && remove->isVisible());
+        remove->click();
+        QVERIFY(!preview->isVisible());
+        QVERIFY(!QFileInfo::exists(restoredPath));
+        QTest::keyClick(input, Qt::Key_V, Qt::ControlModifier);
+        QVERIFY(preview->isVisible());
+        const auto replyId = QStringLiteral("999");
+        composer->setReply({replyId, QStringLiteral("Анна"), QStringLiteral("Исходное сообщение")});
+        QTest::keyClick(input, Qt::Key_Return);
+        QCOMPARE(backend->imageUploadRequests, 0);
+        QCOMPARE(composer->reply().id, replyId);
+        QVERIFY(preview->isVisible());
+        composer->setReply({});
+
+        const auto scope = taskChat ? QStringLiteral("501") : QStringLiteral("c-1");
+        const auto kind = taskChat ? QStringLiteral("task-chat") : QStringLiteral("chat");
+        QTest::keyClick(input, Qt::Key_Return);
+        QCOMPARE(backend->imageUploadRequests, 1);
+        QCOMPARE(backend->imageUploadForTask, taskChat);
+        QCOMPARE(backend->uploadedScope, scope);
+        QCOMPARE(backend->uploadedCaption, caption);
+        const auto uploaded = backend->uploadedPath;
+        QVERIFY(QFileInfo::exists(uploaded));
+        QVERIFY(uploaded.endsWith(QStringLiteral(".png")));
+        const QImage stored(uploaded);
+        QCOMPARE(stored.size(), image.size());
+        QCOMPARE(stored.pixelColor(20, 20), color);
+        QVERIFY(preview->isVisible());
+
+        emit backend->failed((taskChat ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scope,
+                             QStringLiteral("Ошибка отправки"));
+        QVERIFY(preview->isVisible());
+        QVERIFY(QFileInfo::exists(uploaded));
+        QCOMPARE(input->toPlainText(), caption);
+        QTest::keyClick(input, Qt::Key_Return);
+        QCOMPARE(backend->imageUploadRequests, 2);
+        QCOMPARE(backend->uploadedPath, uploaded);
+        const auto newerDraft = QStringLiteral("Новый текст");
+        input->setPlainText(newerDraft);
+        emit backend->fileUploaded(QStringLiteral("other"), kind);
+        QVERIFY(preview->isVisible());
+        emit backend->fileUploaded(scope, kind);
+        QVERIFY(!preview->isVisible());
+        QCOMPARE(input->toPlainText(), newerDraft);
+        QVERIFY(!QFileInfo::exists(uploaded));
+
+        QTest::keyClick(input, Qt::Key_V, Qt::ControlModifier);
+        QVERIFY(preview->isVisible());
+        QVERIFY(remove->isVisible());
+        remove->click();
+        QVERIFY(!preview->isVisible());
+        QCOMPARE(input->toPlainText(), newerDraft);
+        QCOMPARE(backend->imageUploadRequests, 2);
+
+        input->clear();
+        QTest::keyClick(input, Qt::Key_V, Qt::ControlModifier);
+        QTest::keyClick(input, Qt::Key_Return);
+        QCOMPARE(backend->imageUploadRequests, 3);
+        emit backend->fileUploaded(scope, kind);
+        QVERIFY(!preview->isVisible());
+        QVERIFY(input->toPlainText().isEmpty());
+
+        const auto waitCaption = QStringLiteral("Подпись уже отправляется");
+        input->setPlainText(waitCaption);
+        QTest::keyClick(input, Qt::Key_V, Qt::ControlModifier);
+        QTest::keyClick(input, Qt::Key_Return);
+        QCOMPARE(backend->imageUploadRequests, 4);
+        QVERIFY(remove->isVisible());
+        remove->click();
+        QTest::keyClick(input, Qt::Key_Return);
+        QCOMPARE(backend->chatSendRequests, 0);
+        QCOMPARE(backend->taskSendRequests, 0);
+        QCOMPARE(input->toPlainText(), waitCaption);
+        emit backend->fileUploaded(scope, kind);
+        QVERIFY(input->toPlainText().isEmpty());
+        QVERIFY(!QFileInfo::exists(backend->uploadedPath));
+    }
+
+    void taskCardCanCloseImmediatelyAfterSendAcknowledgement()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->holdMessageSends = true;
+        MainWindow window(backend.get());
+        window.resize(960, 650);
+        window.show();
+        const auto taskId = QStringLiteral("501");
+        window.openTaskCard(taskId);
+        const QPointer card(window.findChild<ui::TaskCardDialog *>(QStringLiteral("taskCardDialog")));
+        QVERIFY(card);
+        QTRY_VERIFY(card->isVisible());
+        QVERIFY(!card->hasUnsavedChanges());
+
+        int confirmations = 0;
+        card->setDiscardConfirmation([&confirmations] { ++confirmations; return false; });
+        auto *input = card->messageInput();
+        const auto sent = QStringLiteral("Ответ по задаче");
+        input->setPlainText(sent);
+        QTest::keyClick(input, Qt::Key_Return);
+        QCOMPARE(backend->taskSendRequests, 1);
+        QCOMPARE(backend->sentTask, sent);
+        QVERIFY(card->hasUnsavedChanges());
+        QVERIFY(!card->close());
+        QCOMPARE(confirmations, 1);
+
+        const auto historyRequests = backend->taskChatReadRequests.size();
+        emit backend->messageSent(QStringLiteral("task:") + taskId, QStringLiteral("900"));
+        QCOMPARE(backend->taskChatReadRequests.size(), historyRequests);
+        QVERIFY(input->toPlainText().isEmpty());
+        QVERIFY(!card->hasUnsavedChanges());
+
+        input->setPlainText(QStringLiteral("Новый черновик"));
+        QVERIFY(card->hasUnsavedChanges());
+        QVERIFY(!card->close());
+        QCOMPARE(confirmations, 2);
+
+        input->clear();
+        QVERIFY(card->close());
+        QCOMPARE(confirmations, 2);
+        QVERIFY(!card || !card->isVisible());
     }
 
     void taskCardWarnsBeforeClosingWithUnsavedChanges()

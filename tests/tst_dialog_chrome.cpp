@@ -171,7 +171,7 @@ private slots:
 
         QVERIFY(viewer->windowFlags().testFlag(Qt::FramelessWindowHint));
         QCOMPARE(viewer->windowType(), Qt::Dialog);
-        QCOMPARE(viewer->windowModality(), Qt::WindowModal);
+        QCOMPARE(viewer->windowModality(), Qt::NonModal);
         auto *bar = viewer->layout()->menuBar();
         QVERIFY(bar);
         QCOMPARE(bar->geometry().top(), 0);
@@ -195,6 +195,163 @@ private slots:
         QVERIFY(close);
         QTest::mouseClick(close, Qt::LeftButton);
         QTRY_VERIFY(viewer.isNull());
+    }
+
+    void photoViewerDismissesOutsidePressWithoutClickThrough_data()
+    {
+        QTest::addColumn<bool>("throughWindow");
+        QTest::addColumn<bool>("releaseInOwner");
+        QTest::newRow("widget input") << false << true;
+        QTest::newRow("native window input") << true << true;
+        QTest::newRow("release in an unrelated window") << false << false;
+    }
+
+    void photoViewerDismissesOutsidePressWithoutClickThrough()
+    {
+        QFETCH(bool, throughWindow);
+        QFETCH(bool, releaseInOwner);
+        class BackgroundButton final : public QPushButton {
+        public:
+            using QPushButton::QPushButton;
+            int presses = 0;
+            int releases = 0;
+
+        protected:
+            void mousePressEvent(QMouseEvent *event) override
+            {
+                ++presses;
+                QPushButton::mousePressEvent(event);
+            }
+
+            void mouseReleaseEvent(QMouseEvent *event) override
+            {
+                ++releases;
+                QPushButton::mouseReleaseEvent(event);
+            }
+        };
+        QWidget workspace;
+        auto *layout = new QVBoxLayout(&workspace);
+        auto *background = new BackgroundButton(QStringLiteral("Сообщение"), &workspace);
+        layout->addWidget(background);
+        workspace.show();
+        const QPointer<bx::ui::ChatPhotoDialog> viewer =
+            new bx::ui::ChatPhotoDialog(&workspace, QStringLiteral("Фото.jpg"), {});
+        QSignalSpy finished(viewer, &QDialog::finished);
+        QSignalSpy backgroundClicks(background, &QPushButton::clicked);
+        viewer->show();
+        QVERIFY(QTest::qWaitForWindowExposed(viewer));
+
+        QImage photo(40, 30, QImage::Format_RGB32);
+        photo.fill(Qt::darkRed);
+        viewer->showOriginal(photo);
+        auto *canvas = viewer->findChild<QWidget *>(QStringLiteral("chatPhotoCanvas"));
+        QVERIFY(canvas && canvas->isVisible());
+        QTest::mouseClick(canvas, Qt::LeftButton);
+        QVERIFY(viewer && viewer->isVisible());
+        QEvent deactivate(QEvent::WindowDeactivate);
+        QApplication::sendEvent(viewer, &deactivate);
+        QVERIFY(viewer && viewer->isVisible());
+
+        {
+            QDialog child(viewer);
+            child.setWindowModality(Qt::WindowModal);
+            auto *childLayout = new QVBoxLayout(&child);
+            auto *button = new QPushButton(QStringLiteral("Сохранить"), &child);
+            childLayout->addWidget(button);
+            child.show();
+            QVERIFY(QTest::qWaitForWindowExposed(&child));
+            QSignalSpy childClicks(button, &QPushButton::clicked);
+            QTest::mouseClick(button, Qt::LeftButton);
+            QCOMPARE(childClicks.size(), 1);
+            QVERIFY(viewer && viewer->isVisible());
+            QTest::keyClick(&child, Qt::Key_Escape);
+            QVERIFY(!child.isVisible() && viewer->isVisible());
+        }
+
+        const auto point = canvas->rect().center();
+        QContextMenuEvent context(QContextMenuEvent::Mouse, point, canvas->mapToGlobal(point));
+        QApplication::sendEvent(canvas, &context);
+        const auto menu = viewer->findChild<QMenu *>(QStringLiteral("imageContextMenu"));
+        QVERIFY(menu);
+        QTRY_VERIFY(menu->isVisible());
+        auto *copy = menu->actions().last();
+        QSignalSpy copied(copy, &QAction::triggered);
+        QTest::mouseClick(menu, Qt::LeftButton, Qt::NoModifier, menu->actionGeometry(copy).center());
+        QCOMPARE(copied.size(), 1);
+        QVERIFY(viewer && viewer->isVisible());
+
+        auto *outsideWindow = workspace.windowHandle();
+        QVERIFY(outsideWindow);
+        const auto outsidePoint = background->mapTo(&workspace, background->rect().center());
+        if (throughWindow)
+            QTest::mousePress(outsideWindow, Qt::LeftButton, {}, outsidePoint);
+        else
+            QTest::mousePress(background, Qt::LeftButton);
+        QCOMPARE(finished.size(), 1);
+        QCOMPARE(finished.first().first().toInt(), int(QDialog::Rejected));
+        QTRY_VERIFY(viewer.isNull());
+        if (!releaseInOwner) {
+            BackgroundButton unrelated(QStringLiteral("Другое окно"));
+            unrelated.show();
+            QTest::mouseRelease(&unrelated, Qt::LeftButton);
+            QCOMPARE(unrelated.releases, 1);
+        } else if (throughWindow) {
+            QTest::mouseRelease(outsideWindow, Qt::LeftButton, {}, outsidePoint);
+        } else {
+            QTest::mouseRelease(background, Qt::LeftButton);
+        }
+        QCOMPARE(background->presses, 0);
+        QCOMPARE(background->releases, 0);
+        QCOMPARE(backgroundClicks.size(), 0);
+
+        QTest::mouseClick(background, Qt::LeftButton);
+        QCOMPARE(backgroundClicks.size(), 1);
+    }
+
+    void rightClickDismissalDoesNotOpenBackgroundContextMenu_data()
+    {
+        QTest::addColumn<bool>("contextBeforeRelease");
+        QTest::newRow("context on press") << true;
+        QTest::newRow("context on release") << false;
+    }
+
+    void rightClickDismissalDoesNotOpenBackgroundContextMenu()
+    {
+        QFETCH(bool, contextBeforeRelease);
+        QWidget workspace;
+        workspace.setContextMenuPolicy(Qt::CustomContextMenu);
+        workspace.show();
+        QSignalSpy workspaceMenus(&workspace, &QWidget::customContextMenuRequested);
+        QWidget unrelated;
+        unrelated.setContextMenuPolicy(Qt::CustomContextMenu);
+        unrelated.show();
+        QSignalSpy unrelatedMenus(&unrelated, &QWidget::customContextMenuRequested);
+        const QPointer<bx::ui::ChatPhotoDialog> viewer =
+            new bx::ui::ChatPhotoDialog(&workspace, QStringLiteral("Фото.jpg"), {});
+        viewer->show();
+        QVERIFY(QTest::qWaitForWindowExposed(viewer));
+
+        const auto context = [](QWidget &target, QContextMenuEvent::Reason reason) {
+            const auto point = target.rect().center();
+            QContextMenuEvent event(reason, point, target.mapToGlobal(point));
+            QApplication::sendEvent(&target, &event);
+        };
+        QTest::mousePress(&workspace, Qt::RightButton);
+        QTRY_VERIFY(viewer.isNull());
+        context(workspace, QContextMenuEvent::Keyboard);
+        QCOMPARE(workspaceMenus.size(), 1);
+        context(unrelated, QContextMenuEvent::Mouse);
+        QCOMPARE(unrelatedMenus.size(), 1);
+        if (contextBeforeRelease)
+            context(workspace, QContextMenuEvent::Mouse);
+        QTest::mouseRelease(&workspace, Qt::RightButton);
+        if (!contextBeforeRelease)
+            context(workspace, QContextMenuEvent::Mouse);
+        QCOMPARE(workspaceMenus.size(), 1);
+
+        QTest::mouseClick(&workspace, Qt::RightButton);
+        context(workspace, QContextMenuEvent::Mouse);
+        QCOMPARE(workspaceMenus.size(), 2);
     }
 
     void keepsStandardConfirmationAndInputBehavior()
