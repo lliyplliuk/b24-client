@@ -29,7 +29,7 @@ public:
     explicit PublicLinkPreviewFetcher(QObject *parent = nullptr);
     ~PublicLinkPreviewFetcher() override;
 
-    static bool accepts(const QUrl &url);
+    static bool accepts(const QUrl &url, bool requireNativeTransport = true);
 
     // False means the URL was rejected or another request is already active.
     bool request(const QUrl &url, Completion complete);

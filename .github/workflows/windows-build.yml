@@ -19,10 +19,44 @@ jobs:
           modules: 'qtwebsockets'
           cache: true
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR -DCMAKE_BUILD_TYPE=Release
+        run: |
+          $launcher = Join-Path $env:RUNNER_TEMP 'qt-test-launcher.ps1'
+          @'
+          $test = $args[0]
+          $testArgs = @($args | Select-Object -Skip 1)
+          $log = Join-Path $env:BX_QTTEST_LOG_DIR "$([IO.Path]::GetFileNameWithoutExtension($test)).txt"
+          & $test @testArgs -o '-,txt' -o "$log,txt"
+          exit $LASTEXITCODE
+          '@ | Set-Content -LiteralPath $launcher -Encoding utf8
+          cmake -S . -B build "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR" -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TEST_LAUNCHER=pwsh;-NoProfile;-NonInteractive;-File;$launcher"
       - name: Build
         run: cmake --build build --config Release
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        id: tests
+        run: |
+          $env:BX_QTTEST_LOG_DIR = (New-Item -ItemType Directory -Force -Path build/qt-test-logs).FullName
+          ctest --test-dir build -C Release --output-on-failure
+          exit $LASTEXITCODE
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Annotate Qt test failures
+        if: ${{ failure() && steps.tests.outcome == 'failure' }}
+        run: |
+          Get-ChildItem -LiteralPath build/qt-test-logs -Filter '*.txt' -File | Sort-Object Name |
+            Select-String -Pattern '^(FAIL!|QFATAL)\s*:' -Context 0,4 |
+            Select-Object -First 10 |
+            ForEach-Object {
+              $entry = $_
+              $details = $entry.Context.PostContext | Where-Object { $_ -match '^\s+\S' }
+              $message = (@($entry.Line) + @($details)) -join "`n"
+              $escaped = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Output "::error::$escaped"
+            }
+      - name: Upload failed test diagnostics
+        if: ${{ failure() && steps.tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-test-diagnostics
+          path: |
+            build/qt-test-logs/
+            build/Testing/Temporary/LastTest*.log

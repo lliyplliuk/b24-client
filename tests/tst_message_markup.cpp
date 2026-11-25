@@ -4,6 +4,7 @@
 #include <QDateTime>
 #include <QFontDatabase>
 #include <QLocale>
+#include <QMouseEvent>
 #include <QScopeGuard>
 #include <QSignalSpy>
 #include <QTest>
@@ -410,7 +411,8 @@ void MessageMarkupTest::expandsLongMessagesAndTaskPreviewsOnWideChat()
     QListWidget list;
     list.resize(1157, 630);
     auto *painter = configureRows(&list, Row::Message);
-    auto *shortMessage = addMarkupRow(&list, {}, u"Да, проверю сегодня"_s, u"19:28"_s, u"1"_s);
+    // This text fits the narrow bubble with both the usual and fallback fonts.
+    auto *shortMessage = addMarkupRow(&list, {}, u"Да"_s, u"19:28"_s, u"1"_s);
     const auto text = u"По одному артикулу могут приходить детали разных поставщиков. "
                       "Эту поставку не могли выдать две недели, пока не сверили коробки на складе. "
                       "Проверим похожие случаи и уточним, на каком этапе в программе разошлись данные. "
@@ -796,7 +798,8 @@ void MessageMarkupTest::paintsAndHitsLargerReactionBadges()
     using namespace Qt::StringLiterals;
     using namespace bx::workspace;
     QListWidget list;
-    list.resize(315, 290);
+    // Leave room for the four-digit chip and its delivery caption with fallback fonts.
+    list.resize(430, 290);
     configureRows(&list, Row::Message);
     auto *plain = addMarkupRow(&list, {}, u"Да"_s, u"11:18"_s, u"1"_s);
     auto *reacted = addMarkupRow(&list, {}, u"Да"_s, u"11:18"_s, u"2"_s);
@@ -819,14 +822,19 @@ void MessageMarkupTest::paintsAndHitsLargerReactionBadges()
     const auto bubble = painter->receiptArea(index, row);
     // The larger chip's top area remains clickable and the outgoing delivery stays separate.
     const auto badge = bubble.bottomLeft() + QPoint(21, -21);
-    QTest::mouseMove(list.viewport(), badge);
-    QCOMPARE(list.viewport()->cursor().shape(), Qt::PointingHandCursor);
+    QCOMPARE(list.indexAt(badge), index);
     QStyleOptionViewItem option;
     option.rect = row;
     QHelpEvent tooltip(QEvent::ToolTip, badge, list.viewport()->mapToGlobal(badge));
     QVERIFY(painter->helpEvent(&tooltip, &list, option, index));
     QVERIFY(QToolTip::text().contains(u"Снять реакцию «Нравится»"_s));
     QToolTip::hideText();
+    // Qt's QWidget mouseMove uses the system cursor for moves without any button down.
+    auto *viewport = list.viewport();
+    QMouseEvent hover(QEvent::MouseMove, badge, viewport->mapToGlobal(badge),
+                      Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+    QApplication::sendEvent(viewport, &hover);
+    QCOMPARE(list.viewport()->cursor().shape(), Qt::PointingHandCursor);
     QTest::mouseClick(list.viewport(), Qt::LeftButton, Qt::NoModifier, badge);
     QCOMPARE(actions, QStringList{u"like"_s});
     QTest::mouseClick(list.viewport(), Qt::LeftButton, Qt::NoModifier, bubble.bottomRight() + QPoint(-15, -9));

@@ -4828,7 +4828,8 @@ bool MainWindow::needsPublicLinkPreview(QListWidget *history, const QString &id,
     if (!history || !m_online || !m_linkPreviewAccess || m_backend->isDemo() || !m_sessionRecovery->isHidden()
         || history != m_externalLinkHistory || !history->isVisible() || m_externalLinkPending
         || id.toLongLong() > m_latestExternalLinkMessage || OriginGuard(m_backend->portalOrigin()).isSameOrigin(url)
-        || !ui::PublicLinkPreviewFetcher::accepts(url) || m_externalLinkPreviews.contains({id, url}))
+        || !ui::PublicLinkPreviewFetcher::accepts(url, !m_publicLinkRequest)
+        || m_externalLinkPreviews.contains({id, url}))
         return false;
     return !id.isEmpty() && !m_publicLinkPreviews.contains(publicLinkTarget(url));
 }
@@ -6053,8 +6054,7 @@ bool MainWindow::uploadNextDescriptionFile()
     m_pendingUpload = QStringLiteral("attach-task:") + taskId;
     m_uploadName = QFileInfo(path).fileName();
     m_descriptionUploadLinked = false;
-    QImageReader image(path);
-    m_descriptionUploadSize = image.size();
+    m_descriptionUploadSize = QImageReader(path).size();
     const auto status = QStringLiteral("Загружаем %1…").arg(m_uploadName);
     m_card->descriptionEditor()->setUploadStatus(status, true);
     updateComposers();

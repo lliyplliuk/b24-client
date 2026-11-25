@@ -46,6 +46,7 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QStandardPaths>
+#include <QStyleOptionViewItem>
 #include <QTest>
 #include <QTemporaryFile>
 #include <QTextDocument>
@@ -890,13 +891,21 @@ private slots:
         task.unread = 1;
         backend->taskChats = {task};
         MainWindow window(backend.get());
-        window.resize(1220, 690);
+        window.resize(1400, 690);
         window.show();
         auto *tabs = window.findChild<QTabBar *>(QStringLiteral("chatScopeTabs"));
         auto *splitter = window.findChild<QSplitter *>(QStringLiteral("chatDirectorySplitter"));
         QVERIFY(tabs && splitter);
         QTRY_VERIFY(tabs->isVisible());
-        const auto wideTabWidth = tabs->width();
+        const int compactWidth = splitter->widget(0)->minimumWidth();
+        const int wideWidth = compactWidth + 130;
+        const auto setDirectoryWidth = [splitter](int width) {
+            const int available = splitter->contentsRect().width() - splitter->handle(1)->width();
+            splitter->setSizes({width, available - width});
+            QTRY_COMPARE(splitter->sizes().first(), width);
+        };
+        setDirectoryWidth(wideWidth);
+        const int wideTabWidth = tabs->width();
         const auto assertBadge = [tabs](int scope, const QString &text) {
             const auto *badge = qobject_cast<QLabel *>(tabs->tabButton(scope, QTabBar::RightSide));
             if (text.isEmpty()) {
@@ -916,11 +925,11 @@ private slots:
         assertBadge(0, {});
         assertBadge(1, QStringLiteral("1"));
 
-        for (const auto width : {196, 350}) {
-            window.resize(width == 196 ? 790 : 1220, 690);
-            splitter->setSizes({width, window.width() - width});
+        for (const auto width : {compactWidth, wideWidth}) {
+            window.resize(width == compactWidth ? 900 : 1400, 690);
             QCoreApplication::processEvents();
-            QVERIFY(width == 196 ? tabs->width() < wideTabWidth : tabs->width() > 196);
+            setDirectoryWidth(width);
+            QTRY_VERIFY(width == compactWidth ? tabs->width() < wideTabWidth : tabs->width() == wideTabWidth);
             const QRect first = tabs->tabRect(0);
             const QRect second = tabs->tabRect(1);
             for (int scope : {0, 1}) {
@@ -2035,14 +2044,19 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(column->visualItemRect(first).height(), column->sizeHintForRow(0), 1000);
         const auto rect = column->visualItemRect(first);
         QVERIFY(rect.height() > column->visualItemRect(column->item(1)).height());
-        column->scrollToItem(first, QAbstractItemView::PositionAtBottom);
-        QCoreApplication::processEvents();
-        const auto snapshot = column->viewport()->grab().toImage();
-        const auto firstVisible = column->visualItemRect(first).intersected(snapshot.rect());
-        auto boundsOf = [&snapshot, firstVisible](const QColor &color) {
+        QStyleOptionViewItem option;
+        option.initFrom(column->viewport());
+        option.rect = QRect(QPoint(), rect.size());
+        QImage snapshot(option.rect.size(), QImage::Format_ARGB32_Premultiplied);
+        snapshot.fill(Qt::transparent);
+        {
+            QPainter painter(&snapshot);
+            column->itemDelegate()->paint(&painter, option, column->model()->index(0, 0));
+        }
+        const auto boundsOf = [&snapshot](const QColor &color) {
             QRect bounds;
-            for (int y = firstVisible.top(); y <= firstVisible.bottom(); ++y)
-                for (int x = firstVisible.left(); x <= firstVisible.right(); ++x)
+            for (int y = 0; y < snapshot.height(); ++y)
+                for (int x = 0; x < snapshot.width(); ++x)
                     if (snapshot.pixelColor(x, y) == color)
                         bounds = bounds.united(QRect(x, y, 1, 1));
             return bounds;
@@ -5587,15 +5601,22 @@ private slots:
         const auto projectKey = QStringLiteral("ui/projectDirectoryWidth");
         const auto chatKey = QStringLiteral("ui/chatDirectoryWidth");
         settings.remove(projectKey);
-        settings.setValue(chatKey, 260);
+        const auto clearWidths = qScopeGuard([&] {
+            settings.remove(projectKey);
+            settings.remove(chatKey);
+        });
         std::unique_ptr<FixtureBackend> backend(makeFixture());
+        int chatWidth = 0;
         int savedWidth = 0;
         {
             MainWindow window(backend.get());
             window.resize(960, 650);
             window.show();
             auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
-            QVERIFY(sections);
+            auto *chats = window.findChild<QSplitter *>(QStringLiteral("chatDirectorySplitter"));
+            QVERIFY(sections && chats);
+            chatWidth = qMax(320, chats->widget(0)->minimumWidth() + 32);
+            settings.setValue(chatKey, chatWidth);
             sections->setCurrentRow(1);
             auto *splitter = window.findChild<QSplitter *>(QStringLiteral("projectDirectorySplitter"));
             QVERIFY(splitter);
@@ -5610,24 +5631,23 @@ private slots:
             QTRY_VERIFY(splitter->sizes().first() > old + 30);
             savedWidth = splitter->sizes().first();
             QCOMPARE(settings.value(projectKey).toInt(), savedWidth);
-            QCOMPARE(settings.value(chatKey).toInt(), 260);
+            QCOMPARE(settings.value(chatKey).toInt(), chatWidth);
         }
         MainWindow restored(backend.get());
-        restored.resize(960, 650);
+        const auto wideWindow = qMax(960, chatWidth + 550);
+        restored.resize(wideWindow, 650);
         restored.show();
         auto *sections = findAccessible<QListWidget>(&restored, QStringLiteral("Разделы"));
         auto *splitter = restored.findChild<QSplitter *>(QStringLiteral("projectDirectorySplitter"));
         auto *chats = restored.findChild<QSplitter *>(QStringLiteral("chatDirectorySplitter"));
         QVERIFY(sections && splitter && chats);
-        QTRY_COMPARE(chats->sizes().first(), 260);
+        QTRY_COMPARE(chats->sizes().first(), chatWidth);
         sections->setCurrentRow(1);
         QTRY_COMPARE(splitter->sizes().first(), savedWidth);
         restored.resize(720, 500);
         QTRY_VERIFY(splitter->sizes().at(1) >= 430);
-        restored.resize(960, 650);
+        restored.resize(wideWindow, 650);
         QTRY_COMPARE(splitter->sizes().first(), savedWidth);
-        settings.remove(projectKey);
-        settings.remove(chatKey);
     }
 
     void directoryWidthSurvivesRestartAtManualWidth_data()
@@ -6853,6 +6873,11 @@ private slots:
         QTRY_COMPARE(history->count(), 6);
         QTRY_COMPARE(backend->externalLinkPreviewRequests.size(), 1);
         QVERIFY(requests.isEmpty());
+        const auto showMessage = [history](int row) {
+            history->scrollToItem(history->item(row), QAbstractItemView::PositionAtCenter);
+            QTRY_VERIFY(history->viewport()->rect().contains(history->visualItemRect(history->item(row)).center()));
+        };
+        showMessage(1);
         ChatAsset portal;
         portal.messageId = QStringLiteral("711");
         portal.link = portalRich;
@@ -6884,12 +6909,13 @@ private slots:
         };
         deliverPublic(ui::PublicLinkMetadata{QStringLiteral("Заголовок сайта"), QStringLiteral("Описание сайта"), thumbnail});
         QTRY_VERIFY(history->sizeHintForRow(1) > before);
-        history->scrollToItem(history->item(1), QAbstractItemView::PositionAtCenter);
+        showMessage(1);
         QTRY_VERIFY(thumbnailDrawn(history, 1));
         const auto screenshot = qEnvironmentVariable("B24_PUBLIC_PREVIEW_IMAGE_SCREENSHOT");
         if (!screenshot.isEmpty())
             QVERIFY(history->viewport()->grab().save(screenshot));
         QVERIFY(backend->imageRequests.isEmpty());
+        showMessage(2);
         QTRY_COMPARE(requests.size(), 2);
         QCOMPARE(requests.last().first, unavailable);
         auto deliverUnavailable = std::move(requests.last().second);
@@ -6899,6 +6925,7 @@ private slots:
         QCOMPARE(requests.size(), 2);
 
         history->setCurrentRow(3);
+        showMessage(3);
         const auto point = history->visualItemRect(history->item(3)).center();
         QContextMenuEvent event(QContextMenuEvent::Keyboard, point, history->viewport()->mapToGlobal(point));
         QApplication::sendEvent(history->viewport(), &event);

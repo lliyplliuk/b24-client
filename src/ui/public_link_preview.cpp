@@ -321,9 +321,10 @@ PublicLinkPreviewFetcher::~PublicLinkPreviewFetcher()
         QHostInfo::abortHostLookup(m_lookup);
 }
 
-bool PublicLinkPreviewFetcher::accepts(const QUrl &url)
+bool PublicLinkPreviewFetcher::accepts(const QUrl &url, bool requireNativeTransport)
 {
-    return !public_link_preview::publicHttpsHost(url).isEmpty() && supportsPinnedTls();
+    return !public_link_preview::publicHttpsHost(url).isEmpty()
+        && (!requireNativeTransport || supportsPinnedTls());
 }
 
 bool PublicLinkPreviewFetcher::request(const QUrl &url, Completion complete)
