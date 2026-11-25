@@ -30,7 +30,6 @@ class QListWidget;
 class QListWidgetItem;
 class QPlainTextEdit;
 class QPushButton;
-class QSplitter;
 class QTabBar;
 class QPoint;
 class QResizeEvent;
@@ -261,8 +260,6 @@ private:
 
     QListWidget *m_chats = nullptr;
     QTabBar *m_chatTabs = nullptr;
-    QSplitter *m_chatSplitter = nullptr;
-    int m_chatWidth = 0;
     QListWidget *m_chatMessages = nullptr;
     QLabel *m_chatTitle = nullptr;
     QLabel *m_chatContactInfo = nullptr;
@@ -294,6 +291,9 @@ private:
     bool m_chatSourceSearching = false;
     Chat m_retainedTaskChat;
     int m_retainedTaskChatRow = -1;
+    bool m_taskChatPressActive = false;
+    bool m_taskChatRefreshDeferred = false;
+    QTimer *m_taskChatPressEnd = nullptr;
     QLineEdit *m_messageSearch = nullptr;
     QPushButton *m_messageSearchClear = nullptr;
     QPushButton *m_messageSearchToggle = nullptr;
@@ -332,8 +332,6 @@ private:
     QTimer *m_visibleChatReadTimer = nullptr;
 
     QListWidget *m_projects = nullptr;
-    QSplitter *m_projectSplitter = nullptr;
-    int m_projectWidth = 0;
     QVector<Project> m_projectDirectory;
     QHash<QString, qint64> m_projectUnreadCounts;
     bool m_projectUnreadCountsComplete = false;

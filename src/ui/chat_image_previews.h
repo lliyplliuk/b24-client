@@ -71,6 +71,12 @@ public:
         return true;
     }
 
+    QUrl requestUrl(const QUrl &preferred, const QUrl &original) const
+    {
+        return preferred.isEmpty() || failed(preferred) ? original : preferred;
+    }
+
+    bool pending(const QUrl &url) const { return m_pending.contains(url); }
     const QPixmap *photo(const QUrl &url) const { return m_images.object(url); }
     bool failed(const QUrl &url) const { return m_failures.contains(url); }
     void clear()

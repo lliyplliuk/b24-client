@@ -346,6 +346,13 @@ public:
             m_view->viewport()->installEventFilter(this);
         }
         if (m_style == Row::Message || m_style == Row::TaskContent) {
+            m_previewViewport = m_view->viewport();
+            connect(m_previewViewport, &QObject::destroyed, this, [this] {
+                if (m_previewClock)
+                    m_previewClock->unwatch(m_previewViewport);
+                m_previewClock.clear();
+                m_previewViewport = nullptr;
+            });
             // Model changes already repaint the view and can also occur during its destruction.
             const auto forgetSelection = [this] { m_textIndex = QPersistentModelIndex{}; };
             connect(m_view->model(), &QAbstractItemModel::modelAboutToBeReset, this, forgetSelection);
@@ -363,6 +370,12 @@ public:
             });
         }
     }
+    ~RowPainter() override
+    {
+        if (m_previewClock)
+            m_previewClock->unwatch(m_previewViewport);
+    }
+
     void setNoticeActionHandler(std::function<void(const QModelIndex &, int)> handler)
     {
         m_noticeAction = std::move(handler);
@@ -378,6 +391,50 @@ public:
     void setMessagePreviewSource(std::function<const QPixmap *(const QUrl &)> source)
     {
         m_messagePreview = std::move(source);
+    }
+
+    void setPreviewPendingSource(std::function<bool(const MessageFile &)> source)
+    {
+        m_previewPending = std::move(source);
+    }
+
+    const QPixmap *preview(const MessageFile &file) const
+    {
+        if (file.isVideo)
+            return m_videoPreview ? m_videoPreview(file) : nullptr;
+        if (!m_messagePreview)
+            return nullptr;
+        const auto *photo = m_messagePreview(file.previewUrl);
+        if (!photo || photo->isNull())
+            photo = m_messagePreview(file.originalPreviewUrl);
+        return photo && !photo->isNull() ? photo : nullptr;
+    }
+
+    void setPreviewAnimation(bool active)
+    {
+        if (m_previewViewport && (m_previewAnimation || active)) {
+            m_previewAnimation = active;
+            updatePreviewClock();
+            m_previewViewport->update();
+        }
+    }
+
+    bool hasVisibleLoadingPreview(const QModelIndex &index, const QRect &row, const QRect &visible) const
+    {
+        bool pending = false;
+        visitFileGeometry(index, row, [&](const MessageFile &file, const FileGeometry &geometry) {
+            if (!previewPending(file) || (!geometry.thumbnail.isEmpty() && preview(file)))
+                return false;
+            const auto ring = geometry.thumbnail.isEmpty() ? cardLoadingRing(geometry.control)
+                : mediaLoadingRing(geometry.thumbnail, file, false);
+            pending = ring.intersects(visible);
+            return pending;
+        });
+        if (pending)
+            return true;
+        const auto representative = visibleQuoteMedia(index, row, visible);
+        return representative && previewPending(*representative) && !preview(*representative)
+            && mediaLoadingRing(quoteMediaRect(replyHeaderRect(row, index)), *representative, true).intersects(visible);
     }
 
     void setVideoPreviewSource(std::function<const QPixmap *(const MessageFile &)> source)
@@ -769,6 +826,11 @@ private:
     std::function<void(const MessageFile &)> m_messageDownload;
     std::function<void(const QString &)> m_messageLink;
     std::function<const QPixmap *(const QUrl &)> m_messagePreview;
+    std::function<bool(const MessageFile &)> m_previewPending;
+    QWidget *m_previewViewport = nullptr;
+    QPointer<QWidget> m_previewWindow;
+    QPointer<ui::LoadingClock> m_previewClock;
+    bool m_previewAnimation = false;
     std::function<const QPixmap *(const MessageFile &)> m_videoPreview;
     std::function<const QImage *(const QUrl &)> m_linkThumbnail;
     std::function<MessageLinkPreview(const QModelIndex &, const QString &)> m_linkPreview;
@@ -1263,6 +1325,11 @@ private:
 
     bool eventFilter(QObject *object, QEvent *event) override
     {
+        if (object == m_previewWindow && event->type() == QEvent::WindowStateChange)
+            updatePreviewClock();
+        if (object == m_previewViewport && (event->type() == QEvent::Show || event->type() == QEvent::Hide
+                                            || event->type() == QEvent::StyleChange))
+            updatePreviewClock();
         if (object == m_view->viewport()) {
             if (event->type() == QEvent::ContextMenu && m_style == Row::TaskContent) {
                 auto *context = static_cast<QContextMenuEvent *>(event);
@@ -1376,19 +1443,55 @@ private:
         return index.data(role).value<QVector<MessageFile>>();
     }
 
-    const QPixmap *preview(const MessageFile &file) const
+    void updatePreviewClock()
     {
-        if (file.isVideo)
-            return m_videoPreview ? m_videoPreview(file) : nullptr;
-        const auto *photo = !file.previewUrl.isEmpty() && m_messagePreview ? m_messagePreview(file.previewUrl) : nullptr;
-        return photo && !photo->isNull() ? photo : nullptr;
+        if (!m_previewViewport)
+            return;
+        auto *window = m_previewViewport->window();
+        if (m_previewAnimation && m_previewWindow != window) {
+            if (m_previewWindow)
+                m_previewWindow->removeEventFilter(this);
+            m_previewWindow = window;
+            window->installEventFilter(this);
+        }
+        if (m_previewAnimation && m_previewViewport->isVisible() && !window->isMinimized()
+            && m_previewViewport->style()->styleHint(QStyle::SH_Widget_Animation_Duration, nullptr, m_previewViewport) > 0) {
+            if (!m_previewClock) {
+                m_previewClock = ui::LoadingClock::shared();
+                m_previewClock->watch(m_previewViewport);
+            }
+        } else if (m_previewClock) {
+            m_previewClock->unwatch(m_previewViewport);
+            m_previewClock.clear();
+        }
+    }
+
+    bool previewPending(const MessageFile &file) const
+    {
+        return m_previewPending && m_previewPending(file);
+    }
+
+    int previewAngle() const { return m_previewClock ? m_previewClock->angle() : 0; }
+
+    static QRect cardLoadingRing(const QRect &card)
+    {
+        return QRect(card.left() + 14, card.top() + 12, 18, 18);
+    }
+
+    static QRect mediaLoadingRing(const QRect &frame, const MessageFile &file, bool crop)
+    {
+        QRect ring(0, 0, 18, 18);
+        ring.moveCenter(frame.center());
+        if (!crop && file.isVideo && downloadable(file) && frame.width() >= 40)
+            ring.moveTopLeft(frame.topLeft() + QPoint(4, 4));
+        return ring;
     }
 
     enum class AttachmentSection { Media, Documents };
 
     static bool isMediaFile(const MessageFile &file)
     {
-        return file.isImage || file.isVideo || !file.previewUrl.isEmpty();
+        return file.isImage || file.isVideo || !file.previewUrl.isEmpty() || !file.originalPreviewUrl.isEmpty();
     }
 
     struct QuoteAttachments {
@@ -1521,7 +1624,8 @@ private:
         return std::any_of(entries.cbegin(), entries.cend(), [&file, preview](const MessageFile &current) {
             return current.downloadUrl == file.downloadUrl && current.id == file.id
                 && current.diskObjectId == file.diskObjectId && current.name == file.name
-                && (!preview || current.previewUrl == file.previewUrl);
+                && (!preview || (current.previewUrl == file.previewUrl
+                                 && current.originalPreviewUrl == file.originalPreviewUrl));
         });
     }
 
@@ -1555,6 +1659,8 @@ private:
             p.setRenderHint(QPainter::SmoothPixmapTransform);
             p.drawPixmap(image, *photo);
             p.restore();
+        } else if (previewPending(file)) {
+            ui::paintLoadingRing(p, mediaLoadingRing(frame, file, crop), Accent, previewAngle());
         } else if (crop || !file.isVideo || !downloadable(file)) {
             const auto &icon = ui::attachmentIcon(file.name);
             const QRect glyph(0, 0, 21, 21);
@@ -1594,7 +1700,10 @@ private:
             const QRect icon(card.left() + 6, card.top() + 7, 34, 28);
             const auto &typeIcon = ui::attachmentIcon(file.name);
             fill(p, icon, typeIcon.background, Qt::transparent, 5);
-            ui::paintGlyph(p, typeIcon.glyph, QRectF(icon).adjusted(6, 3, -6, -3), typeIcon.ink);
+            if (previewPending(file))
+                ui::paintLoadingRing(p, cardLoadingRing(card), typeIcon.ink, previewAngle());
+            else
+                ui::paintGlyph(p, typeIcon.glyph, QRectF(icon).adjusted(6, 3, -6, -3), typeIcon.ink);
             const int textLeft = icon.right() + 7;
             const QRect textArea(textLeft, card.top() + fileTitleTop, qMax(1, card.right() - textLeft - 5),
                                  fileTitleHeight);

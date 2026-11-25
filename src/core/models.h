@@ -44,6 +44,7 @@ struct MessageFile {
     QString diskObjectId{};
     bool isImage = false;
     bool isVideo = false;
+    QUrl originalPreviewUrl{};
 };
 
 enum class ChatAssetKind { Media, Files, Links };

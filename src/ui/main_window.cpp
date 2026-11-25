@@ -41,6 +41,7 @@
 #include <QKeyEvent>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QPromise>
 #include <QPushButton>
@@ -50,6 +51,7 @@
 #include <QScrollBar>
 #include <QScopedValueRollback>
 #include <QSignalBlocker>
+#include <QShowEvent>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTemporaryDir>
@@ -74,6 +76,57 @@ using workspace::label;
 using ui::clockLabel;
 using ui::presentMessages;
 using ui::showEmpty;
+
+class DirectorySplitter final : public QSplitter {
+public:
+    DirectorySplitter(const QString &key, int regularWidth, int compactWidth, QWidget *parent)
+        : QSplitter(Qt::Horizontal, parent), m_key(key), m_regularWidth(regularWidth),
+          m_compactWidth(compactWidth)
+    {
+        setHandleWidth(5);
+        setChildrenCollapsible(false);
+        setOpaqueResize(false);
+        QSettings settings(QStringLiteral("bitrix24-client"), QStringLiteral("bitrix24-client"));
+        m_preferredWidth = qMax(0, settings.value(m_key).toInt());
+        connect(this, &QSplitter::splitterMoved, this, [this](int position, int) {
+            m_preferredWidth = position - contentsRect().left();
+            QSettings settings(QStringLiteral("bitrix24-client"), QStringLiteral("bitrix24-client"));
+            settings.setValue(m_key, m_preferredWidth);
+        });
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QSplitter::resizeEvent(event);
+        restoreWidth();
+    }
+
+    void showEvent(QShowEvent *event) override
+    {
+        QSplitter::showEvent(event);
+        restoreWidth();
+    }
+
+private:
+    void restoreWidth()
+    {
+        if (!isVisible() || count() != 2)
+            return;
+        const int available = contentsRect().width() - handle(1)->width();
+        const int minimum = widget(0)->minimumWidth();
+        const int maximum = qMax(minimum, available - widget(1)->minimumWidth());
+        const int preferred = m_preferredWidth > 0 ? m_preferredWidth
+            : (window()->width() < 855 ? m_compactWidth : m_regularWidth);
+        const int left = qBound(minimum, preferred, maximum);
+        setSizes({left, qMax(0, available - left)});
+    }
+
+    const QString m_key;
+    const int m_regularWidth;
+    const int m_compactWidth;
+    int m_preferredWidth = 0;
+};
 
 struct PhotoLoad {
     std::shared_ptr<QTemporaryDir> directory;
@@ -475,6 +528,9 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
         const auto scope = m_backend->settingsScope();
         if (scope != m_reactionAccountScope) {
             if (!m_reactionAccountScope.isEmpty()) {
+                m_chatImagePreviews.clear();
+                refreshChatMediaRows();
+                scheduleAvatars();
                 clearPastedChatImages();
                 resetNotificationAccount();
                 m_pendingCreateTask.clear();
@@ -533,6 +589,8 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
                 taskSearch.query.clear();
                 taskSearch.found.clear();
                 m_chatSource.clear();
+                m_taskChatPressActive = false;
+                m_taskChatRefreshDeferred = false;
                 if (!m_retainedTaskChat.id.isEmpty()) {
                     const QSignalBlocker blocker(m_chats);
                     for (int row = 0; row < m_chats->count(); ++row) {
@@ -1211,15 +1269,21 @@ QWidget *MainWindow::buildChatPanel()
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
 
-    m_chatSplitter = new QSplitter(Qt::Horizontal, panel);
-    m_chatSplitter->setObjectName(QStringLiteral("chatDirectorySplitter"));
-    m_chatSplitter->setAccessibleName(QStringLiteral("Ширина списка чатов"));
-    m_chatSplitter->setHandleWidth(5);
-    m_chatSplitter->setChildrenCollapsible(false);
-    m_chatSplitter->setOpaqueResize(false);
-    root->addWidget(m_chatSplitter);
-    auto *side = directory(QStringLiteral("Чаты"), &m_chats, m_chatSplitter);
+    auto *splitter = new DirectorySplitter(QStringLiteral("ui/chatDirectoryWidth"), 272, 218, panel);
+    splitter->setObjectName(QStringLiteral("chatDirectorySplitter"));
+    splitter->setAccessibleName(QStringLiteral("Ширина списка чатов"));
+    root->addWidget(splitter);
+    auto *side = directory(QStringLiteral("Чаты"), &m_chats, splitter);
     m_chats->setAccessibleName(QStringLiteral("Недавние чаты"));
+    m_taskChatPressEnd = new QTimer(this);
+    m_taskChatPressEnd->setSingleShot(true);
+    connect(m_taskChatPressEnd, &QTimer::timeout, this, [this] {
+        m_taskChatPressActive = false;
+        if (m_lastSection == 0 && m_chats->isVisible() && std::exchange(m_taskChatRefreshDeferred, false) && m_chatScope == 1
+            && m_chatDirectories[1].query.isEmpty())
+            showChatResults(m_chatDirectories[1].recent, true, true);
+    });
+    m_chats->viewport()->installEventFilter(this);
     connect(m_chats, &QListWidget::currentItemChanged, this, &MainWindow::onChatSelected);
     const auto focusSelectedComposer = [this](const QListWidgetItem *item) {
         if (item && item->data(workspace::Id).toString() == m_currentChatId) {
@@ -1301,9 +1365,9 @@ QWidget *MainWindow::buildChatPanel()
         m_unreadOnlyChats = checked;
         showChatResults(m_chatSource, m_chatSourceSearching);
     });
-    m_chatSplitter->addWidget(side);
+    splitter->addWidget(side);
 
-    auto *reading = new QWidget(m_chatSplitter);
+    auto *reading = new QWidget(splitter);
     reading->setMinimumWidth(325);
     reading->setObjectName(QStringLiteral("reading"));
     auto *layout = new QVBoxLayout(reading);
@@ -1474,17 +1538,9 @@ QWidget *MainWindow::buildChatPanel()
     m_chatInput->installEventFilter(this);
     layout->addWidget(m_chatComposer);
     m_chatComposer->hide();
-    m_chatSplitter->addWidget(reading);
-    m_chatSplitter->setStretchFactor(1, 1);
-    QSettings settings(QStringLiteral("bitrix24-client"), QStringLiteral("bitrix24-client"));
-    m_chatWidth = qBound(0, settings.value(QStringLiteral("ui/chatDirectoryWidth")).toInt(), 1000);
-    m_chatSplitter->setSizes({qMax(272, m_chatWidth), 800});
-    connect(m_chatSplitter, &QSplitter::splitterMoved, this, [this] {
-        m_chatWidth = m_chatSplitter->sizes().first();
-        QSettings settings(QStringLiteral("bitrix24-client"), QStringLiteral("bitrix24-client"));
-        settings.setValue(QStringLiteral("ui/chatDirectoryWidth"), m_chatWidth);
-        scheduleAvatars();
-    });
+    splitter->addWidget(reading);
+    splitter->setStretchFactor(1, 1);
+    connect(splitter, &QSplitter::splitterMoved, this, &MainWindow::scheduleAvatars);
     return panel;
 }
 
@@ -1494,14 +1550,11 @@ QWidget *MainWindow::buildProjectsPanel()
     auto *root = new QHBoxLayout(panel);
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
-    m_projectSplitter = new QSplitter(Qt::Horizontal, panel);
-    m_projectSplitter->setObjectName(QStringLiteral("projectDirectorySplitter"));
-    m_projectSplitter->setAccessibleName(QStringLiteral("Ширина списка проектов"));
-    m_projectSplitter->setHandleWidth(5);
-    m_projectSplitter->setChildrenCollapsible(false);
-    m_projectSplitter->setOpaqueResize(false);
-    root->addWidget(m_projectSplitter);
-    auto *side = directory(QStringLiteral("Проекты"), &m_projects, m_projectSplitter, &m_projectDirectoryTitle);
+    auto *splitter = new DirectorySplitter(QStringLiteral("ui/projectDirectoryWidth"), 205, 151, panel);
+    splitter->setObjectName(QStringLiteral("projectDirectorySplitter"));
+    splitter->setAccessibleName(QStringLiteral("Ширина списка проектов"));
+    root->addWidget(splitter);
+    auto *side = directory(QStringLiteral("Проекты"), &m_projects, splitter, &m_projectDirectoryTitle);
     side->setMinimumWidth(132);
     connect(m_projects, &QListWidget::currentItemChanged, this, &MainWindow::onProjectSelected);
     m_projects->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -1545,9 +1598,9 @@ QWidget *MainWindow::buildProjectsPanel()
     m_newProjectButton->setAccessibleName(QStringLiteral("Создать проект"));
     connect(m_newProjectButton, &QPushButton::clicked, this, &MainWindow::createProject);
     side->layout()->addWidget(m_newProjectButton);
-    m_projectSplitter->addWidget(side);
+    splitter->addWidget(side);
 
-    auto *body = new QWidget(m_projectSplitter);
+    auto *body = new QWidget(splitter);
     body->setMinimumWidth(430);
     auto *layout = new QVBoxLayout(body);
     layout->setContentsMargins(16, 17, 16, 14);
@@ -1737,17 +1790,9 @@ QWidget *MainWindow::buildProjectsPanel()
     connect(m_projectTabs, &QTabBar::currentChanged, this, &MainWindow::onProjectScopeChanged);
     updateProjectTaskChatControls();
 
-    m_projectSplitter->addWidget(body);
-    m_projectSplitter->setStretchFactor(1, 1);
-    QSettings settings(QStringLiteral("bitrix24-client"), QStringLiteral("bitrix24-client"));
-    m_projectWidth = qBound(0, settings.value(QStringLiteral("ui/projectDirectoryWidth")).toInt(), 1000);
-    m_projectSplitter->setSizes({m_projectWidth > 0 ? m_projectWidth : 205, 800});
-    connect(m_projectSplitter, &QSplitter::splitterMoved, this, [this] {
-        m_projectWidth = m_projectSplitter->sizes().first();
-        QSettings settings(QStringLiteral("bitrix24-client"), QStringLiteral("bitrix24-client"));
-        settings.setValue(QStringLiteral("ui/projectDirectoryWidth"), m_projectWidth);
-        scheduleAvatars();
-    });
+    splitter->addWidget(body);
+    splitter->setStretchFactor(1, 1);
+    connect(splitter, &QSplitter::splitterMoved, this, &MainWindow::scheduleAvatars);
     return panel;
 }
 
@@ -2052,6 +2097,8 @@ void MainWindow::changeEvent(QEvent *event)
     QMainWindow::changeEvent(event);
     if (event->type() == QEvent::WindowStateChange)
         updateRailWorkday();
+    if (event->type() == QEvent::ActivationChange && !isActiveWindow() && m_taskChatPressActive)
+        m_taskChatPressEnd->start(0);
 }
 
 void MainWindow::onSectionChanged(int index)
@@ -2185,6 +2232,7 @@ void MainWindow::onChatSelected()
     if (leftRetainedTask) {
         QTimer::singleShot(0, this, [this, id] {
             if (m_lastSection == 0 && m_chatScope == 1 && m_currentChatId == id
+                && m_chatDirectories[1].query.isEmpty()
                 && !m_retainedTaskChat.id.isEmpty() && id != m_retainedTaskChat.id)
                 showChatResults(m_chatDirectories[1].recent, true, true);
         });
@@ -2360,6 +2408,25 @@ void MainWindow::onProjectSelected()
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
+    if (m_chats && watched == m_chats->viewport()) {
+        const auto type = event->type();
+        if (m_lastSection == 0 && m_chatScope == 1 && m_chatDirectories[1].query.isEmpty()
+            && (type == QEvent::MouseButtonPress || type == QEvent::MouseButtonDblClick)) {
+            const auto *mouse = static_cast<QMouseEvent *>(event);
+            const auto *row = m_chats->itemAt(mouse->position().toPoint());
+            if (mouse->button() == Qt::LeftButton && row && !row->data(workspace::Id).toString().isEmpty()) {
+                m_taskChatPressActive = true;
+                m_taskChatPressEnd->stop();
+            }
+        } else if (m_taskChatPressActive && (type == QEvent::UngrabMouse || type == QEvent::Hide
+                   || (type == QEvent::Leave && !QGuiApplication::mouseButtons().testFlag(Qt::LeftButton))
+                   || (type == QEvent::MouseButtonRelease && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton))) {
+            // Let QListWidget process the release and emit itemClicked before rebuilding its model.
+            m_taskChatPressEnd->start(0);
+        } else if (type == QEvent::Show && m_taskChatRefreshDeferred) {
+            m_taskChatPressEnd->start(0);
+        }
+    }
     if (m_projects && watched == m_projects->viewport() && event->type() == QEvent::Wheel) {
         const auto *wheel = static_cast<QWheelEvent *>(event);
         const auto delta = wheel->pixelDelta().isNull() ? wheel->angleDelta() : wheel->pixelDelta();
@@ -2388,14 +2455,8 @@ void MainWindow::resizeEvent(QResizeEvent *event)
     QMainWindow::resizeEvent(event);
     if (!m_projects)
         return;
-    const bool compact = event->size().width() < 855;
-    const int desired = m_chatWidth > 0 ? m_chatWidth : (compact ? 218 : 272);
-    const int available = event->size().width() - 74;
-    m_chatSplitter->setSizes({desired, qMax(325, available - desired)});
     scheduleAvatars();
     scheduleVisibleNoticeRead();
-    const int projectWidth = m_projectWidth > 0 ? m_projectWidth : (compact ? 151 : 205);
-    m_projectSplitter->setSizes({projectWidth, qMax(430, available - projectWidth)});
 }
 
 void MainWindow::onSendChat()
@@ -4042,6 +4103,12 @@ void MainWindow::showChatResults(const QVector<Chat> &chats, bool useSearchMode,
     const auto &directory = m_chatDirectories[m_chatScope];
     const bool searching = useSearchMode && !directory.query.isEmpty();
     const bool taskRecent = m_chatScope == 1 && !searching;
+    if (m_taskChatPressActive && taskRecent && backgroundRefresh) {
+        m_taskChatRefreshDeferred = true;
+        return;
+    }
+    m_taskChatPressActive = false;
+    m_taskChatRefreshDeferred = false;
     const bool preserveViewport = taskRecent && backgroundRefresh
         && (!m_chatSource.isEmpty() || !m_retainedTaskChat.id.isEmpty());
     const auto anchor = preserveViewport ? listViewportAnchor(m_chats) : ListViewportAnchor{};
@@ -4622,11 +4689,12 @@ void MainWindow::refreshChatMediaRows()
 void MainWindow::loadVisibleChatPreviews()
 {
     const auto load = [this](QListWidget *list) {
-        if (!list->isVisible() || list->count() == 0)
-            return;
+        auto *delegate = static_cast<workspace::RowPainter *>(list->itemDelegate());
         const auto visible = list->viewport()->visibleRegion().boundingRect();
-        if (visible.isEmpty())
+        if (!list->isVisible() || list->count() == 0 || visible.isEmpty()) {
+            delegate->setPreviewAnimation(false);
             return;
+        }
         constexpr int nearby = 125;
         const auto first = list->indexAt(QPoint(4, qMax(0, visible.top() - nearby)));
         const int start = first.isValid() ? qMax(0, first.row() - 3) : 0;
@@ -4636,6 +4704,7 @@ void MainWindow::loadVisibleChatPreviews()
         const OriginGuard guard(portal);
         qint64 newestExternalLink = 0;
         QPair<QString, QUrl> publicCandidate;
+        bool animatePreviews = false;
         const bool foreground = chatHistory && !m_publicLinkPending && !isMinimized()
             && QApplication::activeWindow() == list->window()
             && QGuiApplication::applicationState() == Qt::ApplicationActive;
@@ -4671,24 +4740,28 @@ void MainWindow::loadVisibleChatPreviews()
             const auto loadImage = [this, taskContent, &bounds, &visible](const MessageFile &file) {
                 if (file.isVideo)
                     return;
-                if (taskContent && file.previewUrl == file.downloadUrl && !bounds.intersects(visible))
+                const auto url = m_chatImagePreviews.requestUrl(file.previewUrl, file.originalPreviewUrl);
+                if (taskContent && url == file.downloadUrl && !bounds.intersects(visible))
                     return;
-                if (m_chatImagePreviews.begin(file.previewUrl))
-                    m_backend->requestMessageImage(file.previewUrl);
+                if (m_chatImagePreviews.begin(url))
+                    m_backend->requestMessageImage(url);
             };
             const auto files = item->data(workspace::MessageFiles).value<QVector<MessageFile>>();
             for (const auto &file : files)
                 loadImage(file);
-            if (chatHistory && bounds.intersects(visible) && m_sessionRecovery->isHidden()) {
-                const auto *delegate = static_cast<const workspace::RowPainter *>(list->itemDelegate());
+            if (bounds.intersects(visible)) {
                 const auto index = list->model()->index(row, 0);
-                if (const auto representative = delegate->visibleQuoteMedia(index, bounds, visible))
-                    loadImage(*representative);
-                const auto videos = delegate->visibleVideos(index, bounds, visible);
-                for (const auto &file : videos)
-                    m_chatVideoPreviews->request(file);
+                if (chatHistory && m_sessionRecovery->isHidden()) {
+                    if (const auto representative = delegate->visibleQuoteMedia(index, bounds, visible))
+                        loadImage(*representative);
+                    const auto videos = delegate->visibleVideos(index, bounds, visible);
+                    for (const auto &file : videos)
+                        m_chatVideoPreviews->request(file);
+                }
+                animatePreviews = animatePreviews || delegate->hasVisibleLoadingPreview(index, bounds, visible);
             }
         }
+        delegate->setPreviewAnimation(animatePreviews);
         if (chatHistory) {
             requestExternalLinkPreviews(list, newestExternalLink);
             if (!publicCandidate.second.isEmpty())
@@ -4696,6 +4769,7 @@ void MainWindow::loadVisibleChatPreviews()
         }
     };
     if (m_card) {
+        static_cast<workspace::RowPainter *>(m_chatMessages->itemDelegate())->setPreviewAnimation(false);
         load(m_card->messageList());
         load(m_card->descriptionList());
         load(m_card->attachmentList());
@@ -5546,6 +5620,11 @@ void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
     });
     delegate->setMessagePreviewSource([this](const QUrl &url) { return m_chatImagePreviews.photo(url); });
     delegate->setVideoPreviewSource([this](const MessageFile &file) { return m_chatVideoPreviews->poster(file); });
+    delegate->setPreviewPendingSource([this](const MessageFile &file) {
+        if (file.isVideo)
+            return m_chatVideoPreviews->posterPending(file);
+        return m_chatImagePreviews.pending(m_chatImagePreviews.requestUrl(file.previewUrl, file.originalPreviewUrl));
+    });
     delegate->setMessageVideoHandler([this, list](const QModelIndex &index, const MessageFile &file) {
         playMessageVideo(file, list->window(), [list = QPointer<QListWidget>(list),
                          current = QPersistentModelIndex(index), file] {
@@ -5567,9 +5646,9 @@ void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
     });
     const auto open = [this, list](const MessageFile &file) { saveMessageFile(file, list->window()); };
     delegate->setMessageDownloadHandler(open);
-    delegate->setMessagePhotoMenuHandler([this, list](const QModelIndex &index, const MessageFile &file,
-                                                      const QRect &anchor) {
-        const auto *thumb = file.isVideo ? nullptr : m_chatImagePreviews.photo(file.previewUrl);
+    delegate->setMessagePhotoMenuHandler([this, list, delegate](const QModelIndex &index, const MessageFile &file,
+                                                                const QRect &anchor) {
+        const auto *thumb = file.isVideo ? nullptr : delegate->preview(file);
         const auto pixels = thumb ? thumb->toImage() : QImage();
         const auto samePhoto = [this, list, current = QPersistentModelIndex(index), file,
                                 account = m_backend->settingsScope()] {

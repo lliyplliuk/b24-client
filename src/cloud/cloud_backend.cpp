@@ -69,6 +69,7 @@ constexpr int maxNotifications = 100;
 constexpr int notificationPageSize = 50;
 constexpr int maxPendingChatPopups = 12;
 constexpr int freshPopupSeconds = 10;
+constexpr int freshHistoryPopupSeconds = 30;
 constexpr int heartbeatIntervalMs = 60000;
 constexpr int handshakeTimeoutMs = 15000;
 
@@ -148,6 +149,20 @@ qint64 explicitMessageChatId(const QJsonObject &message)
         chatId = id;
     }
     return chatId;
+}
+
+bool matchesRequestedHistory(const QJsonObject &history, const QString &dialog, qint64 expectedChatId)
+{
+    const auto chat = history.value(QStringLiteral("chat")).toObject();
+    const auto declaredId = chat.value(QStringLiteral("id"));
+    const auto declaredDialog = chat.value(QStringLiteral("dialogId"));
+    const auto matchesId = [expectedChatId](qint64 value) {
+        return value >= 0 && (expectedChatId <= 0 || value == 0 || value == expectedChatId);
+    };
+    const auto declaredNumericId = numericId(string(declaredId)).toLongLong();
+    return (declaredId.isUndefined() || (declaredNumericId > 0 && matchesId(declaredNumericId)))
+        && (declaredDialog.isUndefined() || validDialog(string(declaredDialog)) == dialog)
+        && matchesId(explicitMessageChatId(chat)) && matchesId(explicitMessageChatId(history));
 }
 
 qint64 recentMessageId(const QJsonObject &message)
@@ -831,7 +846,7 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
             ++m_chatPopupSettingsGeneration;
             m_chatPopupSettings = {};
             m_chatPopupSettingsKnown = false;
-            m_pendingChatPopups.clear();
+            m_pendingChatPopups.removeIf([](const ChatPopup &popup) { return !popup.fromHistory; });
             m_nextChatPopupSettingsRequest = 0;
         }
         setOnline(true);
@@ -1019,10 +1034,12 @@ void CloudBackend::clearOpenHistory(bool task)
         ++m_taskHistoryRetry.revision;
         m_openTask.clear();
         m_taskMessagesDirty = false;
+        m_taskPopupHistory = {};
     } else {
         ++m_chatHistoryRetry.revision;
         m_openDialog.clear();
         m_chatDirty = false;
+        m_chatPopupHistory = {};
     }
     updateHistoryCatchup();
 }
@@ -1634,7 +1651,16 @@ void CloudBackend::rememberCurrentUser(const QString &id)
         resetWorktime();
         resetChatCounters();
         m_taskDialogs.clear();
+        m_dialogChatIds.clear();
+        m_dialogMessageStates.clear();
         m_recentTitles.clear();
+        ++m_chatPopupSettingsGeneration;
+        m_chatPopupSettings = {};
+        m_chatPopupSettingsKnown = false;
+        m_nextChatPopupSettingsRequest = 0;
+        m_notificationSettings.clear();
+        m_notificationSettingChanges.clear();
+        m_notificationSettingsRevision = 0;
         resetNoticeState();
     }
     bindPortalStatusIdentity(accountChanged);
@@ -2371,11 +2397,15 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
         return true;
     };
     const auto expectedChatId = badgeChatId(dialogId);
+    const auto groupChatId = groupDialogChatId(dialogId);
+    const auto popupChatId = groupChatId > 0 ? groupChatId : expectedChatId;
     const auto snapshotOperation = (expectedChatId > 0 ? historySnapshotPrefix : historyReadPrefix) + operation;
-    const auto deliver = [this, key, dialogId, task](const QJsonObject &history) {
+    const auto deliver = [this, key, dialogId, popupChatId, task](const QJsonObject &history, bool trustedMetadata) {
         const auto messages = decodeMessages(history, true, dialogId);
-        if (task ? m_openTask == key : m_openDialog == dialogId)
+        if (trustedMetadata && (task ? m_openTask == key : m_openDialog == dialogId)) {
             rememberRecentHistoryPreview(dialogId, history);
+            reconcileHistoryPopups(dialogId, popupChatId, task, history, messages);
+        }
         if (task)
             emit taskMessagesLoaded(key, messages);
         else
@@ -2383,21 +2413,29 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
     };
     ajax(QStringLiteral("im.v2.Chat.load"),
          {{QStringLiteral("dialogId"), dialogId}, {QStringLiteral("messageLimit"), QStringLiteral("25")}},
-         snapshotOperation, [this, key, dialogId, task, operation, superseded, deliver, expectedChatId,
+         snapshotOperation, [this, key, dialogId, task, operation, superseded, deliver, popupChatId,
                              counterRevision = ++m_chatBadgeRevision](QJsonValue data) {
         if (superseded())
             return;
         const auto object = data.toObject();
+        if (!matchesRequestedHistory(object, dialogId, popupChatId)) {
+            // Retain direct history rows for existing callers without accepting the conflicting chat metadata.
+            if (object.value(QStringLiteral("messages")).isArray())
+                deliver(object, false);
+            else
+                failShape(operation);
+            return;
+        }
         const auto chat = object.value(QStringLiteral("chat")).toObject();
-        const auto publishHistory = [this, key, dialogId, task, chat, expectedChatId, counterRevision, deliver]
+        const auto publishHistory = [this, key, dialogId, task, chat, popupChatId, counterRevision, deliver]
             (const QJsonObject &history) {
             if (task ? m_openTask == key : m_openDialog == dialogId) {
                 const auto rows = history.value(QStringLiteral("messages")).toArray();
-                rememberUnreadHistoryRows(dialogId, expectedChatId > 0 ? expectedChatId : badgeChatId(dialogId),
+                rememberUnreadHistoryRows(dialogId, popupChatId > 0 ? popupChatId : badgeChatId(dialogId),
                                           rows, counterRevision);
-                reconcileHistoryUnread(dialogId, chat, rows, expectedChatId, counterRevision);
+                reconcileHistoryUnread(dialogId, chat, rows, popupChatId, counterRevision);
             }
-            deliver(history);
+            deliver(history, true);
         };
         if (data.isObject()) {
             const auto live = m_recentOverlays.constFind(dialogId);
@@ -2415,18 +2453,20 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
         }
         auto chatId = field(object, {"chatId", "CHAT_ID"});
         if (chatId.isEmpty())
-            chatId = QString::number(expectedChatId > 0 ? expectedChatId : badgeChatId(dialogId));
-        if (numericId(chatId).isEmpty())
+            chatId = QString::number(popupChatId > 0 ? popupChatId : badgeChatId(dialogId));
+        const auto pagingChatId = numericId(chatId).toLongLong();
+        if (pagingChatId <= 0 || (popupChatId > 0 && pagingChatId != popupChatId))
             return failShape(operation);
 
         ajax(QStringLiteral("im.v2.Chat.Message.list"),
              {{QStringLiteral("chatId"), chatId}, {QStringLiteral("limit"), QStringLiteral("25")}},
-             historyReadPrefix + operation, [this, operation, superseded, publishHistory](QJsonValue page) {
+             historyReadPrefix + operation, [this, operation, dialogId, pagingChatId, superseded, publishHistory](QJsonValue page) {
             if (superseded())
                 return;
-            if (!page.toObject().value(QStringLiteral("messages")).isArray())
+            const auto result = page.toObject();
+            if (!result.value(QStringLiteral("messages")).isArray() || !matchesRequestedHistory(result, dialogId, pagingChatId))
                 return failShape(operation);
-            publishHistory(page.toObject());
+            publishHistory(result);
         }, operation);
     }, operation);
 }
@@ -2564,6 +2604,7 @@ void CloudBackend::requestChatMessages(const QString &dialogId)
         ++m_chatHistoryRetry.revision;
         m_openDialog = valid;
         m_chatDirty = false;
+        m_chatPopupHistory = {};
     }
     if (m_activeSection == 0)
         updateHistoryCatchup(true);
@@ -4790,6 +4831,7 @@ void CloudBackend::requestTaskMessages(const QString &taskId)
         ++m_taskHistoryRetry.revision;
         m_openTask = taskId;
         m_taskMessagesDirty = false;
+        m_taskPopupHistory = {};
     }
     updateHistoryCatchup(true);
     if (canAutoRefreshChats() && (m_requests.size() >= maxRequests
@@ -4911,6 +4953,9 @@ void CloudBackend::resetNoticeState()
     m_notificationsDirty = false;
     m_pendingInitialAlerts.clear();
     m_pendingChatPopups.clear();
+    m_seenChatPopups.clear();
+    m_chatPopupHistory = {};
+    m_taskPopupHistory = {};
     if (pagingVisible)
         publishNotificationHistoryPageState();
 }
@@ -5652,6 +5697,16 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
         id = QStringLiteral("push:") + (mid.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : mid);
     else if (isMessage)
         id.prepend(QStringLiteral("message:"));
+    const auto notify = notificationFlag(params.value(QStringLiteral("notify")));
+    const auto messageNotify = notificationFlag(message.value(QStringLiteral("params")).toObject().value(QStringLiteral("NOTIFY")));
+    const auto blockedUsers = params.value(QStringLiteral("userBlockChat")).toObject().value(chatId);
+    if (isMessage && (notify == false || messageNotify == false || mutedListContains(blockedUsers, m_userId)
+                      || m_portalStatus == QLatin1String("dnd"))) {
+        rememberChatPopup(dialog, id);
+        m_pendingChatPopups.removeIf([&](const ChatPopup &popup) {
+            return popup.dialog == dialog && popup.entry.id == id;
+        });
+    }
     if (std::any_of(m_notifications.cbegin(), m_notifications.cend(), [&id](const auto &item) { return item.id == id; }))
         return;
     const auto extra = body.contains(QStringLiteral("extra")) ? body.value(QStringLiteral("extra")).toObject()
@@ -5771,31 +5826,110 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
         }
         return;
     }
-    const auto notify = notificationFlag(params.value(QStringLiteral("notify")));
-    const auto messageNotify = notificationFlag(message.value(QStringLiteral("params")).toObject().value(QStringLiteral("NOTIFY")));
     const bool important = message.value(QStringLiteral("isImportant")).toBool();
     if (!fresh || (!published.isValid() && !hasAge) || author.isEmpty() || dialog.isEmpty()
         || notify == false || messageNotify == false || (!important && notify != true))
         return;
-    if (chatPopupsEnabled() == false)
-        return;
-
     const auto pullChats = params.value(QStringLiteral("chat")).toObject();
     auto eventChat = pullChats.value(chatId).toObject();
     if (eventChat.isEmpty() && !field(pullChats, {"id", "chatId"}).isEmpty())
         eventChat = pullChats;
     if (!eventChat.isEmpty())
         rememberDialog(dialog, {{QStringLiteral("chat"), eventChat}});
-    const auto blockedUsers = params.value(QStringLiteral("userBlockChat")).toObject().value(chatId);
-    ChatPopup popup{entry, dialog, author, blockedUsers};
-    if (!chatMuted(popup)) {
-        if (m_pendingChatPopups.size() == maxPendingChatPopups)
-            m_pendingChatPopups.dequeue();
-        m_pendingChatPopups.enqueue(std::move(popup));
-        deliverChatPopups();
-        if (!m_pendingChatPopups.isEmpty())
-            loadChatPopupSettings();
+    queueChatPopup({entry, dialog, author, blockedUsers});
+}
+
+void CloudBackend::reconcileHistoryPopups(const QString &dialog, qint64 chatId, bool task, const QJsonObject &history,
+                                         const QVector<Message> &messages)
+{
+    if (chatId <= 0)
+        return;
+
+    const auto snapshot = history.value(QStringLiteral("messages")).toArray();
+    QHash<qint64, QJsonObject> rows;
+    qint64 newest = 0;
+    for (qsizetype i = 0; i < qMin<qsizetype>(snapshot.size(), tunables::kPageSizeMessages); ++i) {
+        const auto row = snapshot.at(i).toObject();
+        const auto id = recentMessageId(row);
+        const auto rowChat = explicitMessageChatId(row);
+        if (id > 0 && (rowChat == 0 || rowChat == chatId)) {
+            rows.insert(id, row);
+            newest = qMax(newest, id);
+        }
     }
+    if (!snapshot.isEmpty() && rows.isEmpty())
+        return;
+    auto &scope = task ? m_taskPopupHistory : m_chatPopupHistory;
+    const auto previous = scope.dialog == dialog ? scope.through.value_or(-1) : -1;
+    scope = {dialog, qMax(newest, previous)};
+    const auto state = m_dialogMessageStates.constFind(dialog);
+    m_pendingChatPopups.removeIf([&](const ChatPopup &popup) {
+        if (!popup.fromHistory || popup.dialog != dialog)
+            return false;
+        const auto id = popup.entry.id.section(QLatin1Char(':'), -1).toLongLong();
+        const auto unread = rows.value(id).value(QStringLiteral("unread"));
+        if (unread.isBool())
+            return !unread.toBool();
+        return state != m_dialogMessageStates.cend() && id <= state->lastReadId && !state->historyUnread.contains(id);
+    });
+    if (previous < 0 || m_foreground || !m_workspaceVisible || (!task && m_activeSection != 0)
+        || m_authExpired || m_userId.isEmpty() || m_portalStatus == QLatin1String("dnd"))
+        return;
+    if (!m_online && m_portalStatus.isEmpty())
+        return;
+
+    const auto now = QDateTime::currentDateTime();
+    const auto title = m_recentTitles.value(dialog, QStringLiteral("Новое сообщение"));
+    const auto chat = history.value(QStringLiteral("chat")).toObject();
+    const bool taskChat = task || !notificationTaskId(dialog, chat).isEmpty();
+    for (const auto &message : messages) {
+        const auto id = numericId(message.id).toLongLong();
+        if (id <= previous || !message.unread || message.outgoing || message.system || !message.createdAt.isValid())
+            continue;
+        const auto age = message.createdAt.secsTo(now);
+        if (age < -5 || age > freshHistoryPopupSeconds)
+            continue;
+        const auto row = rows.value(id);
+        const auto author = explicitMessageAuthorId(row);
+        const auto params = oneOf(row, {"params", "PARAMS"}).toObject();
+        if (!author || *author <= 0 || QString::number(*author) == m_userId
+            || notificationFlag(oneOf(row, {"notify", "NOTIFY"})) == false
+            || notificationFlag(oneOf(params, {"NOTIFY", "notify"})) == false
+            || notificationFlag(row.value(QStringLiteral("silent"))) == true
+            || notificationFlag(row.value(QStringLiteral("isDeleted"))) == true
+            || notificationFlag(params.value(QStringLiteral("IS_DELETED"))) == true)
+            continue;
+        auto text = notificationDisplayText(message.text);
+        if (text.isEmpty())
+            text = message.attachments.isEmpty() ? QStringLiteral("Новое сообщение") : QStringLiteral("Вложение");
+        Notification entry{QStringLiteral("message:%1").arg(id), QStringLiteral("im"), title, text, message.createdAt};
+        entry.ordinaryChatMessage = !taskChat;
+        entry.targets.append({NotificationTargetKind::Chat, dialog, QString::number(id), {}, title, taskChat});
+        queueChatPopup({std::move(entry), dialog, QString::number(*author), {}, true});
+    }
+}
+
+bool CloudBackend::rememberChatPopup(const QString &dialog, const QString &noticeId)
+{
+    if (dialog.isEmpty() || noticeId.isEmpty())
+        return false;
+    const auto key = replyPreviewKey(dialog, noticeId);
+    if (m_seenChatPopups.contains(key))
+        return false;
+    m_seenChatPopups.insert(key, new bool(true));
+    return true;
+}
+
+void CloudBackend::queueChatPopup(ChatPopup popup)
+{
+    if (!rememberChatPopup(popup.dialog, popup.entry.id) || chatMuted(popup) || chatPopupsEnabled() == false)
+        return;
+    if (m_pendingChatPopups.size() == maxPendingChatPopups)
+        m_pendingChatPopups.dequeue();
+    m_pendingChatPopups.enqueue(std::move(popup));
+    deliverChatPopups();
+    if (!m_pendingChatPopups.isEmpty())
+        loadChatPopupSettings();
 }
 
 CloudBackend::DialogMessageState &CloudBackend::dialogMessageState(const QString &dialog)
@@ -5889,7 +6023,7 @@ void CloudBackend::deliverChatPopups()
 {
     if (m_initialPortalStatusPending)
         return;
-    if (!m_online || m_portalStatus == QLatin1String("dnd")) {
+    if (m_authExpired || m_portalStatus == QLatin1String("dnd")) {
         m_pendingChatPopups.clear();
         return;
     }
@@ -5903,7 +6037,17 @@ void CloudBackend::deliverChatPopups()
     for (const auto &popup : waiting) {
         if (!m_started)
             return;
-        if (popup.author == m_userId || popup.entry.createdAt.secsTo(now) > freshPopupSeconds || chatMuted(popup))
+        const bool watching = (m_activeSection == 0 && popup.dialog == m_openDialog)
+            || (!m_openTask.isEmpty() && popup.dialog == m_taskDialogs.value(m_openTask));
+        if ((!m_online && (!popup.fromHistory || m_portalStatus.isEmpty()))
+            || (popup.fromHistory && (m_foreground || !m_workspaceVisible || !watching)))
+            continue;
+        const auto maxAge = popup.fromHistory ? freshHistoryPopupSeconds : freshPopupSeconds;
+        const auto state = m_dialogMessageStates.constFind(popup.dialog);
+        const auto id = popup.entry.id.section(QLatin1Char(':'), -1).toLongLong();
+        const bool read = popup.fromHistory && state != m_dialogMessageStates.cend()
+            && (id <= state->confirmedReadThrough || state->exactlyRead.contains(id));
+        if (read || popup.author == m_userId || popup.entry.createdAt.secsTo(now) > maxAge || chatMuted(popup))
             continue;
         if (enabled == true && !m_userId.isEmpty())
             emit notificationReceived(popup.entry);
@@ -5922,9 +6066,14 @@ void CloudBackend::requestNotificationSettings(const QString &operation, const Q
 {
     const auto before = started.value_or(m_notificationSettingsRevision);
     const auto popupGeneration = m_chatPopupSettingsGeneration;
-    withCurrentUser(operation, [this, operation, updated, expected, before, popupGeneration](qint64 userId) {
+    const auto accountScope = m_accountScopeRevision;
+    withCurrentUser(operation, [this, operation, updated, expected, before, popupGeneration, accountScope](qint64 userId) {
+        if (accountScope != m_accountScopeRevision)
+            return;
         ajax(QStringLiteral("im.v2.Settings.General.list"), {{QStringLiteral("userId"), QString::number(userId)}},
-             operation, [this, operation, updated, expected, before, popupGeneration](QJsonValue result) {
+             operation, [this, operation, updated, expected, before, popupGeneration, accountScope](QJsonValue result) {
+            if (accountScope != m_accountScopeRevision)
+                return;
             auto data = result.toObject();
             for (auto entry = m_notificationSettingChanges.cbegin(); entry != m_notificationSettingChanges.cend(); ++entry)
                 if (entry.value().first > before)

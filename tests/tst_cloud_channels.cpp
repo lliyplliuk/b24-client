@@ -173,6 +173,7 @@ private slots:
     void previewsSmallAuthorizedChatImageOriginals();
     void previewsNativeResizeAndDeclaredOriginals_data();
     void previewsNativeResizeAndDeclaredOriginals();
+    void reservesStandbyOriginalsWithoutEvictingPreferredImages();
     void linkPreviewsRequireAnAuthorizedMatchingPortalObject();
     void decodesPortalExternalLinkMetadata();
     void labelsOnlyVerifiedTaskCreationNotices();
@@ -900,7 +901,8 @@ void TestCloudChannels::previewsOnlyRegisteredImagesAndQuotes()
         }
         if (request.action() == QLatin1String("disk.api.file.download"))
             return {png, "200 OK", {}, "image/png"};
-        if (request.url.path() == QLatin1String("/disk/showFile/57/"))
+        if (request.url.path() == QLatin1String("/disk/showFile/57/")
+            || request.url.path() == QLatin1String("/disk/downloadFile/55/"))
             return {png, "200 OK", {}, "image/png"};
         if (request.url.path() == QLatin1String("/disk/showFile/59/"))
             return {{}, "302 Found", "Location: " + remote.session().origin.toEncoded() + "/image.png\r\n"};
@@ -922,7 +924,9 @@ void TestCloudChannels::previewsOnlyRegisteredImagesAndQuotes()
     QVERIFY(photo.previewUrl.isValid());
     QCOMPARE(photo.previewSize, QSize(600, 400));
     QCOMPARE(photo.downloadUrl.path(), QStringLiteral("/disk/downloadFile/55/"));
+    QCOMPARE(photo.originalPreviewUrl, photo.downloadUrl);
     QCOMPARE(messages.last().replyFiles.first().previewUrl, photo.previewUrl);
+    QCOMPARE(messages.last().replyFiles.first().originalPreviewUrl, photo.originalPreviewUrl);
     QVERIFY(files.at(1).previewUrl.isEmpty());
     QVERIFY(files.at(2).previewUrl.isValid());
     QVERIFY(files.at(5).previewUrl.isEmpty());
@@ -940,11 +944,12 @@ void TestCloudChannels::previewsOnlyRegisteredImagesAndQuotes()
     backend.requestMessageImage(photo.previewUrl);
     QTRY_COMPARE(fetched.size(), 2);
     QCOMPARE(fixture.matching(QStringLiteral("disk.api.file.download")).size(), 1);
+    QCOMPARE(fixture.matching(photo.downloadUrl.path()).size(), 0);
 
     backend.requestMessageImage(files.at(2).previewUrl);
     backend.requestMessageImage(files.at(3).previewUrl);
     backend.requestMessageImage(files.at(4).previewUrl);
-    backend.requestMessageImage(photo.downloadUrl);
+    backend.requestMessageImage(photo.originalPreviewUrl);
     QTRY_COMPARE(fetched.size(), 6);
     QHash<QUrl, QByteArray> bytesByUrl;
     for (const auto &entry : fetched)
@@ -952,9 +957,9 @@ void TestCloudChannels::previewsOnlyRegisteredImagesAndQuotes()
     QCOMPARE(bytesByUrl.value(files.at(2).previewUrl), png);
     QVERIFY(bytesByUrl.value(files.at(3).previewUrl).isEmpty());
     QVERIFY(bytesByUrl.value(files.at(4).previewUrl).isEmpty());
-    QVERIFY(bytesByUrl.value(photo.downloadUrl).isEmpty());
+    QCOMPARE(bytesByUrl.value(photo.originalPreviewUrl), png);
     QCOMPARE(remote.matching(QStringLiteral("/image.png")).size(), 0);
-    QCOMPARE(fixture.matching(photo.downloadUrl.path()).size(), 0);
+    QCOMPARE(fixture.matching(photo.downloadUrl.path()).size(), 1);
 }
 
 void TestCloudChannels::previewsSmallAuthorizedChatImageOriginals()
@@ -1051,6 +1056,7 @@ void TestCloudChannels::previewsNativeResizeAndDeclaredOriginals_data()
     QTest::addColumn<bool>("nativeResize");
     QTest::addColumn<bool>("largeOriginal");
     QTest::newRow("download-alias-prefers-native-resize") << true << true;
+    QTest::newRow("native-resize-with-bounded-original") << true << false;
     QTest::newRow("declared-generic-image-without-suffix") << false << false;
     QTest::newRow("download-alias-over-limit") << false << true;
 }
@@ -1109,6 +1115,7 @@ void TestCloudChannels::previewsNativeResizeAndDeclaredOriginals()
     const auto photo = messages.first().files.first();
     QVERIFY(photo.isImage);
     QCOMPARE(photo.downloadUrl, fixture.session().origin.resolved(QUrl(download)));
+    QCOMPARE(photo.originalPreviewUrl, nativeResize && !largeOriginal ? photo.downloadUrl : QUrl());
     if (nativeResize || !largeOriginal) {
         QCOMPARE(photo.previewUrl, fixture.session().origin.resolved(QUrl(nativeResize ? resized : download)));
         backend.requestMessageImage(photo.previewUrl);
@@ -1121,7 +1128,13 @@ void TestCloudChannels::previewsNativeResizeAndDeclaredOriginals()
         QVERIFY(fetched.first().at(1).toByteArray().isEmpty());
     }
     QCOMPARE(fixture.matching(resizeAction).size(), nativeResize ? 1 : 0);
-    QCOMPARE(fixture.matching(downloadAction).size(), largeOriginal ? 0 : 1);
+    QCOMPARE(fixture.matching(downloadAction).size(), !nativeResize && !largeOriginal ? 1 : 0);
+    if (nativeResize && !largeOriginal) {
+        backend.requestMessageImage(photo.downloadUrl);
+        QTRY_COMPARE(fetched.size(), 2);
+        QCOMPARE(fetched.last().at(1).toByteArray(), original);
+        QCOMPARE(fixture.matching(downloadAction).size(), 1);
+    }
 
     QTemporaryDir temp;
     QVERIFY(temp.isValid());
@@ -1131,6 +1144,61 @@ void TestCloudChannels::previewsNativeResizeAndDeclaredOriginals()
     QFile downloaded(path);
     QVERIFY(downloaded.open(QIODevice::ReadOnly));
     QCOMPARE(downloaded.readAll(), original);
+}
+
+void TestCloudChannels::reservesStandbyOriginalsWithoutEvictingPreferredImages()
+{
+    const auto png = QByteArray::fromBase64(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRYAAAAAASUVORK5CYII=");
+    Fixture fixture;
+    QVERIFY(fixture.listen());
+    fixture.responder = [&](const Request &request) -> Response {
+        if (request.action() == loadAction) {
+            QJsonArray messages, files;
+            for (int message = 0; message < 3; ++message) {
+                QJsonArray attachmentIds;
+                for (int index = 0; index < 43; ++index) {
+                    const auto id = message * 43 + index + 1;
+                    files.append(QJsonObject{{"id", id}, {"name", "photo.png"}, {"size", png.size()}, {"type", "image"},
+                        {"urlShow", QStringLiteral("/disk/showFile/%1/").arg(id)},
+                        {"urlDownload", QStringLiteral("/disk/downloadFile/%1/").arg(id)}});
+                    attachmentIds.append(id);
+                }
+                messages.append(QJsonObject{{"id", 1000 + message}, {"files", attachmentIds}});
+            }
+            return ajax(QJsonDocument(QJsonObject{
+                {"chat", QJsonObject{{"id", 321}}}, {"messages", messages}, {"files", files}
+            }).toJson(QJsonDocument::Compact));
+        }
+        return {png, "200 OK", {}, "image/png"};
+    };
+
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
+    QSignalSpy fetched(&backend, &Backend::messageImageLoaded);
+    backend.start();
+    backend.requestChatMessages(QStringLiteral("chat321"));
+    QTRY_COMPARE(history.size(), 1);
+    const auto messages = history.first().at(1).value<QVector<Message>>();
+    QCOMPARE(messages.size(), 3);
+    for (const auto &message : messages)
+        QCOMPARE(message.files.size(), 43);
+    const auto first = messages.first().files.first();
+    QCOMPARE(first.previewUrl.path(), QStringLiteral("/disk/showFile/1/"));
+    QCOMPARE(first.originalPreviewUrl, first.downloadUrl);
+    QCOMPARE(fixture.matching(first.previewUrl.path()).size(), 0);
+    QCOMPARE(fixture.matching(first.originalPreviewUrl.path()).size(), 0);
+
+    backend.requestMessageImage(first.previewUrl);
+    QTRY_COMPARE(fetched.size(), 1);
+    QCOMPARE(fetched.first().at(1).toByteArray(), png);
+    QCOMPARE(fixture.matching(first.previewUrl.path()).size(), 1);
+    QCOMPARE(fixture.matching(first.originalPreviewUrl.path()).size(), 0);
+
+    backend.requestMessageImage(first.originalPreviewUrl);
+    QTRY_COMPARE(fetched.size(), 2);
+    QCOMPARE(fetched.last().at(1).toByteArray(), png);
+    QCOMPARE(fixture.matching(first.originalPreviewUrl.path()).size(), 1);
 }
 
 void TestCloudChannels::linkPreviewsRequireAnAuthorizedMatchingPortalObject()

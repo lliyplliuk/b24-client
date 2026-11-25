@@ -695,13 +695,13 @@ private:
             const bool form = request.headers.value("content-type").startsWith("application/x-www-form-urlencoded")
                 && !request.field(QStringLiteral("ids[0]")).isEmpty();
             return approveVisibleRead && form ? ajaxResult(visibleReadResult)
-                : R"({"status":"error","errors":[{"code":"FIXTURE_DENIED"}]})";
+                : QByteArrayLiteral(R"({"status":"error","errors":[{"code":"FIXTURE_DENIED"}]})");
         }
         if (chatBadgesFixture && action == QStringLiteral("im.v2.Anchor.read"))
             return request.headers.value("content-type").startsWith("application/x-www-form-urlencoded")
                 && !request.field(QStringLiteral("messageIds[0]")).isEmpty()
                 ? ajaxResult(approveAnchorRead ? "true" : "false")
-                : R"({"status":"error","errors":[{"code":"FIXTURE_DENIED"}]})";
+                : QByteArrayLiteral(R"({"status":"error","errors":[{"code":"FIXTURE_DENIED"}]})");
         if (action == QStringLiteral("im.v2.Chat.Message.tail")) {
             if (request.field(QStringLiteral("chatId")) == QLatin1String("73"))
                 return ajaxResult(R"({"chatId":73,"hasNextPage":false,"messages":[]})");
@@ -1159,6 +1159,8 @@ private slots:
     void catchesUpWhenAnActiveChatStopsReceivingPush();
     void refreshesVisibleInactiveHistory_data();
     void refreshesVisibleInactiveHistory();
+    void desktopBannersCatchUpFromHistory_data();
+    void desktopBannersCatchUpFromHistory();
     void refusesToFollowRedirectWithSession();
     void sendsTaskEditsAndKanbanMutations();
     void confirmedKanbanMoveSupersedesOutstandingBoardRead();
@@ -6564,6 +6566,158 @@ void TestCloudBackend::refreshesVisibleInactiveHistory()
     QCOMPARE(history.size(), 4);
     QVERIFY(fixture.requestsFor(QStringLiteral("im.v2.Chat.Message.read")).isEmpty());
     QVERIFY(fixture.requestsFor(QStringLiteral("applyFilter")).isEmpty());
+}
+
+void TestCloudBackend::desktopBannersCatchUpFromHistory_data()
+{
+    QTest::addColumn<bool>("task");
+    QTest::newRow("ordinary") << false;
+    QTest::newRow("task") << true;
+}
+
+void TestCloudBackend::desktopBannersCatchUpFromHistory()
+{
+    QFETCH(bool, task);
+    CloudFixture fixture;
+    fixture.portalStatusFixture = true;
+    fixture.serverNotificationScheme = QStringLiteral("simple");
+    QVERIFY(fixture.start());
+    const int chatId = task ? 73 : 91;
+    const auto dialog = QStringLiteral("chat%1").arg(chatId);
+    const auto row = [chatId](int id, int author = 22, bool unread = true, int age = 0, bool silent = false) {
+        return QJsonObject{{"id", id}, {"chatId", chatId}, {"authorId", author}, {"text", "New message"},
+            {"unread", unread}, {"date", QDateTime::currentDateTimeUtc().addSecs(-age).toString(Qt::ISODate)},
+            {"params", silent ? QJsonObject{{"NOTIFY", "N"}} : QJsonObject{}}};
+    };
+    QJsonArray rows{row(900)};
+    const auto publish = [&] {
+        fixture.chatResponseOverride = ajaxResult(QJsonDocument(QJsonObject{
+            {"chat", QJsonObject{{"id", chatId}, {"dialogId", dialog}}}, {"messages", rows}}).toJson(QJsonDocument::Compact));
+    };
+    publish();
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy connection(&backend, &Backend::connectionChanged);
+    QSignalSpy history(&backend, task ? &Backend::taskMessagesLoaded : &Backend::chatMessagesLoaded);
+    QSignalSpy failures(&backend, &Backend::failed);
+    QSignalSpy banners(&backend, &CloudBackend::notificationReceived);
+    QSignalSpy remoteNotices(&backend, &Backend::notificationsLoaded);
+    backend.setForeground(false);
+    backend.setWorkspaceVisible(true);
+    if (task)
+        backend.setActiveSection(1);
+    backend.start();
+    QTRY_VERIFY(!connection.isEmpty());
+    const auto requestHistory = [&] {
+        if (task)
+            backend.requestTaskMessages(QStringLiteral("42"));
+        else
+            backend.requestChatMessages(dialog);
+    };
+    const auto load = [&] {
+        const auto before = history.size();
+        requestHistory();
+        QTRY_VERIFY(history.size() > before);
+    };
+    load();
+    QCOMPARE(banners.size(), 0);
+
+    auto foreignRow = row(999);
+    foreignRow.insert(QStringLiteral("chatId"), chatId + 1);
+    const auto historyOperation = task ? QStringLiteral("task-messages:42") : QStringLiteral("chat:") + dialog;
+    const auto historyErrors = [&] {
+        return std::count_if(failures.cbegin(), failures.cend(), [&](const auto &result) {
+            return result.first().toString() == historyOperation;
+        });
+    };
+    fixture.chatResponseOverride = ajaxResult(QJsonDocument(QJsonObject{
+        {"chat", QJsonObject{{"id", chatId + 1}}}, {"messages", QJsonArray{foreignRow}}}).toJson(QJsonDocument::Compact));
+    load();
+    QCOMPARE(historyErrors(), 0);
+    QCOMPARE(history.size(), 2);
+    const auto listAction = QStringLiteral("im.v2.Chat.Message.list");
+    const auto listCount = fixture.requestsFor(listAction).size();
+    fixture.chatResponseOverride = ajaxResult(QJsonDocument(QJsonObject{{"chatId", chatId + 1}}).toJson(QJsonDocument::Compact));
+    requestHistory();
+    QTRY_COMPARE(historyErrors(), 1);
+    QCOMPARE(fixture.requestsFor(listAction).size(), listCount);
+    QCOMPARE(history.size(), 2);
+    QCOMPARE(banners.size(), 0);
+
+    fixture.holdNotificationReply = QStringLiteral("im.v2.Settings.General.list");
+    rows.append(row(901));
+    publish();
+    load();
+    QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    QCOMPARE(banners.size(), 0);
+    rows.removeLast();
+    rows.append(row(901, 22, false));
+    rows.append(row(902));
+    rows.append(foreignRow);
+    publish();
+    load();
+    QCOMPARE(banners.size(), 0);
+    fixture.releaseHeldNotificationReply();
+    QTRY_COMPARE_WITH_TIMEOUT(banners.size(), 1, 650);
+    const auto delivered = banners.first().first().value<Notification>();
+    QCOMPARE(delivered.id, QStringLiteral("message:902"));
+    QVERIFY(!delivered.targets.isEmpty());
+    QCOMPARE(delivered.targets.first().id, dialog);
+    QCOMPARE(delivered.targets.first().taskChat, task);
+    rows.removeLast();
+    fixture.pushMessage(QStringLiteral("history-before-push"), QStringLiteral("902"), chatId);
+    QTest::qWait(350);
+    QCOMPARE(banners.size(), 1);
+
+    fixture.pushMessage(QStringLiteral("push-before-history"), QStringLiteral("903"), chatId);
+    QTRY_COMPARE(banners.size(), 2);
+    rows.append(row(903));
+    rows.append(row(904, 22, false));
+    rows.append(row(905, 11));
+    rows.append(row(906, 0));
+    rows.append(row(907, 22, true, 60));
+    rows.append(row(908, 22, true, 0, true));
+    publish();
+    load();
+    QCOMPARE(banners.size(), 2);
+
+    const auto pushWithFlags = [&](int id, const QJsonObject &params, const QJsonValue &notify = {}) {
+        QJsonObject event{{"chatId", chatId}, {"dialogId", dialog},
+            {"message", QJsonObject{{"id", id}, {"authorId", 22}, {"text", "New message"}, {"params", params}}}};
+        if (notify.isBool())
+            event.insert(QStringLiteral("notify"), notify);
+        fixture.pushIm(QStringLiteral("history-notify-%1").arg(id), QStringLiteral("messageChat"), event);
+    };
+    const auto beforeNotices = remoteNotices.size();
+    pushWithFlags(909, {}); // Unclear Push metadata must neither notify directly nor veto a later verified history row.
+    pushWithFlags(910, {}, false);
+    pushWithFlags(911, {{"NOTIFY", "N"}}, true);
+    QTRY_VERIFY(remoteNotices.size() >= beforeNotices + 3);
+    QCOMPARE(banners.size(), 2);
+    for (int id = 909; id <= 911; ++id)
+        rows.append(row(id));
+    publish();
+    load();
+    QTRY_COMPARE(banners.size(), 3);
+    QCOMPARE(banners.last().first().value<Notification>().id, QStringLiteral("message:909"));
+
+    fixture.pushIm(QStringLiteral("history-chat-muted"), QStringLiteral("chatMuteNotify"),
+                   {{"dialogId", dialog}, {"muted", true}});
+    QTest::qWait(30);
+    rows.append(row(912));
+    publish();
+    load();
+    QCOMPARE(banners.size(), 3);
+
+    fixture.pushIm(QStringLiteral("history-chat-unmuted"), QStringLiteral("chatMuteNotify"),
+                   {{"dialogId", dialog}, {"muted", false}});
+    backend.setForeground(true);
+    rows.append(row(913));
+    publish();
+    load();
+    backend.setForeground(false);
+    load();
+    QCOMPARE(banners.size(), 3);
+    QVERIFY(fixture.requestsFor(QStringLiteral("im.v2.Chat.Message.read")).isEmpty());
 }
 
 void TestCloudBackend::refusesToFollowRedirectWithSession()

@@ -139,6 +139,13 @@ const QPixmap *ChatVideoPreviews::poster(const MessageFile &file) const
     return entry && !entry->poster.isNull() ? &entry->poster : nullptr;
 }
 
+bool ChatVideoPreviews::posterPending(const MessageFile &file) const
+{
+    return m_serverPosters.pending(file.previewUrl)
+        || (m_active && m_active->url == file.downloadUrl && !m_ffmpeg.isEmpty()
+            && file.size > 0 && file.size <= tunables::kChatVideoPreviewBytes);
+}
+
 void ChatVideoPreviews::begin(const MessageFile &file, Playback playback)
 {
     auto directory = std::make_shared<QTemporaryDir>();

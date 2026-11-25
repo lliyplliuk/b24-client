@@ -289,31 +289,38 @@ private:
     void setOnline(bool online);
     void failShape(const QString &operation);
 
+    enum class RasterRegistration { Primary, Standby };
     QUrl avatarUrlFromPortal(const QString &value) const;
-    QUrl messageImageUrlFromPortal(const QString &value, const QString &fileId, bool previewField) const;
+    QUrl messageImageUrlFromPortal(const QString &value, const QString &fileId, bool previewField,
+                                  RasterRegistration registration = RasterRegistration::Primary) const;
     QUrl taskImageUrlFromPortal(const QString &value, const QString &attachmentId, const QString &objectId,
-                               bool original = false) const;
+                               bool original = false, RasterRegistration registration = RasterRegistration::Primary) const;
+    struct RasterRegistrations {
+        QSet<QUrl> urls;
+        QQueue<QUrl> order;
+    };
     struct RasterAssets {
         RasterAssets(qsizetype maxBytes, qsizetype concurrentRequests, qsizetype cacheBytes)
             : maxBytes(maxBytes), concurrentRequests(concurrentRequests), cache(cacheBytes) {}
 
         qsizetype maxBytes;
         qsizetype concurrentRequests;
-        mutable QSet<QUrl> registered;
-        mutable QQueue<QUrl> registrationOrder;
+        mutable RasterRegistrations registrations;
         QQueue<QUrl> queue;
         QSet<QUrl> pending;
         QHash<QUrl, QNetworkReply *> replies;
         QCache<QUrl, QByteArray> cache;
     };
     using RasterLoaded = void (Backend::*)(const QUrl &, const QByteArray &);
-    QUrl registerRasterAsset(const QUrl &url, const RasterAssets &assets) const;
+    QUrl registerRasterAsset(const QUrl &url, const RasterAssets &assets,
+                             RasterRegistration registration = RasterRegistration::Primary) const;
     void requestRasterAsset(const QUrl &url, RasterAssets &assets, RasterLoaded loaded);
     void startRasterAssets(RasterAssets &assets, RasterLoaded loaded);
     void startRasterAsset(const QUrl &key, const QUrl &url, RasterAssets &assets, RasterLoaded loaded);
     void clearRasterAssets();
     RasterAssets m_avatarAssets{128 * 1024, 4, 1024 * 1024};
     RasterAssets m_messageImageAssets{512 * 1024, 2, 2 * 1024 * 1024};
+    mutable RasterRegistrations m_standbyMessageImageRegistrations;
 
     // Chat lookup, message attachments and the portal uploader.
     struct Upload;
@@ -409,7 +416,16 @@ private:
         QString dialog;
         QString author;
         QJsonValue muteList;
+        bool fromHistory = false;
     };
+    struct ChatPopupHistory {
+        QString dialog;
+        std::optional<qint64> through;
+    };
+    void reconcileHistoryPopups(const QString &dialog, qint64 chatId, bool task, const QJsonObject &history,
+                                const QVector<Message> &messages);
+    bool rememberChatPopup(const QString &dialog, const QString &noticeId);
+    void queueChatPopup(ChatPopup popup);
     DialogMessageState &dialogMessageState(const QString &dialog);
     bool chatMuted(const ChatPopup &popup) const;
     QHash<QString, DialogMessageState> m_dialogMessageStates;
@@ -418,6 +434,9 @@ private:
     QHash<QString, QPair<quint64, QJsonValue>> m_notificationSettingChanges;
     quint64 m_notificationSettingsRevision = 0;
     QQueue<ChatPopup> m_pendingChatPopups;
+    QCache<QString, bool> m_seenChatPopups{256};
+    ChatPopupHistory m_chatPopupHistory;
+    ChatPopupHistory m_taskPopupHistory;
     qint64 m_nextChatPopupSettingsRequest = 0;
     quint64 m_chatPopupSettingsGeneration = 0;
     bool m_chatPopupSettingsKnown = false;

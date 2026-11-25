@@ -602,12 +602,19 @@ MessageFile CloudBackend::decodeChatFile(const QString &id, const QJsonObject &f
             entry.previewUrl = messageImageUrlFromPortal(mediaPreview, id, true);
         if (entry.previewUrl.isEmpty() && !usesOriginal(show))
             entry.previewUrl = messageImageUrlFromPortal(show, id, false);
-        if (photo && entry.previewUrl.isEmpty() && raster && !url.isEmpty() && exactSize > 0
+        if (photo && raster && !url.isEmpty() && entry.previewUrl != url && exactSize > 0
             && exactSize <= m_messageImageAssets.maxBytes) {
+            const auto registration = entry.previewUrl.isEmpty()
+                ? RasterRegistration::Primary : RasterRegistration::Standby;
+            QUrl originalPreview;
             if (previewIsOriginal || mediaIsOriginal)
-                entry.previewUrl = messageImageUrlFromPortal(download, id, true);
+                originalPreview = messageImageUrlFromPortal(download, id, true, registration);
+            if (originalPreview.isEmpty())
+                originalPreview = taskImageUrlFromPortal(url.toString(QUrl::FullyEncoded), {}, id, true, registration);
             if (entry.previewUrl.isEmpty())
-                entry.previewUrl = taskImageUrlFromPortal(url.toString(QUrl::FullyEncoded), {}, id, true);
+                entry.previewUrl = originalPreview;
+            else
+                entry.originalPreviewUrl = originalPreview;
         }
         const auto image = file.value(QStringLiteral("image")).toObject();
         const auto width = positiveId(field(image, {"width"}));

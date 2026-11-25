@@ -568,8 +568,7 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
     }
     if (cloud) {
         QObject::connect(cloud, &CloudBackend::notificationReceived, &tray, [&](const Notification &notice) {
-            const bool chatMessage = notice.id.startsWith(QLatin1String("message:"));
-            if (!loggedOut && (chatMessage || !window || !window->isActiveWindow()))
+            if (desktop::shouldShowNotification(app.applicationState(), loggedOut))
                 desktop::showNotification(tray, notice, cloud);
         });
     }

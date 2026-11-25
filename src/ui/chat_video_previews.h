@@ -31,6 +31,7 @@ public:
     void request(const MessageFile &file);
     void play(const MessageFile &file, QWidget *window, std::function<bool()> stillVisible);
     const QPixmap *poster(const MessageFile &file) const;
+    bool posterPending(const MessageFile &file) const;
 
 private:
     struct Entry;

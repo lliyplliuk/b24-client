@@ -1,3 +1,4 @@
+#include "app/desktop_notification.h"
 #include "ui/chat_photo_viewer.h"
 #include "ui/dialog_chrome.h"
 #include "ui/message_menu_window.h"
@@ -27,6 +28,25 @@ class DialogChromeTest final : public QObject {
 
 private slots:
     void initTestCase() { installDialogChrome(*qApp); }
+
+    void desktopNotificationsRequireInactiveApplication_data()
+    {
+        QTest::addColumn<Qt::ApplicationState>("state");
+        QTest::addColumn<bool>("loggedOut");
+        QTest::addColumn<bool>("allowed");
+        QTest::newRow("focused workspace or modal dialog") << Qt::ApplicationActive << false << false;
+        QTest::newRow("inactive workspace") << Qt::ApplicationInactive << false << true;
+        QTest::newRow("hidden in tray") << Qt::ApplicationHidden << false << true;
+        QTest::newRow("logged out") << Qt::ApplicationInactive << true << false;
+    }
+
+    void desktopNotificationsRequireInactiveApplication()
+    {
+        QFETCH(Qt::ApplicationState, state);
+        QFETCH(bool, loggedOut);
+        QFETCH(bool, allowed);
+        QCOMPARE(bx::desktop::shouldShowNotification(state, loggedOut), allowed);
+    }
 
     void addsSharedChromeWithoutChangingDialogActions()
     {

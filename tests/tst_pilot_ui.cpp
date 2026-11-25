@@ -117,7 +117,8 @@ public:
     void requestTaskChats() override
     {
         ++taskChatRequests;
-        emit taskChatsLoaded(taskChats);
+        if (!holdTaskChatDirectory)
+            emit taskChatsLoaded(taskChats);
     }
     void requestTaskChatBadges() override
     {
@@ -126,6 +127,7 @@ public:
             emit taskChatsLoaded(taskChats);
     }
     int taskChatRequests = 0;
+    bool holdTaskChatDirectory = false;
     int taskChatBadgeRequests = 0;
     bool provideTaskBadges = false;
     std::optional<qint64> unreadChatCount() const override { return railUnread; }
@@ -139,9 +141,12 @@ public:
     void requestMessageImage(const QUrl &url) override
     {
         imageRequests.append(url);
+        if (holdMessageImages)
+            return;
         const auto bytes = messageImages.value(url);
         QTimer::singleShot(0, this, [this, url, bytes] { emit messageImageLoaded(url, bytes); });
     }
+    bool holdMessageImages = false;
     void downloadMessageVideo(const QUrl &url, const QString &path) override
     {
         videoRequests.append({url, path});
@@ -5625,6 +5630,70 @@ private slots:
         settings.remove(chatKey);
     }
 
+    void directoryWidthSurvivesRestartAtManualWidth_data()
+    {
+        QTest::addColumn<QString>("key");
+        QTest::addColumn<QString>("splitterName");
+        QTest::addColumn<int>("section");
+        QTest::addColumn<int>("bodyMinimum");
+        QTest::newRow("chats") << QStringLiteral("ui/chatDirectoryWidth")
+            << QStringLiteral("chatDirectorySplitter") << 0 << 325;
+        QTest::newRow("projects") << QStringLiteral("ui/projectDirectoryWidth")
+            << QStringLiteral("projectDirectorySplitter") << 1 << 430;
+    }
+
+    void directoryWidthSurvivesRestartAtManualWidth()
+    {
+        QFETCH(QString, key);
+        QFETCH(QString, splitterName);
+        QFETCH(int, section);
+        QFETCH(int, bodyMinimum);
+        QSettings settings(QStringLiteral("bitrix24-client"), QStringLiteral("bitrix24-client"));
+        settings.remove(key);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        int savedWidth = 0;
+        {
+            MainWindow window(backend.get());
+            window.resize(1750, 700);
+            window.show();
+            auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
+            auto *splitter = window.findChild<QSplitter *>(splitterName);
+            QVERIFY(sections && splitter);
+            sections->setCurrentRow(section);
+            QTRY_VERIFY(splitter->isVisible());
+            auto *handle = splitter->handle(1);
+            QVERIFY(handle);
+            const auto start = handle->rect().center();
+            QTest::mousePress(handle, Qt::LeftButton, Qt::NoModifier, start);
+            QTest::mouseMove(handle, start + QPoint(880, 0));
+            QTest::mouseRelease(handle, Qt::LeftButton, Qt::NoModifier, start + QPoint(880, 0));
+            QTRY_VERIFY(splitter->widget(0)->width() > 1000);
+            savedWidth = splitter->widget(0)->width();
+            QCOMPARE(settings.value(key).toInt(), savedWidth);
+        }
+        {
+            MainWindow restored(backend.get());
+            restored.resize(1750, 700);
+            restored.show();
+            auto *sections = findAccessible<QListWidget>(&restored, QStringLiteral("Разделы"));
+            auto *splitter = restored.findChild<QSplitter *>(splitterName);
+            QVERIFY(sections && splitter);
+            sections->setCurrentRow(section);
+            QTRY_COMPARE(splitter->widget(0)->width(), savedWidth);
+
+            restored.resize(900, 600);
+            QTRY_VERIFY(splitter->widget(0)->width() < savedWidth);
+            QTRY_VERIFY(splitter->widget(1)->width() >= bodyMinimum);
+            QCOMPARE(settings.value(key).toInt(), savedWidth);
+
+            sections->setCurrentRow(1 - section);
+            restored.resize(1750, 700);
+            sections->setCurrentRow(section);
+            QTRY_COMPARE(splitter->widget(0)->width(), savedWidth);
+        }
+        settings.remove(key);
+    }
+
     void notificationFiltersKeepPendingAndFailedHistoryVisible()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());
@@ -7392,6 +7461,103 @@ private slots:
         backend->taskMessages.append(message(QStringLiteral("704"), link));
         emit backend->taskMessagesLoaded(QStringLiteral("501"), backend->taskMessages);
         QTRY_COMPARE(backend->externalLinkPreviewRequests.size(), 3);
+    }
+
+    void inlineChatPreviewAnimatesUntilTerminalResult_data()
+    {
+        QTest::addColumn<bool>("fallback");
+        QTest::addColumn<bool>("succeeds");
+        QTest::newRow("preferred succeeds") << false << true;
+        QTest::newRow("preferred fails") << false << false;
+        QTest::newRow("original succeeds") << true << true;
+    }
+
+    void inlineChatPreviewAnimatesUntilTerminalResult()
+    {
+        QFETCH(bool, fallback);
+        QFETCH(bool, succeeds);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->holdMessageImages = true;
+        MessageFile file;
+        file.id = QStringLiteral("800");
+        file.name = QStringLiteral("image (800).png");
+        file.isImage = true;
+        file.size = 8611;
+        file.downloadUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/disk/downloadFile/800/"));
+        file.previewUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/disk/showFile/800/"));
+        if (fallback)
+            file.originalPreviewUrl = file.downloadUrl;
+        backend->messages.first().files = {file};
+
+        MainWindow window(backend.get());
+        window.resize(900, 600);
+        window.show();
+        auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
+        QVERIFY(history);
+        QTRY_COMPARE(backend->imageRequests.count(file.previewUrl), 1);
+        if (fallback) {
+            emit backend->messageImageLoaded(file.previewUrl, {});
+            QTRY_COMPARE_WITH_TIMEOUT(backend->imageRequests.count(file.downloadUrl), 1, 800);
+        }
+
+        const auto rowImage = [history] {
+            const auto row = history->visualItemRect(history->item(0));
+            return history->viewport()->grab(row).toImage();
+        };
+        const auto firstFrame = rowImage();
+        QVERIFY(!firstFrame.isNull());
+        QTRY_VERIFY_WITH_TIMEOUT(rowImage() != firstFrame, 500);
+
+        QByteArray bytes;
+        QBuffer buffer(&bytes);
+        QVERIFY(buffer.open(QIODevice::WriteOnly));
+        const QColor thumbnailColor("#749fb1");
+        QImage image(634, 60, QImage::Format_RGB32);
+        image.fill(thumbnailColor);
+        if (succeeds)
+            QVERIFY(image.save(&buffer, "PNG"));
+        emit backend->messageImageLoaded(fallback ? file.downloadUrl : file.previewUrl, bytes);
+        QCoreApplication::processEvents();
+        const auto finalFrame = rowImage();
+        bool hasImage = false;
+        for (int y = 0; y < finalFrame.height() && !hasImage; ++y)
+            for (int x = 0; x < finalFrame.width() && !hasImage; ++x)
+                hasImage = finalFrame.pixelColor(x, y) == thumbnailColor;
+        QCOMPARE(hasImage, succeeds);
+        QTest::qWait(210);
+        QCOMPARE(rowImage(), finalFrame);
+        QCOMPARE(backend->imageRequests.size(), fallback ? 2 : 1);
+    }
+
+    void chatPreviewRequestsRestartOnlyAfterAnAccountChange()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->holdMessageImages = true;
+        MessageFile file;
+        file.id = QStringLiteral("800");
+        file.name = QStringLiteral("image.png");
+        file.isImage = true;
+        file.previewUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/disk/showFile/800/"));
+        auto other = file;
+        other.id = QStringLiteral("801");
+        other.previewUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/disk/showFile/801/"));
+        backend->messages.first().files = {file, other};
+
+        MainWindow window(backend.get());
+        window.resize(900, 600);
+        window.show();
+        QTRY_COMPARE(backend->imageRequests.size(), 2);
+
+        backend->accountScope = QStringLiteral("fixture/preview-account-one");
+        emit backend->accountScopeChanged();
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->imageRequests.size(), 2);
+
+        // Account changes cancel raster requests without delivering a completion.
+        backend->accountScope = QStringLiteral("fixture/preview-account-two");
+        emit backend->accountScopeChanged();
+        QTRY_COMPARE_WITH_TIMEOUT(backend->imageRequests.count(file.previewUrl), 2, 800);
+        QCOMPARE(backend->imageRequests.count(other.previewUrl), 2);
     }
 
     void imageContextMenuUsesTheClickedPhoto_data()
@@ -9952,6 +10118,94 @@ private slots:
 
         chats->setCurrentRow(selectedRow + 1);
         QTRY_VERIFY(rowId(chats->item(selectedRow)) != activeId);
+    }
+
+    void taskChatRowsStayInPlaceUntilMouseRelease_data()
+    {
+        QTest::addColumn<bool>("ungrab");
+        QTest::addColumn<bool>("leaveSection");
+        QTest::newRow("release") << false << false;
+        QTest::newRow("ungrab") << true << false;
+        QTest::newRow("switch-section") << false << true;
+    }
+
+    void taskChatRowsStayInPlaceUntilMouseRelease()
+    {
+        QFETCH(bool, ungrab);
+        QFETCH(bool, leaveSection);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        const auto activeId = QStringLiteral("task-dialog");
+        const auto targetId = QStringLiteral("chat201");
+        for (const auto &id : {activeId, targetId, QStringLiteral("chat202"), QStringLiteral("chat203")}) {
+            Chat chat;
+            chat.id = id;
+            chat.title = id;
+            chat.taskChat = true;
+            chat.unread = 2;
+            backend->taskChats.append(chat);
+        }
+        MainWindow window(backend.get());
+        window.resize(960, 650);
+        window.show();
+        auto *tabs = window.findChild<QTabBar *>(QStringLiteral("chatScopeTabs"));
+        QVERIFY(tabs);
+        tabs->setCurrentIndex(1);
+        auto *chats = findAccessible<QListWidget>(&window, QStringLiteral("Чаты задач"));
+        QVERIFY(chats);
+        QTRY_COMPARE(chats->count(), 4);
+        const auto idOf = [](const QListWidgetItem *item) {
+            return item ? item->data(workspace::Id).toString() : QString{};
+        };
+        QCOMPARE(idOf(chats->currentItem()), activeId);
+        backend->taskChats.removeFirst();
+        emit backend->taskChatsLoaded(backend->taskChats);
+        QCOMPARE(idOf(chats->item(0)), activeId);
+        auto *target = chats->item(1);
+        QCOMPARE(idOf(target), targetId);
+        const auto point = chats->visualItemRect(target).center();
+        QVERIFY(chats->viewport()->rect().contains(point));
+        QString clicked;
+        connect(chats, &QListWidget::itemClicked, &window, [&](const QListWidgetItem *item) { clicked = idOf(item); });
+
+        QTest::mousePress(chats->viewport(), Qt::LeftButton, {}, point);
+        QCOMPARE(idOf(chats->currentItem()), targetId);
+        QCoreApplication::processEvents();
+        QCOMPARE(idOf(chats->item(0)), activeId);
+        QCOMPARE(chats->itemAt(point), target);
+
+        emit backend->chatReadConfirmed(targetId, {QStringLiteral("701")}, 701);
+        backend->taskChats[0].unread = 0;
+        backend->taskChats[1].pinned = true;
+        emit backend->taskChatsLoaded(backend->taskChats);
+        backend->taskChats[2].pinned = true;
+        emit backend->taskChatsLoaded(backend->taskChats);
+        QCOMPARE(idOf(chats->itemAt(point)), targetId);
+        QCOMPARE(chats->itemAt(point), target);
+
+        if (ungrab) {
+            QEvent cancelled(QEvent::UngrabMouse);
+            QCoreApplication::sendEvent(chats->viewport(), &cancelled);
+            QTRY_COMPARE(chats->count(), 3);
+        }
+        if (leaveSection) {
+            auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
+            QVERIFY(sections);
+            backend->holdTaskChatDirectory = true;
+            sections->setCurrentRow(1);
+            QVERIFY(!chats->isVisible());
+            QTest::mouseRelease(sections->viewport(), Qt::LeftButton, {}, sections->visualItemRect(sections->currentItem()).center());
+            QCoreApplication::processEvents();
+            QCOMPARE(chats->count(), 4);
+            sections->setCurrentRow(0);
+        } else {
+            QTest::mouseRelease(chats->viewport(), Qt::LeftButton, {}, point);
+        }
+        QCOMPARE(clicked, ungrab || leaveSection ? QString{} : targetId);
+        QTRY_COMPARE(chats->count(), 3);
+        QCOMPARE(idOf(chats->currentItem()), targetId);
+        QCOMPARE(idOf(chats->item(1)), QStringLiteral("chat203"));
+        QCOMPARE(chats->currentItem()->data(workspace::Count).toInt(), 0);
+        QCOMPARE(backend->chatRefreshCalls.last(), targetId);
     }
 
     void chatUnreadFilterWorksTogetherWithSearch()

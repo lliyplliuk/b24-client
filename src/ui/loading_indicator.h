@@ -57,6 +57,21 @@ private:
     int m_angle = 0;
 };
 
+inline void paintLoadingRing(QPainter &painter, const QRectF &bounds, const QColor &foreground, int angle)
+{
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setBrush(Qt::NoBrush);
+    auto track = foreground;
+    track.setAlpha(55);
+    const auto ring = bounds.adjusted(1.4, 1.4, -1.4, -1.4);
+    painter.setPen(QPen(track, 1.6));
+    painter.drawEllipse(ring);
+    painter.setPen(QPen(foreground, 1.6, Qt::SolidLine, Qt::RoundCap));
+    painter.drawArc(ring, angle * -16, 110 * 16);
+    painter.restore();
+}
+
 class LoadingIndicator final : public QWidget {
 public:
     explicit LoadingIndicator(QLabel *label) : QWidget(label), m_label(label)
@@ -132,15 +147,7 @@ protected:
     void paintEvent(QPaintEvent *) override
     {
         QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing);
-        auto foreground = palette().color(QPalette::WindowText);
-        auto track = foreground;
-        track.setAlpha(55);
-        const QRectF ring = QRectF(rect()).adjusted(1.4, 1.4, -1.4, -1.4);
-        painter.setPen(QPen(track, 1.6));
-        painter.drawEllipse(ring);
-        painter.setPen(QPen(foreground, 1.6, Qt::SolidLine, Qt::RoundCap));
-        painter.drawArc(ring, (m_clock ? m_clock->angle() : 0) * -16, 110 * 16);
+        paintLoadingRing(painter, rect(), palette().color(QPalette::WindowText), m_clock ? m_clock->angle() : 0);
     }
 
 private:

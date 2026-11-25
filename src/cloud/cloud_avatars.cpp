@@ -188,7 +188,8 @@ QUrl CloudBackend::avatarUrlFromPortal(const QString &value) const
     return registerRasterAsset(url, m_avatarAssets);
 }
 
-QUrl CloudBackend::messageImageUrlFromPortal(const QString &value, const QString &fileId, bool previewField) const
+QUrl CloudBackend::messageImageUrlFromPortal(const QString &value, const QString &fileId, bool previewField,
+                                            RasterRegistration registration) const
 {
     if (value.isEmpty() || value.size() > 4096)
         return {};
@@ -199,14 +200,14 @@ QUrl CloudBackend::messageImageUrlFromPortal(const QString &value, const QString
     if (!rasterAddressAllowed(url, m_session.origin, m_allowLoopback)
         || (!staticRasterPathAllowed(url) && !diskImagePathAllowed(url, fileId, previewField)))
         return {};
-    return registerRasterAsset(url, m_messageImageAssets);
+    return registerRasterAsset(url, m_messageImageAssets, registration);
 }
 
 QUrl CloudBackend::taskImageUrlFromPortal(const QString &value, const QString &attachmentId, const QString &objectId,
-                                         bool original) const
+                                         bool original, RasterRegistration registration) const
 {
     if (!original) {
-        if (const auto image = messageImageUrlFromPortal(value, objectId, true); !image.isEmpty())
+        if (const auto image = messageImageUrlFromPortal(value, objectId, true, registration); !image.isEmpty())
             return image;
     }
     if (value.isEmpty() || value.size() > 4096)
@@ -220,19 +221,22 @@ QUrl CloudBackend::taskImageUrlFromPortal(const QString &value, const QString &a
     const auto actions = query.allQueryItemValues(QStringLiteral("action"), QUrl::FullyDecoded);
     if (!original && attached && actions.size() == 1 && actions.first() == QLatin1String("show")
         && exactQueryId(query, QStringLiteral("attachedId"), attachmentId))
-        return registerRasterAsset(url, m_messageImageAssets);
+        return registerRasterAsset(url, m_messageImageAssets, registration);
     if ((original || attached) && cloud::isPortalDiskDownload(url, attachmentId, objectId))
-        return registerRasterAsset(url, m_messageImageAssets);
+        return registerRasterAsset(url, m_messageImageAssets, registration);
     return {};
 }
 
-QUrl CloudBackend::registerRasterAsset(const QUrl &url, const RasterAssets &assets) const
+QUrl CloudBackend::registerRasterAsset(const QUrl &url, const RasterAssets &assets,
+                                      RasterRegistration registration) const
 {
-    if (!assets.registered.contains(url)) {
-        assets.registered.insert(url);
-        assets.registrationOrder.enqueue(url);
-        if (assets.registrationOrder.size() > maxMetadataUrls)
-            assets.registered.remove(assets.registrationOrder.dequeue());
+    auto &registered = registration == RasterRegistration::Standby
+        ? m_standbyMessageImageRegistrations : assets.registrations;
+    if (!registered.urls.contains(url)) {
+        registered.urls.insert(url);
+        registered.order.enqueue(url);
+        if (registered.order.size() > maxMetadataUrls)
+            registered.urls.remove(registered.order.dequeue());
     }
     return url;
 }
@@ -249,7 +253,9 @@ void CloudBackend::requestMessageImage(const QUrl &url)
 
 void CloudBackend::requestRasterAsset(const QUrl &url, RasterAssets &assets, RasterLoaded loaded)
 {
-    if (!m_started || m_authExpired || !assets.registered.contains(url)) {
+    const bool registered = assets.registrations.urls.contains(url)
+        || (&assets == &m_messageImageAssets && m_standbyMessageImageRegistrations.urls.contains(url));
+    if (!m_started || m_authExpired || !registered) {
         (this->*loaded)(url, {});
         return;
     }
@@ -356,9 +362,9 @@ void CloudBackend::startRasterAsset(const QUrl &key, const QUrl &url, RasterAsse
 
 void CloudBackend::clearRasterAssets()
 {
+    m_standbyMessageImageRegistrations = {};
     for (auto *assets : {&m_avatarAssets, &m_messageImageAssets}) {
-        assets->registered.clear();
-        assets->registrationOrder.clear();
+        assets->registrations = {};
         assets->queue.clear();
         assets->pending.clear();
         assets->cache.clear();
