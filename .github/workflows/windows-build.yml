@@ -5,12 +5,19 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 30
+    outputs:
+      tested_commit: ${{ steps.package.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Qt (aqtinstall)
         uses: jurplel/install-qt-action@v3
         with:
@@ -60,3 +67,180 @@ jobs:
           path: |
             build/qt-test-logs/
             build/Testing/Temporary/LastTest*.log
+      - name: Package Windows x64 release
+        id: package
+        if: ${{ success() && steps.tests.outcome == 'success' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag') }}
+        run: |
+          if ($env:GITHUB_REF -cne 'refs/heads/main' -and
+              ($env:GITHUB_REF_TYPE -cne 'tag' -or
+               $env:GITHUB_REF_NAME -cnotmatch '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z')) {
+            Write-Output 'Skipping packaging for a non-release ref.'
+            exit 0
+          }
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $stage = (New-Item -ItemType Directory -Path build/windows-package).FullName
+          $output = (New-Item -ItemType Directory -Path build/windows-release-artifact).FullName
+          $install = Join-Path $env:RUNNER_TEMP 'bitrix24-client-install'
+          cmake --install build --config Release --prefix $install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Join-Path $stage 'bitrix24-client.exe'
+          Copy-Item -LiteralPath (Join-Path $install 'bin/bitrix24-client.exe') -Destination $exe
+          Copy-Item -LiteralPath LICENSE -Destination $stage
+
+          $deploy = (Get-Command windeployqt.exe -CommandType Application | Select-Object -First 1).Source
+          & $deploy --release --no-translations --no-compiler-runtime --no-system-d3d-compiler --no-opengl-sw --no-ffmpeg $exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'Visual Studio C++ tools were not found.' }
+          $runtime = Get-ChildItem -LiteralPath (Join-Path $vs 'VC/Redist/MSVC') -Directory |
+            Where-Object Name -Match '^[0-9]+\.[0-9]+\.[0-9]+$' |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Join-Path $_.FullName 'x64/Microsoft.VC143.CRT' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+            Select-Object -First 1
+          if (-not $runtime) { throw 'The official x64 MSVC redistributable DLLs were not found.' }
+          Get-ChildItem -LiteralPath $runtime -Filter '*.dll' -File | Copy-Item -Destination $stage
+
+          foreach ($file in @('Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'Qt6Network.dll',
+                               'Qt6WebSockets.dll', 'platforms/qwindows.dll', 'tls/qschannelbackend.dll',
+                               'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $file) -PathType Leaf)) {
+              throw "Windows package is missing $file"
+            }
+          }
+
+          $licenses = (New-Item -ItemType Directory -Path (Join-Path $stage 'licenses')).FullName
+          foreach ($name in @('LGPL-3.0-only.txt', 'GPL-3.0-only.txt')) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/qt/qtbase/v6.6.3/LICENSES/$name" `
+              -OutFile (Join-Path $licenses $name) -TimeoutSec 30
+          }
+          @'
+          This application uses Qt 6.6.3 shared libraries under the GNU LGPL v3.
+          The corresponding Qt source packages are available from:
+          https://download.qt.io/archive/qt/6.6/6.6.3/submodules/
+          Qt Base and Qt WebSockets contain the source and third-party notices.
+          The package also contains the Microsoft Visual C++ x64 runtime.
+          '@ | Set-Content -LiteralPath (Join-Path $licenses 'THIRD-PARTY.txt') -Encoding utf8
+
+          $zip = 'bitrix24-client-windows-x64.zip'
+          [IO.Compression.ZipFile]::CreateFromDirectory($stage, (Join-Path $output $zip))
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Upload Windows release package
+        if: ${{ steps.package.outputs.commit != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-release-x64
+          path: build/windows-release-artifact/bitrix24-client-windows-x64.zip
+          if-no-files-found: error
+
+  publish:
+    needs: windows
+    if: ${{ needs.windows.result == 'success' && github.event_name == 'push' && needs.windows.outputs.tested_commit != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: windows-release-publication
+      queue: max
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-release-x64
+          path: release
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_COMMIT: ${{ needs.windows.outputs.tested_commit }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          ref = os.environ["GITHUB_REF"]
+          commit = os.environ["TESTED_COMMIT"]
+          if not re.fullmatch(r"[a-f0-9]{40}", commit):
+              raise SystemExit("Missing or invalid tested commit.")
+          stable = re.compile(r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+          remote = subprocess.run(
+              ["git", "ls-remote", "--tags", f"https://github.com/{repo}.git"],
+              capture_output=True, text=True, check=True, timeout=30,
+          ).stdout
+          tags = {}
+          peeled = {}
+          for line in remote.splitlines():
+              oid, name = line.split("\t")
+              tag = name.removeprefix("refs/tags/")
+              if tag.endswith("^{}"):
+                  peeled[tag[:-3]] = oid
+              else:
+                  tags[tag] = oid
+          tags.update(peeled)
+
+          reserve = False
+          if ref == "refs/heads/main":
+              if commit != os.environ["GITHUB_SHA"]:
+                  raise SystemExit("Main push SHA differs from the tested commit.")
+              versions = []
+              matching = []
+              for tag, oid in tags.items():
+                  match = stable.fullmatch(tag)
+                  if not match:
+                      continue
+                  version = tuple(map(int, match.groups()))
+                  versions.append(version)
+                  if oid == commit:
+                      matching.append((version, tag))
+              if matching:
+                  # A simultaneous explicit tag push or an earlier attempt owns this version.
+                  _, tag = max(matching)
+              else:
+                  major, minor, patch = max(versions, default=(0, 0, 0))
+                  tag = f"{major}.{minor}.{patch + 1}"
+                  reserve = True
+          elif ref.startswith("refs/tags/"):
+              tag = ref.removeprefix("refs/tags/")
+              if not stable.fullmatch(tag) or tags.get(tag) != commit:
+                  raise SystemExit("Version tag does not point to the tested commit.")
+          else:
+              raise SystemExit("Unexpected release ref.")
+
+          archive = Path("release/bitrix24-client-windows-x64.zip")
+          if not archive.is_file() or archive.stat().st_size == 0:
+              raise SystemExit("The tested Windows archive is missing or empty.")
+          asset = archive.with_name(f"bitrix24-client-{tag}-windows-x64.zip")
+          existing = subprocess.run(
+              ["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"],
+              capture_output=True, text=True, check=True, timeout=30,
+          )
+          for page in json.loads(existing.stdout):
+              for release in page:
+                  if release["tag_name"] != tag:
+                      continue
+                  if not reserve and not release["draft"] and any(
+                      a["name"] == asset.name and a["state"] == "uploaded" and a["size"] > 0
+                      for a in release["assets"]
+                  ):
+                      print(f"Release {tag} already contains {asset.name}.")
+                      raise SystemExit(0)
+                  raise SystemExit(f"Release {tag} already exists without the expected published asset.")
+          if reserve:
+              # Atomically create the ref; a concurrent claim fails without changing either tag.
+              subprocess.run(
+                  ["gh", "api", "--method", "POST", f"repos/{repo}/git/refs",
+                   "-f", f"ref=refs/tags/{tag}", "-f", f"sha={commit}", "--silent"],
+                  check=True, timeout=30,
+              )
+          archive.rename(asset)
+          subprocess.run(
+              ["gh", "release", "create", tag, str(asset), "--repo", repo, "--verify-tag", "--generate-notes"],
+              check=True,
+          )
+          PY
