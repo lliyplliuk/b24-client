@@ -1986,11 +1986,19 @@ QWidget *MainWindow::buildNotificationsPanel()
         if (!row || !m_noticeRead->isEnabled())
             return;
         const auto id = row->data(workspace::Id).toString();
+        if (m_clientUpdates && id == m_clientUpdates->notice().id) {
+            m_clientUpdates->markRead();
+            return;
+        }
         beginAction(QStringLiteral("read-notification"));
         m_backend->markNotificationRead(id);
     });
     connect(m_noticeReadAll, &QPushButton::clicked, this, [this, beginAction] {
         if (!m_noticeReadAll->isEnabled())
+            return;
+        if (m_clientUpdates)
+            m_clientUpdates->markRead();
+        if (!writable() || (m_noticeHistory.isEmpty() && m_noticeSearchResults.isEmpty()))
             return;
         beginAction(QStringLiteral("read-all-notifications"));
         m_backend->markAllNotificationsRead();
@@ -3716,12 +3724,49 @@ void MainWindow::setChatTabUnreadCount(int scope, qint64 count)
     m_chatTabs->setTabToolTip(scope, m_chatTabs->tabText(scope) + QStringLiteral(" · ") + detail);
 }
 
+void ClientUpdateFeed::publish(const QString &tag, const QUrl &downloadUrl)
+{
+    const auto id = QStringLiteral("client-update:") + tag;
+    if (m_notice.id == id)
+        return;
+    m_notice = {};
+    m_notice.id = id;
+    m_notice.title = QStringLiteral("Доступно обновление Битрикс24 %1 для Windows").arg(tag);
+    m_notice.text = QStringLiteral("Скачать ZIP");
+    m_notice.markup = QStringLiteral("[URL=%1]%2[/URL]").arg(downloadUrl.toString(), m_notice.text);
+    m_notice.createdAt = QDateTime::currentDateTimeUtc();
+    emit changed();
+}
+
+void ClientUpdateFeed::markRead()
+{
+    if (m_notice.id.isEmpty() || m_notice.read)
+        return;
+    m_notice.read = true;
+    emit changed();
+}
+
+void MainWindow::setClientUpdateFeed(ClientUpdateFeed *feed)
+{
+    if (m_clientUpdates)
+        disconnect(m_clientUpdates, nullptr, this, nullptr);
+    m_clientUpdates = feed;
+    const auto refresh = [this] {
+        updateNotificationRailBadge();
+        showNotifications();
+    };
+    connect(feed, &ClientUpdateFeed::changed, this, refresh);
+    refresh();
+}
+
 void MainWindow::updateNotificationRailBadge()
 {
     QSet<QString> unread;
     for (const auto &notice : m_noticeHistory)
         if (!notice.read && !notice.id.isEmpty())
             unread.insert(notice.id);
+    if (m_clientUpdates && !m_clientUpdates->notice().read && !m_clientUpdates->notice().id.isEmpty())
+        unread.insert(m_clientUpdates->notice().id);
     setRailUnreadCount(2, unread.size());
 }
 
@@ -5056,6 +5101,12 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
         return;
     const bool remoteSearch = m_noticeQuery.size() >= 3;
     auto notices = remoteSearch ? m_noticeSearchResults : m_noticeHistory;
+    if (m_clientUpdates) {
+        const auto &local = m_clientUpdates->notice();
+        if (!local.id.isEmpty() && (local.title.contains(m_noticeQuery, Qt::CaseInsensitive)
+                                    || local.text.contains(m_noticeQuery, Qt::CaseInsensitive)))
+            notices.append(local);
+    }
     notices.erase(std::remove_if(notices.begin(), notices.end(), [this, remoteSearch](const Notification &notice) {
         return (m_noticeUnreadOnly->isChecked() && notice.read) ||
             (!remoteSearch && !m_noticeQuery.isEmpty() &&
@@ -5165,16 +5216,23 @@ void MainWindow::readVisibleNotices()
 {
     if (!canReadVisibleNotices() || !m_pendingNoticeRead.isEmpty())
         return;
+    bool readClientUpdate = false;
     for (const int row : visibleNoticeRows()) {
         const auto *item = m_notifications->item(row);
         if (!item->data(workspace::Count).toBool())
             continue;
         auto id = item->data(workspace::Id).toString();
+        if (m_clientUpdates && id == m_clientUpdates->notice().id) {
+            readClientUpdate = true;
+            continue;
+        }
         if (!isLocalNotificationId(id))
             id = portalTaskIdentifier(id);
         if (!id.isEmpty() && !m_failedNoticeRead.contains(id) && !m_pendingNoticeRead.contains(id))
             m_pendingNoticeRead.append(id);
     }
+    if (readClientUpdate)
+        m_clientUpdates->markRead();
     if (!m_pendingNoticeRead.isEmpty())
         m_backend->markNotificationsRead(QStringList(m_pendingNoticeRead));
 }
@@ -5196,9 +5254,12 @@ void MainWindow::updateNotificationActions()
     const bool canWrite = writable() && m_noticeAction.isEmpty();
     const auto *row = m_notifications->currentItem();
     const bool validRow = row && !portalTaskIdentifier(row->data(workspace::Id).toString()).isEmpty();
-    m_noticeRead->setEnabled(canWrite && validRow && row->data(workspace::Count).toBool());
+    const bool localUnread = m_clientUpdates && !m_clientUpdates->notice().id.isEmpty() && !m_clientUpdates->notice().read;
+    const bool localSelected = localUnread && row && row->data(workspace::Id).toString() == m_clientUpdates->notice().id;
+    m_noticeRead->setEnabled(localSelected || (canWrite && validRow && row->data(workspace::Count).toBool()));
     m_noticeDelete->setEnabled(canWrite && validRow);
-    m_noticeReadAll->setEnabled(canWrite && (!m_noticeHistory.isEmpty() || !m_noticeSearchResults.isEmpty()));
+    const bool portalRows = !m_noticeHistory.isEmpty() || !m_noticeSearchResults.isEmpty();
+    m_noticeReadAll->setEnabled(m_noticeAction.isEmpty() && (localUnread || (canWrite && portalRows)));
     const auto tip = m_readOnly ? QStringLiteral("Недоступно в режиме чтения") : QString();
     for (auto *button : {m_noticeRead, m_noticeReadAll, m_noticeDelete})
         button->setToolTip(tip);

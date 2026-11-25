@@ -5714,6 +5714,57 @@ private slots:
         settings.remove(key);
     }
 
+    void periodicUpdateStaysLocalAcrossPortalSnapshots()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->holdNotifications = true;
+        backend->accountScope = QStringLiteral("fixture/first-account");
+        ClientUpdateFeed feed;
+        MainWindow window(backend.get());
+        window.setClientUpdateFeed(&feed);
+        auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
+        auto *notices = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
+        auto *search = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск уведомлений"));
+        auto *read = findAccessible<QPushButton>(&window, QStringLiteral("Прочитать уведомление"));
+        QVERIFY(sections && notices && search && read);
+        const QUrl url(QStringLiteral("https://github.com/lliyplliuk/b24-client/releases/download/v1.2.3/bitrix24-client-v1.2.3-windows-x64.zip"));
+        feed.publish(QStringLiteral("v1.2.3"), url);
+        QVERIFY(window.isHidden());
+        QCOMPARE(sections->currentRow(), 0);
+        QVERIFY(sections->item(2)->data(Qt::AccessibleDescriptionRole).toString().contains(QStringLiteral("1")));
+        window.show();
+        sections->setCurrentRow(2);
+        emit backend->notificationsLoaded({});
+        QCOMPARE(notices->count(), 1);
+        QVERIFY(notices->item(0)->data(workspace::MarkupHtml).toString().contains(url.toString()));
+        search->setText(QStringLiteral("1.2.3"));
+        QTest::keyClick(search, Qt::Key_Return);
+        emit backend->notificationsFound(search->text(), {});
+        QCOMPARE(notices->count(), 1);
+        notices->setCurrentRow(0);
+        read->click();
+        QVERIFY(feed.notice().read);
+        QVERIFY(backend->noticeReadId.isEmpty());
+        QVERIFY(backend->noticeReadBatches.isEmpty());
+        feed.publish(QStringLiteral("v1.2.3"), url);
+        QVERIFY(feed.notice().read);
+        search->setText(QStringLiteral("другое"));
+        QTest::keyClick(search, Qt::Key_Return);
+        emit backend->notificationsFound(search->text(), {});
+        QCOMPARE(notices->count(), 0);
+        backend->accountScope = QStringLiteral("fixture/another-account");
+        emit backend->accountScopeChanged();
+        QCOMPARE(notices->count(), 1);
+        QVERIFY(!notices->item(0)->data(workspace::Count).toBool());
+        QVERIFY(sections->item(2)->data(Qt::AccessibleDescriptionRole).toString().isEmpty());
+        QApplication::setActiveWindow(&window);
+        window.onConnectionChanged(true);
+        feed.publish(QStringLiteral("v1.2.4"), QUrl(url.toString().replace(QStringLiteral("1.2.3"), QStringLiteral("1.2.4"))));
+        QTRY_VERIFY(feed.notice().read);
+        QCOMPARE(notices->count(), 1);
+        QVERIFY(backend->noticeReadBatches.isEmpty());
+    }
+
     void notificationFiltersKeepPendingAndFailedHistoryVisible()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());

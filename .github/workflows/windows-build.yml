@@ -161,7 +161,8 @@ jobs:
           import os
           import re
           import subprocess
-          from pathlib import Path
+          from pathlib import Path, PureWindowsPath
+          from zipfile import BadZipFile, ZipFile
 
           repo = os.environ["GITHUB_REPOSITORY"]
           ref = os.environ["GITHUB_REF"]
@@ -231,6 +232,24 @@ jobs:
                       print(f"Release {tag} already contains {asset.name}.")
                       raise SystemExit(0)
                   raise SystemExit(f"Release {tag} already exists without the expected published asset.")
+
+          marker = "bitrix24-version.txt"
+          executable = "bitrix24-client.exe"
+          try:
+              # Read first: append mode can silently start a new ZIP after non-ZIP data.
+              with ZipFile(archive) as package:
+                  names = package.namelist()
+                  if any(PureWindowsPath(name) == PureWindowsPath(marker) for name in names):
+                      raise SystemExit("The tested Windows archive already has a version marker.")
+                  if names.count(executable) != 1 or not package.getinfo(executable).file_size:
+                      raise SystemExit("The tested Windows archive is missing its expected root executable.")
+                  if package.testzip() is not None:
+                      raise SystemExit("The tested Windows archive has a damaged ZIP entry.")
+              with ZipFile(archive, "a") as package:
+                  package.writestr(marker, (tag + "\n").encode("ascii"))
+          except BadZipFile as error:
+              raise SystemExit("The tested Windows archive is an invalid ZIP.") from error
+
           if reserve:
               # Atomically create the ref; a concurrent claim fails without changing either tag.
               subprocess.run(

@@ -30,6 +30,16 @@
 #include <cstdio>
 #include <optional>
 
+#ifdef Q_OS_WIN
+#include "app/windows_update.h"
+
+#include <QDesktopServices>
+#include <QDir>
+#include <QMessageBox>
+#include <QPushButton>
+#include <memory>
+#endif
+
 using namespace bx;
 
 namespace {
@@ -361,7 +371,8 @@ bool forgetPortal(const QUrl &origin)
 }
 
 WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &backend,
-                             CloudBackend *cloud, bool readOnly, const QUrl &logoutPortal = {})
+                             CloudBackend *cloud, bool readOnly, const QUrl &logoutPortal = {},
+                             ClientUpdateFeed *updates = nullptr)
 {
     app.setQuitOnLastWindowClosed(true);
     std::optional<bool> connectionOnline;
@@ -490,6 +501,8 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
             if (cloud)
                 cloud->setActiveSection(0);
             window = new MainWindow(&backend, readOnly);
+            if (updates)
+                window->setClientUpdateFeed(updates);
             window->setLogoutAvailable(!logoutPortal.isEmpty());
             QObject::connect(window, &MainWindow::logoutRequested, &tray, [&] {
                 if (logoutPortal.isEmpty() || loggedOut)
@@ -597,6 +610,12 @@ int main(int argc, char **argv) {
     app.setQuitOnLastWindowClosed(false);
     QCoreApplication::setApplicationName(QStringLiteral("bitrix24-client"));
     QCoreApplication::setApplicationVersion(QStringLiteral("0.1.0-pilot"));
+#ifdef Q_OS_WIN
+    const auto packagedVersion = update::readWindowsPackageVersion(
+        QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("bitrix24-version.txt")));
+    if (!packagedVersion.isEmpty())
+        QCoreApplication::setApplicationVersion(packagedVersion);
+#endif
     app.setDesktopFileName(QStringLiteral("bitrix24-client"));
     QIcon icon;
     for (const auto size : {16, 22, 24, 32, 48, 64, 128, 256})
@@ -648,12 +667,43 @@ int main(int argc, char **argv) {
         return runWorkspace(app, icon, backend, &backend, true).exitCode;
     }
 
+    ClientUpdateFeed updates;
+#ifdef Q_OS_WIN
+    QPointer<QMessageBox> updateNotice;
+    std::unique_ptr<update::WindowsUpdateChecker> updateChecker;
+    if (!packagedVersion.isEmpty()) {
+        updateChecker = std::make_unique<update::WindowsUpdateChecker>(packagedVersion,
+            [&updateNotice, &icon](const update::WindowsRelease &release) {
+                if (updateNotice)
+                    updateNotice->close();
+                auto *notice = new QMessageBox(QMessageBox::Information, QStringLiteral("Доступно обновление"),
+                    QStringLiteral("Доступна версия Битрикс24 %1 для Windows.").arg(release.tag), QMessageBox::Close);
+                updateNotice = notice;
+                notice->setAttribute(Qt::WA_DeleteOnClose);
+                notice->setAttribute(Qt::WA_ShowWithoutActivating);
+                notice->setWindowModality(Qt::NonModal);
+                notice->setTextFormat(Qt::PlainText);
+                notice->setWindowIcon(icon);
+                auto *download = notice->addButton(QStringLiteral("Скачать ZIP"), QMessageBox::AcceptRole);
+                notice->setDefaultButton(QMessageBox::Close);
+                QObject::connect(download, &QPushButton::clicked, notice, [url = release.downloadUrl] {
+                    QDesktopServices::openUrl(url);
+                });
+                notice->show();
+            },
+            [&updates](const update::WindowsRelease &release) {
+                updates.publish(release.tag, release.downloadUrl);
+            });
+        updateChecker->start();
+    }
+#endif
+
     auto session = sessionFromBrowser(parser.value(portalOpt), portalGiven);
     while (session.isValid()) {
         const auto origin = session.origin;
         {
             CloudBackend backend(std::move(session), allowLoopback);
-            const auto result = runWorkspace(app, icon, backend, &backend, false, origin);
+            const auto result = runWorkspace(app, icon, backend, &backend, false, origin, &updates);
             if (!result.loggedOut)
                 return result.exitCode;
         }

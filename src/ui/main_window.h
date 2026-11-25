@@ -45,6 +45,20 @@ namespace ui { class WorktimePanel; class ChatVideoPreviews; }
 namespace ui { class ProjectToolsDialog; }
 namespace ui { class AvatarBadge; class ChatComposer; class HistoryList; class PinnedMessageBar; class TaskCardDialog; class TaskEditForm; class NameDialog; class StageManagerDialog; class GlyphButton; }
 
+class ClientUpdateFeed final : public QObject {
+    Q_OBJECT
+public:
+    void publish(const QString &tag, const QUrl &downloadUrl);
+    const Notification &notice() const { return m_notice; }
+    void markRead();
+
+signals:
+    void changed();
+
+private:
+    Notification m_notice;
+};
+
 class MainWindow final : public QMainWindow {
     Q_OBJECT
 public:
@@ -59,6 +73,7 @@ public:
     // Opens a clicked message link: own-portal task links open the native task card,
     // other safe http(s) links keep the browser behaviour.
     void openMessageLink(const QString &href, QWidget *source = nullptr);
+    void setClientUpdateFeed(ClientUpdateFeed *feed);
     void setLogoutAvailable(bool available);
     void setSessionRecoveryAvailable(bool available);
     bool confirmWorkspaceClose();
@@ -409,6 +424,7 @@ private:
     QListWidget *m_notifications = nullptr;
     QLabel *m_notificationsEmpty = nullptr;
     QVector<QVector<NotificationTarget>> m_noticeTargets;
+    QPointer<ClientUpdateFeed> m_clientUpdates;
     QVector<Notification> m_noticeHistory;
     QVector<Notification> m_noticeSearchResults;
     QString m_noticeSelectedId;
