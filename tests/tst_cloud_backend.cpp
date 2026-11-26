@@ -287,6 +287,7 @@ public:
     bool legacyProjectFallbackFixture = false;
     bool editableTaskFixture = false;
     QJsonObject actionTaskLegacy;
+    QJsonArray taskAttachmentRows;
     QByteArray taskLegacyResponseOverride;
     QByteArray taskCurrentResponseOverride;
     QJsonObject actionTaskCurrent;
@@ -911,6 +912,8 @@ private:
             return ajaxResult("{\"columns\":" + columns +
                 R"(,"items":[{"id":"42","columnId":50,"data":{"name":"Проверить маршрут"}}]})");
         }
+        if (action == QStringLiteral("tasks.v2.File.listObjects"))
+            return ajaxResult(QJsonDocument(taskAttachmentRows).toJson(QJsonDocument::Compact));
         if (action == QStringLiteral("tasks.task.get")) {
             if (!taskLegacyResponseOverride.isEmpty())
                 return taskLegacyResponseOverride;
@@ -1175,6 +1178,7 @@ private slots:
     void desktopBannersCatchUpFromHistory_data();
     void desktopBannersCatchUpFromHistory();
     void refusesToFollowRedirectWithSession();
+    void dispatchesPullByModuleAndDeduplicatesAcrossModules();
     void sendsTaskEditsAndKanbanMutations();
     void confirmedKanbanMoveSupersedesOutstandingBoardRead();
     void readsAndChangesStageColorWithoutRenaming();
@@ -1240,6 +1244,7 @@ private slots:
     void taskCardRequiresTheMatchingLegacyResponse_data();
     void taskCardRequiresTheMatchingLegacyResponse();
     void discardsParallelTaskCardFromPreviousAccount();
+    void discardsTaskAttachmentsFromPreviousAccount();
     void discardsCachedChatDataFromPreviousAccount();
     void discardsPendingProjectsAndPullCursorFromPreviousAccount();
     void settlesPendingSendOnAccountChange();
@@ -2202,6 +2207,37 @@ void TestCloudBackend::discardsParallelTaskCardFromPreviousAccount()
     QCOMPARE(cards.size(), 1);
     for (const auto &summary : summaries)
         QCOMPARE(summary.first().value<Task>().name, QStringLiteral("Current account task"));
+}
+
+void TestCloudBackend::discardsTaskAttachmentsFromPreviousAccount()
+{
+    CloudFixture fixture;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,"recentItems":[],"chats":[]})";
+    fixture.actionTaskLegacy = {{"id", 42}, {"ufTaskWebdavFiles", QJsonArray{7}}};
+    fixture.actionTaskCurrent = {{"id", 42}};
+    fixture.taskAttachmentRows = {QJsonObject{{"id", 7}, {"name", "old.txt"}}};
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy accounts(&backend, &Backend::accountScopeChanged);
+    QSignalSpy cards(&backend, &Backend::taskLoaded);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 1);
+
+    fixture.holdNotificationReply = QStringLiteral("tasks.v2.File.listObjects");
+    backend.requestTask(QStringLiteral("42"));
+    QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    QCOMPARE(cards.size(), 1);
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 2);
+    fixture.taskAttachmentRows = {QJsonObject{{"id", 7}, {"name", "current.txt"}}};
+    backend.requestTask(QStringLiteral("42"));
+    QTRY_COMPARE(cards.size(), 3);
+    QCOMPARE(cards.last().first().value<Task>().attachments, QStringList{QStringLiteral("current.txt")});
+    fixture.releaseHeldNotificationReply();
+    QTest::qWait(50);
+    QCOMPARE(cards.size(), 3);
 }
 
 void TestCloudBackend::discardsCachedChatDataFromPreviousAccount()
@@ -7374,6 +7410,31 @@ void TestCloudBackend::refusesToFollowRedirectWithSession()
     QCOMPARE(errors.first().first().toString(), QStringLiteral("projects"));
     QVERIFY(projects.isEmpty());
     QVERIFY(otherOrigin.requests.isEmpty());
+}
+
+void TestCloudBackend::dispatchesPullByModuleAndDeduplicatesAcrossModules()
+{
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy connected(&backend, &Backend::connectionChanged);
+    QSignalSpy invalidated(&backend, &Backend::taskLinkPreviewInvalidated);
+    QSignalSpy notices(&backend, &Backend::notificationsLoaded);
+    backend.start();
+    QTRY_VERIFY(!connected.isEmpty() && connected.last().first().toBool());
+
+    const QJsonObject task{{"fields", QJsonObject{{"ID", 37}, {"GROUP_ID", 5}}}};
+    fixture.pushIm(QStringLiteral("wrong-module"), QStringLiteral("taskUpdate"), task);
+    fixture.pushIm(QStringLiteral("shared-id"), QStringLiteral("taskUpdate"), task, 0, QStringLiteral("tasks"));
+    fixture.pushIm(QStringLiteral("shared-id"), QStringLiteral("notifyAdd"), {{"id", 81}, {"text", "duplicate"}});
+    fixture.pushIm(QStringLiteral("new-id"), QStringLiteral("notifyAdd"), {{"id", 82}, {"text", "new notice"}});
+
+    QTRY_VERIFY(!notices.isEmpty());
+    QCOMPARE(invalidated.size(), 1);
+    QCOMPARE(invalidated.first().first().toString(), QStringLiteral("37"));
+    const auto feed = notices.last().first().value<QVector<Notification>>();
+    QCOMPARE(feed.size(), 1);
+    QCOMPARE(feed.first().id, QStringLiteral("82"));
 }
 
 QTEST_GUILESS_MAIN(TestCloudBackend)

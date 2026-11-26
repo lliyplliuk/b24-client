@@ -6,6 +6,10 @@
 
 namespace bx::cloud_rows {
 
+inline constexpr qsizetype maxAttachmentNames = 100;
+QString plainFileName(QString path);
+QHash<QString, QJsonObject> responseFiles(const QJsonValue &value);
+QString taskFileId(const QString &raw);
 QString string(const QJsonValue &value);
 QString field(const QJsonObject &object, std::initializer_list<const char *> keys);
 QString numericId(const QString &candidate);

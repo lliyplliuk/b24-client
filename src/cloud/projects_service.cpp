@@ -1329,6 +1329,19 @@ void ProjectsService::refreshDirtyBoard()
     requestProjectBoard(m_openBoard);
 }
 
+void ProjectsService::handleTaskPull(const QJsonObject &fields, const QString &groupId, const QString &taskId, qint64 remembered)
+{
+    const auto changedProject = field(fields, {"GROUP_ID", "groupId"});
+    bool hasProject = false;
+    const auto project = changedProject.toLongLong(&hasProject);
+    if (hasProject && !taskId.isEmpty() && project >= 0) {
+        const auto chat = explicitMessageChatId(fields);
+        updateProjectUnreadTask(taskId.toLongLong(), remembered > 0 ? remembered
+            : hasTaskParent(chat) ? chat : 0, project);
+    }
+    invalidateBoardForTask(groupId, taskId);
+}
+
 void ProjectsService::invalidateBoardForTask(const QString &groupId, const QString &taskId)
 {
     // After moving away, the event may identify only the destination board.

@@ -1,5 +1,6 @@
 #include "cloud/cloud_backend.h"
 #include "cloud/cloud_avatars.h"
+#include "cloud/cloud_rows.h"
 #include "cloud/reaction_code.h"
 
 #include "core/download_target.h"
@@ -27,8 +28,13 @@
 namespace bx {
 namespace {
 
+using cloud_rows::field;
+using cloud_rows::maxAttachmentNames;
+using cloud_rows::plainFileName;
+using cloud_rows::responseFiles;
+using cloud_rows::taskFileId;
+
 constexpr qsizetype maxQueryLength = 512;
-constexpr qsizetype maxAttachmentNames = 100;
 constexpr qsizetype chatAssetPageLimit = 50;
 constexpr qint64 chatLinkMaxOffset = 10000;
 constexpr qint64 uploadChunkSize = 10 * 1024 * 1024;
@@ -49,16 +55,6 @@ const QString resultEnvelope = QStringLiteral("result");
 QString text(const QJsonValue &value)
 {
     return value.isDouble() ? QString::number(value.toInteger()) : value.toString();
-}
-
-QString field(const QJsonObject &object, std::initializer_list<const char *> keys)
-{
-    for (const char *key : keys) {
-        const auto value = text(object.value(QLatin1String(key)));
-        if (!value.isEmpty())
-            return value;
-    }
-    return {};
 }
 
 qint64 positiveId(const QString &candidate)
@@ -121,15 +117,6 @@ qint64 groupChatId(const QString &dialog)
     return dialog.startsWith(QLatin1String("chat")) ? positiveId(dialog.mid(4)) : 0;
 }
 
-QString plainFileName(QString path)
-{
-    path.replace(QLatin1Char('\\'), QLatin1Char('/'));
-    path = path.section(QLatin1Char('/'), -1);
-    static const QRegularExpression controls(QStringLiteral("[\\p{Cc}\\p{Cf}]"));
-    path.remove(controls);
-    return path.left(255).trimmed();
-}
-
 QString authorName(const QJsonObject &user)
 {
     if (const auto name = field(user, {"name", "NAME"}); !name.isEmpty())
@@ -143,38 +130,6 @@ QDateTime date(const QJsonValue &value)
     if (value.isDouble() && value.toInteger() > 0)
         return QDateTime::fromSecsSinceEpoch(value.toInteger());
     return QDateTime::fromString(value.toString(), Qt::ISODate);
-}
-
-QHash<QString, QJsonObject> responseFiles(const QJsonValue &value)
-{
-    QHash<QString, QJsonObject> files;
-    auto insert = [&files](const QJsonValue &row, const QString &fallbackId = QString()) {
-        const auto file = row.toObject();
-        auto id = field(file, {"id", "ID"});
-        if (id.isEmpty())
-            id = fallbackId;
-        if (!id.isEmpty())
-            files.insert(id, file);
-    };
-    if (value.isArray()) {
-        for (const auto row : value.toArray())
-            insert(row);
-    } else {
-        const auto fileMap = value.toObject();
-        for (auto it = fileMap.constBegin(); it != fileMap.constEnd(); ++it)
-            insert(it.value(), it.key());
-    }
-    return files;
-}
-
-QString taskFileId(const QString &raw)
-{
-    static const QRegularExpression syntax(QStringLiteral("^n?[0-9]{1,19}$"));
-    if (!syntax.match(raw).hasMatch())
-        return {};
-    const bool diskObject = raw.startsWith(QLatin1Char('n'));
-    const auto number = positiveId(diskObject ? raw.mid(1) : raw);
-    return number == 0 ? QString() : (diskObject ? QStringLiteral("n") : QString()) + QString::number(number);
 }
 
 QJsonObject messageParams(const QJsonObject &message)
@@ -1138,7 +1093,7 @@ void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QStrin
             onDialog(known, id);
             return;
         }
-        loadTask(scopeId, operation, [this, scopeId, operation, onDialog](const QJsonObject &) {
+        m_tasks.loadTask(scopeId, operation, [this, scopeId, operation, onDialog](const QJsonObject &) {
             const auto dialog = m_taskDialogs.value(scopeId);
             const auto chatId = groupChatId(dialog);
             if (chatId == 0) {
@@ -1574,79 +1529,6 @@ void CloudBackend::searchMessages(const QString &scopeId, const QString &query, 
     });
 }
 
-void CloudBackend::loadTaskAttachments(Task task, const QJsonObject &row)
-{
-    if (!m_taskAttachmentRevisions.contains(task.id) && m_taskAttachmentRevisions.size() >= tunables::kPageSizeChats)
-        m_taskAttachmentRevisions.erase(m_taskAttachmentRevisions.begin());
-    const auto revision = ++m_taskAttachmentRevision;
-    m_taskAttachmentRevisions.insert(task.id, revision);
-    auto source = row.value(QStringLiteral("ufTaskWebdavFiles"));
-    if (!source.isArray())
-        source = row.value(QStringLiteral("UF_TASK_WEBDAV_FILES"));
-    if (!source.isArray())
-        source = row.value(QStringLiteral("fileIds"));
-    QJsonArray ids;
-    QSet<QString> requested;
-    for (const auto value : source.toArray()) {
-        const auto id = taskFileId(text(value));
-        if (id.isEmpty() || requested.contains(id))
-            continue;
-        requested.insert(id);
-        ids.append(id.startsWith(QLatin1Char('n')) ? QJsonValue(id) : QJsonValue(id.toLongLong()));
-        if (ids.size() == maxAttachmentNames)
-            break;
-    }
-
-    emit taskLoaded(task);
-    if (ids.isEmpty())
-        return;
-    const auto operation = operationKey(OperationKind::TaskFiles, task.id);
-    const auto key = operation + QLatin1Char(':') + QString::number(revision);
-    ajaxJson(QStringLiteral("tasks.v2.File.listObjects"), {{QStringLiteral("ids"), ids}},
-             operation, [this, task = std::move(task), ids, operation, revision](QJsonValue data) mutable {
-        if (m_taskAttachmentRevisions.value(task.id) != revision)
-            return;
-        if (!data.isArray()) {
-            failShape(operation);
-            return;
-        }
-        const auto files = responseFiles(data);
-        for (const auto id : ids) {
-            const auto fileId = text(id);
-            const auto metadata = files.value(fileId);
-            const auto name = plainFileName(field(metadata, {"name"}));
-            if (name.isEmpty())
-                continue;
-            bool sizeKnown = false;
-            const auto size = metadata.value(QStringLiteral("size")).toVariant().toLongLong(&sizeKnown);
-            const auto exactSize = sizeKnown && size >= 0 ? size : -1;
-            const bool photo = metadata.value(QStringLiteral("isImage")) == true;
-            const auto original = registerMessageFileUrl(field(metadata, {"downloadUrl"}), exactSize, photo);
-            MessageFile file{fileId, name, exactSize, original};
-            file.isImage = photo;
-            auto diskObject = taskFileId(field(metadata.value(QStringLiteral("customData")).toObject(), {"objectId"}));
-            if (!diskObject.isEmpty() && !diskObject.startsWith(QLatin1Char('n')))
-                file.diskObjectId = QLatin1Char('n') + diskObject;
-            if (fileId.startsWith(QLatin1Char('n')))
-                diskObject = fileId.mid(1);
-            if (photo) {
-                file.previewUrl = taskImageUrlFromPortal(field(metadata, {"serverPreviewUrl"}), fileId, diskObject);
-                auto width = positiveId(field(metadata, {"serverPreviewWidth", "width"}));
-                auto height = positiveId(field(metadata, {"serverPreviewHeight", "height"}));
-                if (!file.previewUrl.isEmpty() && width > 0 && height > 0 && width <= 1048576 && height <= 1048576)
-                    file.previewSize = QSize(static_cast<int>(width), static_cast<int>(height));
-                if (file.previewUrl.isEmpty() && !original.isEmpty() && exactSize > 0
-                    && exactSize <= m_messageImageAssets.maxBytes)
-                    file.previewUrl = taskImageUrlFromPortal(original.toString(QUrl::FullyEncoded), fileId, diskObject, true);
-            }
-            task.attachments.append(file.name);
-            task.files.append(std::move(file));
-        }
-        if (!task.attachments.isEmpty())
-            emit taskLoaded(task);
-    }, key);
-}
-
 std::shared_ptr<CloudBackend::Upload> CloudBackend::openUpload(const QString &scopeId,
     const QString &localPath, const QString &kind, const QString &operation)
 {
@@ -1739,11 +1621,11 @@ void CloudBackend::uploadChatAttachment(const QString &scopeId, const QString &l
 
 void CloudBackend::attachTaskFile(const QString &taskId, const QString &localPath)
 {
-    const auto operation = operationKey(OperationKind::AttachTask, taskId);
-    if (positiveId(taskId) == 0) {
-        emit failed(operation, QStringLiteral("Некорректный номер задачи"));
-        return;
-    }
+    m_tasks.attachTaskFile(taskId, localPath);
+}
+
+void CloudBackend::uploadTaskFile(const QString &taskId, const QString &localPath, const QString &operation)
+{
     if (const auto upload = openUpload(taskId, localPath, QStringLiteral("task"), operation))
         uploadChunk(upload, 0);
 }
@@ -1806,9 +1688,12 @@ void CloudBackend::commitUpload(const std::shared_ptr<Upload> &upload)
     const auto fileId = taskFileId(upload->serverFileId);
     if (!fileId.startsWith(QLatin1Char('n')) || fileId != upload->serverFileId)
         return failShape(upload->operation);
-    const auto taskObjectId = upload->chatId == 0 ? fileId : QString();
+    if (upload->chatId == 0) {
+        m_tasks.attachUploadedFile(upload->scopeId, fileId, upload->operation);
+        return;
+    }
     const auto complete = [this, scopeId = upload->scopeId, kind = upload->kind,
-                           operation = upload->operation, taskObjectId, image = upload->image,
+                           operation = upload->operation, image = upload->image,
                            accountScope = upload->accountScope](QJsonValue result) {
         if (image && accountScope != m_accountScopeRevision)
             return;
@@ -1816,17 +1701,8 @@ void CloudBackend::commitUpload(const std::shared_ptr<Upload> &upload)
             failShape(operation);
             return;
         }
-        if (!taskObjectId.isEmpty())
-            emit taskFileAttached(scopeId, taskObjectId);
         emit fileUploaded(scopeId, kind);
     };
-    if (!taskObjectId.isEmpty()) {
-        const QJsonObject task{{QStringLiteral("id"), positiveId(upload->scopeId)}};
-        ajaxJson(QStringLiteral("tasks.v2.File.attach"),
-                 {{QStringLiteral("task"), task}, {QStringLiteral("ids"), QJsonArray{taskObjectId}}},
-                 upload->operation, complete);
-        return;
-    }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.disk.file.commit.json"));
     m_portalHttp.webRequest(url, {{QStringLiteral("chat_id"), QString::number(upload->chatId)},
                      {QStringLiteral("message"), upload->caption},

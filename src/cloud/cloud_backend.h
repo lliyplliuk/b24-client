@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cloud/projects_service.h"
+#include "cloud/tasks_service.h"
 #include "core/backend.h"
 #include "core/session.h"
 #include "core/tunables.h"
@@ -26,7 +27,7 @@ namespace bx {
 
 namespace signin { class SessionRestore; }
 
-class CloudBackend final : public Backend, private PortalSession, private ProjectsHost {
+class CloudBackend final : public Backend, private PortalSession, private ProjectsHost, private TasksHost {
     Q_OBJECT
 
 public:
@@ -196,20 +197,20 @@ private:
     void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser) override;
     void requestCurrentUser(const QString &operation, std::function<void(const QString &)> onUser,
                             const std::shared_ptr<Session> &candidate = {});
+    QByteArray csrfToken() const override { return m_session.csrf; }
+    quint64 unreadBindingRevision() const override { return m_projects.unreadBindingRevision(); }
+    void rememberLoadedTask(const QString &taskId, const QJsonObject &task, quint64 bindingRevision) override;
+    void updateTaskChatProject(const QString &taskId, qint64 project) override;
+    void clearDeletedTaskHistory(const QString &taskId) override;
+    void forgetTaskChat(const QString &taskId) override;
+    QUrl taskFileUrl(const QString &value, qint64 size, bool photo) const override { return registerMessageFileUrl(value, size, photo); }
+    QUrl taskImageUrl(const QString &value, const QString &attachmentId, const QString &objectId,
+                      bool original) const override { return taskImageUrlFromPortal(value, attachmentId, objectId, original); }
+    qsizetype taskImageMaxBytes() const override { return m_messageImageAssets.maxBytes; }
+    void uploadTaskFile(const QString &taskId, const QString &localPath, const QString &operation) override;
     void resetAccountScopedState();
     void rememberCurrentUser(const QString &id);
-    void updateTaskFields(const QString &taskId, QQueue<QPair<QString, QJsonObject>> writes,
-                          const QString &requestKey = {});
-    void updateTaskRequisite(const QString &taskId, const TaskEdit &edit);
-    void loadTask(const QString &taskId, const QString &operation,
-                  std::function<void(QJsonObject)> onTask, const QString &requestKey = {}, bool remember = true);
-    void finishTaskCardRead(const QString &taskId);
     void loadPerson(const QString &id, const QString &operation, PersonHandler onPerson, bool requireName = false);
-    QUrl taskRoleAvatar(const QJsonObject &current, const QJsonObject &legacy, const QString &personId) const;
-    void createTaskRequest(const QString &projectId, const QString &parentId, const TaskEdit &edit);
-    void loadTaskChecklist(const QString &taskId, const QString &operation,
-                           std::function<void(QJsonArray, QJsonValue)> handler);
-    void updateTaskChecklist(const QString &taskId, const QString &action, QJsonObject payload);
     void loadMessages(const QString &key, const QString &dialogId, bool task, bool retry = false);
     void resumeHistoriesWithIdentity();
     void loadRecentChats(bool task, bool badgesOnly = false);
@@ -224,7 +225,7 @@ private:
     void rememberDismissalStatus(const QString &id, std::optional<bool> dismissed);
     std::optional<bool> cachedDismissalStatus(const QString &id) const;
     void resolveTaskChatTitles(QVector<Chat> chats, const QString &key, std::function<void(QVector<Chat>)> deliver);
-    void rememberTaskTitle(const QString &id, const QString &title);
+    void rememberTaskTitle(const QString &id, const QString &title) override;
     QString recentTitle(const QString &dialog, const QString &fallback) const;
     Chat chatFromMetadata(const QString &dialog, const QJsonObject &row, const QJsonObject &chat,
                           const QJsonObject &user);
@@ -237,6 +238,20 @@ private:
     void connectPull();
     void receivePull(const QString &frame);
     void handlePullEvent(const QJsonObject &event);
+    void handleTaskPull(const QString &command, const QJsonObject &params);
+    void handlePresencePull(const QJsonObject &params, const QJsonObject &recentExtra);
+    void handleSettingsPull(const QJsonObject &params);
+    QString pullDialog(const QJsonObject &params, const QString &chatId) const;
+    void handleOpponentReadPull(const QString &dialog, const QJsonObject &params);
+    void handleTypingPull(const QString &dialog, const QJsonObject &params);
+    void handleReactionPull(const QString &dialog, const QJsonObject &params);
+    void handleHistoryRemovalPull(const QString &command, const QString &dialog, const QString &chatId, const QJsonObject &params);
+    void handleMutePull(const QString &dialog, const QJsonObject &params);
+    void handleNotificationStatePull(const QString &command, const QJsonObject &params);
+    void handleImPull(const QString &command, const QJsonObject &params, const QJsonObject &recentExtra, const QString &mid);
+    void prepareMessagePullNotice(Notification &entry, const QString &command, const QString &content, const QJsonObject &params);
+    void preparePortalPullNotice(Notification &entry, const QString &content, const QJsonObject &notification, const QJsonObject &params);
+    void handleIncomingNoticePull(const QString &command, const QString &dialog, const QString &chatId, const QJsonObject &params, const QJsonObject &extra, const QString &mid);
     void loadChatPopupSettings();
     enum class ChatPopupSettingsSource { Push, InitialSnapshot, RefreshSnapshot };
     void applyChatPopupSettings(const QJsonObject &settings, ChatPopupSettingsSource source);
@@ -268,7 +283,7 @@ private:
     bool refreshCsrf(Session candidate, quint64 revision) override;
     void scheduleRefresh() override;
     void refreshDirtyViews();
-    void invalidateTaskChat(const QString &taskId);
+    void invalidateTaskChat(const QString &taskId) override;
     void setOnline(bool online);
     void failShape(const QString &operation) override;
 
@@ -359,7 +374,6 @@ private:
     QSet<QString> m_downloadTargets;
     MediaDownloads m_photoDownloads;
     MediaDownloads m_videoDownloads;
-    void loadTaskAttachments(Task task, const QJsonObject &row);
     void uploadChatAttachment(const QString &scopeId, const QString &localPath, bool task, bool image,
                               const QString &caption, std::shared_ptr<QTemporaryDir> temporaryDirectory = {});
     std::shared_ptr<Upload> openUpload(const QString &scopeId, const QString &localPath,
@@ -367,17 +381,6 @@ private:
     void uploadChunk(const std::shared_ptr<Upload> &upload, qint64 offset);
     void commitUpload(const std::shared_ptr<Upload> &upload);
     QHash<QString, qint64> m_dialogChatIds;
-    struct TaskCardRead {
-        QJsonObject base;
-        QJsonObject details;
-        bool baseFinished = false;
-        bool detailsFinished = false;
-        bool refresh = false;
-    };
-    QHash<QString, TaskCardRead> m_taskCardReads;
-    QHash<QString, quint64> m_taskAttachmentRevisions;
-    quint64 m_taskAttachmentRevision = 0;
-
     struct DialogMessageState {
         qint64 lastReadId = -1;
         qint64 confirmedReadThrough = 0;
@@ -444,6 +447,7 @@ private:
     QNetworkAccessManager m_http;
     PortalHttp m_portalHttp;
     ProjectsService m_projects;
+    TasksService m_tasks;
     QWebSocket m_socket;
     QTimer m_retry;
     QTimer m_watchdog;

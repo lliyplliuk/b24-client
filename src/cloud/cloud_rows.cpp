@@ -2,9 +2,51 @@
 #include "core/tunables.h"
 
 #include <QJsonArray>
+#include <QRegularExpression>
 #include <QSet>
 
 namespace bx::cloud_rows {
+
+QString plainFileName(QString path)
+{
+    path.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    path = path.section(QLatin1Char('/'), -1);
+    static const QRegularExpression controls(QStringLiteral("[\\p{Cc}\\p{Cf}]"));
+    path.remove(controls);
+    return path.left(255).trimmed();
+}
+
+QHash<QString, QJsonObject> responseFiles(const QJsonValue &value)
+{
+    QHash<QString, QJsonObject> files;
+    auto insert = [&files](const QJsonValue &row, const QString &fallbackId = QString()) {
+        const auto file = row.toObject();
+        auto id = field(file, {"id", "ID"});
+        if (id.isEmpty())
+            id = fallbackId;
+        if (!id.isEmpty())
+            files.insert(id, file);
+    };
+    if (value.isArray()) {
+        for (const auto row : value.toArray())
+            insert(row);
+    } else {
+        const auto fileMap = value.toObject();
+        for (auto it = fileMap.constBegin(); it != fileMap.constEnd(); ++it)
+            insert(it.value(), it.key());
+    }
+    return files;
+}
+
+QString taskFileId(const QString &raw)
+{
+    static const QRegularExpression syntax(QStringLiteral("^n?[0-9]{1,19}$"));
+    if (!syntax.match(raw).hasMatch())
+        return {};
+    const bool diskObject = raw.startsWith(QLatin1Char('n'));
+    const auto id = numericId(diskObject ? raw.mid(1) : raw);
+    return diskObject && !id.isEmpty() ? QLatin1Char('n') + id : id;
+}
 
 QString string(const QJsonValue &value)
 {

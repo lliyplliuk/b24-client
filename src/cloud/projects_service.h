@@ -11,14 +11,9 @@
 
 namespace bx {
 
-class ProjectsHost {
+class ProjectsHost : public virtual SessionStateHost {
 public:
-    virtual ~ProjectsHost() = default;
     virtual QUrl portalOrigin() const = 0;
-    virtual quint64 sessionRevision() const = 0;
-    virtual quint64 accountScopeRevision() const = 0;
-    virtual bool started() const = 0;
-    virtual bool authExpired() const = 0;
     virtual QString settingsScope() const = 0;
     virtual QString currentUserId() const = 0;
     virtual void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser) = 0;
@@ -40,7 +35,7 @@ public:
     // The backend publishes cleared unread counts after resetting its chat counter snapshot.
     [[nodiscard]] bool reset();
     void invalidateOpenBoard() { m_boardDirty = !m_openBoard.isEmpty(); }
-    void invalidateBoardForTask(const QString &groupId, const QString &taskId);
+    void handleTaskPull(const QJsonObject &fields, const QString &groupId, const QString &taskId, qint64 remembered);
     bool boardDirty() const { return m_boardDirty; }
     void refreshDirtyBoard();
     bool isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const;
@@ -73,7 +68,6 @@ public:
     void updateProjectUnreadTask(qint64 task, qint64 chat, qint64 project);
     void publishProjectTaskChatBadges(qint64 chatId = 0);
     bool containsChat(qint64 chat) const;
-    bool hasTaskParent(qint64 chat) const { return m_projectUnreadParentsByChat.contains(chat); }
     quint64 unreadBindingRevision() const { return m_projectUnreadBindingRevision; }
 
 signals:
@@ -98,6 +92,8 @@ signals:
     void projectsScopeLoaded(bool membershipVerified);
 
 private:
+    void invalidateBoardForTask(const QString &groupId, const QString &taskId);
+    bool hasTaskParent(qint64 chat) const { return m_projectUnreadParentsByChat.contains(chat); }
     ProjectsHost &m_host;
     PortalHttp &m_portalHttp;
     using Fields = PortalHttp::Fields;

@@ -17,14 +17,18 @@ class TestCloudBackend;
 
 namespace bx {
 
-class PortalSession {
+class SessionStateHost {
 public:
-    virtual ~PortalSession() = default;
-    virtual const Session &currentSession() const = 0;
+    virtual ~SessionStateHost() = default;
     virtual quint64 sessionRevision() const = 0;
     virtual quint64 accountScopeRevision() const = 0;
     virtual bool started() const = 0;
     virtual bool authExpired() const = 0;
+};
+
+class PortalSession : public virtual SessionStateHost {
+public:
+    virtual const Session &currentSession() const = 0;
     virtual bool allowLoopback() const = 0;
     virtual bool isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const = 0;
     virtual bool isCurrentHistory(bool task, const QString &key, const QString &dialog) const = 0;
