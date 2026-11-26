@@ -34,6 +34,8 @@ The demo uses sample data and runs offline without an account.
 
 Native Wayland requires Qt 6.6.2 or newer to restore maximized windows after minimizing. On older Qt versions, the client prefers XWayland when available. You can pass `-platform` to choose a Qt platform explicitly.
 
+For a custom Qt installation with Adwaita window decorations on GNOME Wayland, include the matching Qt SVG module. The decoration plugin needs it to draw the window title bar and its buttons.
+
 To connect to your portal, replace the example URL with your own.
 
 ```bash
