@@ -5384,6 +5384,7 @@ private slots:
         column->setCurrentRow(5);
         const auto *selected = column->currentItem();
         const auto previousPosition = scrollbar->value();
+        const int firstPageMaximum = scrollbar->maximum();
         emit backend->boardTasksPageLoaded(project, firstStage, second, true);
         QVERIFY(column);
         QCOMPARE(column->count(), 49);
@@ -5392,6 +5393,9 @@ private slots:
         QVERIFY(!loadingVisible(status));
         QVERIFY(!status->isVisible());
         QVERIFY(findAccessible<QLabel>(board, QStringLiteral("Задач в колонке: 79")));
+        // Appending rows schedules a list layout independently of the board's queued page check.
+        column->doItemsLayout();
+        QVERIFY(scrollbar->maximum() > firstPageMaximum);
         QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QCOMPARE(backend->boardPageRequests.size(), 1);
 
@@ -5409,10 +5413,12 @@ private slots:
                                                                QStyle::SC_ScrollBarSlider, scrollbar);
         QVERIFY(!handle.isEmpty());
         QTest::mousePress(scrollbar, Qt::LeftButton, Qt::NoModifier, handle.center());
+        QVERIFY(scrollbar->isSliderDown());
         const QPoint bottom(handle.center().x(), scrollbar->height() - 3);
         QMouseEvent drag(QEvent::MouseMove, bottom, scrollbar->mapToGlobal(bottom),
                          Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
         QApplication::sendEvent(scrollbar, &drag);
+        QVERIFY(3 * qint64(scrollbar->value()) >= 2 * qint64(scrollbar->maximum()));
         QTest::mouseRelease(scrollbar, Qt::LeftButton, Qt::NoModifier, bottom);
         QTRY_COMPARE(backend->boardPageRequests.size(), 2);
         QCOMPARE(backend->boardPageRequests.last().second, firstStage);
@@ -5536,6 +5542,7 @@ private slots:
         push.id = QStringLiteral("m-10");
         push.text = QStringLiteral("Свежее сообщение");
         emit backend->chatMessagesLoaded(QStringLiteral("c-1"), QVector<Message>{push, push});
+        QCoreApplication::processEvents();
         QCOMPARE(messages->count(), 1);
         QCOMPARE(messages->item(0)->data(workspace::Detail).toString(), QStringLiteral("Привет из поиска"));
 
