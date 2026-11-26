@@ -2,6 +2,10 @@
 
 #include "ui/loading_indicator.h"
 
+#include <QEvent>
+#include <QStyle>
+#include <QWidget>
+
 namespace bx::workspace {
 
 PreviewAnimation::PreviewAnimation(QWidget *viewport) : m_viewport(viewport)

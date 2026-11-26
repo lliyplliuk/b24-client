@@ -1,3 +1,6 @@
+#include "ui/task_card_dialog.h"
+#include "ui/task_picker_choice_delegate.h"
+#include <QToolButton>
 #include "pilot_fixture.h"
 
 using namespace bx;

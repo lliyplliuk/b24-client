@@ -1,3 +1,4 @@
+#include "ui/history_list.h"
 #include "pilot_fixture.h"
 
 using namespace bx;

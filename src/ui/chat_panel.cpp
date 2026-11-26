@@ -1,6 +1,7 @@
 #include "ui/chat_panel.h"
 #include "ui/chat_widgets.h"
 #include "ui/task_dialogs.h"
+#include "ui/requisite_avatar.h"
 #include "ui/reaction_catalog.h"
 #include "ui/workspace_directory.h"
 #include "ui/workspace_presentation.h"

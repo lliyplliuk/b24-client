@@ -5,6 +5,7 @@
 #include "ui/chat_widgets.h"
 #include "ui/projects_panel.h"
 #include "ui/task_dialogs.h"
+#include "ui/requisite_avatar.h"
 #include "ui/workspace_message_previews.h"
 #include "ui/workspace_message_viewers.h"
 #include "ui/workspace_presentation.h"

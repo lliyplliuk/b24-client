@@ -1,3 +1,4 @@
+#include "ui/chat_photo_canvas.h"
 #include "pilot_fixture.h"
 
 using namespace bx;

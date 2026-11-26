@@ -61,8 +61,6 @@ add_library(bxwidgets STATIC
     src/ui/task_card_controller.h
     src/ui/task_card_controller.cpp
     src/ui/main_window.cpp
-    src/ui/task_dialogs.cpp
-    src/ui/chat_widgets.cpp
     src/ui/avatar_painter.cpp
     src/ui/card_row_painter.cpp
     src/ui/directory_row_painter.cpp
@@ -81,6 +79,54 @@ add_library(bxwidgets STATIC
     src/ui/workspace_row_style.cpp
     src/ui/workspace_rows.cpp
     src/ui/workspace_theme.cpp
+    src/ui/avatar_badge.cpp
+    src/ui/chat_composer.cpp
+    src/ui/chat_image_previews.cpp
+    src/ui/chat_photo_canvas.cpp
+    src/ui/chat_photo_dialog.cpp
+    src/ui/chat_text_edit.cpp
+    src/ui/conversation_canvas.cpp
+    src/ui/emoji_panel.cpp
+    src/ui/emoji_tile.cpp
+    src/ui/gantt_rows.cpp
+    src/ui/glyph_button.cpp
+    src/ui/history_list.cpp
+    src/ui/history_list_interaction.cpp
+    src/ui/loading_clock.cpp
+    src/ui/loading_indicator.cpp
+    src/ui/mention_suggestion_delegate.cpp
+    src/ui/name_dialog.cpp
+    src/ui/people_suggestions.cpp
+    src/ui/photo_viewer_input.cpp
+    src/ui/pinned_message_bar.cpp
+    src/ui/portal_dnd_control.cpp
+    src/ui/reaction_palette.cpp
+    src/ui/requisite_avatar.cpp
+    src/ui/section_rail_painter.cpp
+    src/ui/stage_manager_dialog.cpp
+    src/ui/task_card_actions.cpp
+    src/ui/task_card_dialog.cpp
+    src/ui/task_card_requisites.cpp
+    src/ui/task_content_list.cpp
+    src/ui/task_description/bb_code.cpp
+    src/ui/task_description/decoder.cpp
+    src/ui/task_description/input.cpp
+    src/ui/task_description/mark.cpp
+    src/ui/task_description/safe_document.cpp
+    src/ui/task_description_editor.cpp
+    src/ui/task_detail_editor.cpp
+    src/ui/task_dialog_controls.cpp
+    src/ui/task_edit_form.cpp
+    src/ui/task_fields.cpp
+    src/ui/task_gantt_view.cpp
+    src/ui/task_people_input.cpp
+    src/ui/task_picker_choice_delegate.cpp
+    src/ui/task_picker_choices.cpp
+    src/ui/task_picker_summary.cpp
+    src/ui/task_picker_value_label.cpp
+    src/ui/task_relations_panel.cpp
+    src/ui/task_requisite_row.cpp
+    src/ui/task_selection_field.cpp
     src/ui/composer_send_controller.cpp
     src/ui/chat_panel.h
     src/ui/chat_panel.cpp
@@ -147,6 +193,12 @@ if(Qt6Test_FOUND)
     target_link_libraries(tst_ui_workspace_presentation PRIVATE bxwidgets Qt6::Test)
     add_test(NAME tst_ui_workspace_presentation COMMAND tst_ui_workspace_presentation)
     set_tests_properties(tst_ui_workspace_presentation PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    add_executable(tst_ui_widget_access tests/tst_ui_widget_access.cpp)
+    target_link_libraries(tst_ui_widget_access PRIVATE bxwidgets Qt6::Test)
+    add_test(NAME tst_ui_widget_access COMMAND tst_ui_widget_access)
+    set_tests_properties(tst_ui_widget_access PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    target_sources(tst_public_link_preview PRIVATE src/ui/chat_image_previews.cpp)
     target_link_libraries(tst_message_markup PRIVATE bxwidgets)
     add_executable(tst_signin_session src/signin/session_capture_test.cpp)
     target_link_libraries(tst_signin_session PRIVATE bxchromesignin Qt6::Test)
