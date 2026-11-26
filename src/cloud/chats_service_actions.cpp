@@ -1,6 +1,7 @@
-#include "cloud_backend.h"
+#include "chats_service.h"
 #include "reaction_code.h"
 
+#include "core/backend.h"
 #include "core/origin_guard.h"
 
 #include <QJsonArray>
@@ -43,12 +44,12 @@ bool commandAccepted(const QJsonValue &data)
 
 } // namespace
 
-void CloudBackend::notifyChatTyping(const QString &dialog)
+void ChatsService::notifyChatTyping(const QString &dialog)
 {
     const auto scope = portalDialog(dialog);
-    if (!m_started || !m_foreground || !m_online || scope.isEmpty() || m_authExpired
-        || (m_userId.isEmpty() && !scope.startsWith(QLatin1String("chat"))) || scope == m_userId
-        || (scope != m_openDialog && scope != m_taskDialogs.value(m_openTask)))
+    if (!m_host.started() || !m_host.chatForeground() || !m_host.chatOnline() || scope.isEmpty() || m_host.authExpired()
+        || (m_host.currentUserId().isEmpty() && !scope.startsWith(QLatin1String("chat"))) || scope == m_host.currentUserId()
+        || (scope != m_timeline.openDialog && scope != m_timeline.taskDialogs.value(m_timeline.openTask)))
         return;
     const auto now = QDateTime::currentMSecsSinceEpoch();
     const auto previous = m_lastTypingRequest.value(scope, 0);
@@ -57,29 +58,12 @@ void CloudBackend::notifyChatTyping(const QString &dialog)
     if (!m_lastTypingRequest.contains(scope) && m_lastTypingRequest.size() >= 32)
         m_lastTypingRequest.erase(m_lastTypingRequest.begin());
     m_lastTypingRequest.insert(scope, now);
-    ajaxJson(QStringLiteral("im.v2.Chat.InputAction.notify"),
+    m_portalHttp.ajaxJson(QStringLiteral("im.v2.Chat.InputAction.notify"),
              {{QStringLiteral("dialogId"), scope}, {QStringLiteral("type"), QStringLiteral("writing")}},
              operationKey(OperationKind::ChatTyping, scope), [](const QJsonValue &) {});
 }
 
-void CloudBackend::refreshChangedChat(const QString &dialog, bool pins)
-{
-    if (m_openDialog == dialog)
-        m_chatDirty = true;
-    if (m_taskDialogs.value(m_openTask) == dialog) {
-        if (m_foreground)
-            requestTaskMessages(m_openTask);
-        else
-            m_taskMessagesDirty = true;
-    }
-    if (pins && m_pinnedDialog == dialog)
-        requestPinnedMessages(dialog);
-    if (m_activeSection == 0)
-        m_recentDirty = true;
-    scheduleRefresh();
-}
-
-void CloudBackend::changeMessage(const QString &dialog, const QString &id, MessageAction action, const QString &value)
+void ChatsService::changeMessage(const QString &dialog, const QString &id, MessageAction action, const QString &value)
 {
     const auto scope = portalDialog(dialog);
     const auto message = portalId(id);
@@ -90,7 +74,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
     }
     const auto kind = action == MessageAction::CreateTask ? OperationKind::CreateTaskFromMessage
         : action == MessageAction::Edit ? OperationKind::MessageEdit : OperationKind::MessageAction;
-    const auto operation = reaction ? reactionOperationKey(scope, message, value) : operationKey(kind, scope, message);
+    const auto operation = reaction ? Backend::reactionOperationKey(scope, message, value) : operationKey(kind, scope, message);
     if (scope.isEmpty() || message.isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный диалог или сообщение"));
         return;
@@ -118,7 +102,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
         emit chatActionSucceeded(scope, feedback);
     };
     const auto rest = [this, &operation, &acknowledge](const QString &method, const Fields &fields) {
-        const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/") + method + QStringLiteral(".json"));
+        const auto url = OriginGuard(m_host.portalOrigin()).resolve(QStringLiteral("/rest/") + method + QStringLiteral(".json"));
         m_portalHttp.webRequest(url, fields, operation, QStringLiteral("result"), acknowledge);
     };
 
@@ -127,7 +111,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
     case MessageAction::RemoveReaction: {
         const auto method = action == MessageAction::React ? QStringLiteral("im.v2.Chat.Message.Reaction.add")
                                                            : QStringLiteral("im.v2.Chat.Message.Reaction.delete");
-        ajax(method, {{QStringLiteral("messageId"), QString::number(messageNumber)},
+        m_portalHttp.ajax(method, {{QStringLiteral("messageId"), QString::number(messageNumber)},
                       {QStringLiteral("reaction"), value}}, operation, acknowledge);
         break;
     }
@@ -136,43 +120,43 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
             emit failed(operation, QStringLiteral("Введите сообщение длиной до 20 000 символов"));
             return;
         }
-        ajax(QStringLiteral("im.v2.Chat.Message.update"),
+        m_portalHttp.ajax(QStringLiteral("im.v2.Chat.Message.update"),
              {{QStringLiteral("id"), QString::number(messageNumber)},
               {QStringLiteral("fields[message]"), value}}, operation, acknowledge);
         break;
     case MessageAction::Delete:
-        ajaxJson(QStringLiteral("im.v2.Chat.Message.delete"),
+        m_portalHttp.ajaxJson(QStringLiteral("im.v2.Chat.Message.delete"),
                  {{QStringLiteral("messageIds"), QJsonArray{messageNumber}}}, operation, acknowledge);
         break;
     case MessageAction::CreateTask: {
-        if (!m_started || !m_online) {
+        if (!m_host.started() || !m_host.chatOnline()) {
             emit failed(operation, QStringLiteral("Создание задачи доступно при подключении к порталу"));
             break;
         }
-        if ((m_activeSection != 0 || m_openDialog != scope) &&
-            (m_openTask.isEmpty() || m_taskDialogs.value(m_openTask) != scope)) {
+        if ((!m_host.chatsSectionActive() || m_timeline.openDialog != scope) &&
+            (m_timeline.openTask.isEmpty() || m_timeline.taskDialogs.value(m_timeline.openTask) != scope)) {
             emit failed(operation, QStringLiteral("Откройте исходный чат сообщения"));
             break;
         }
         // A repeated creation command for this message has a single UI acknowledgement.
         if (m_portalHttp.contains(operation))
             return;
-        const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.message.share.json"));
-        const auto account = m_accountScopeRevision;
+        const auto url = OriginGuard(m_host.portalOrigin()).resolve(QStringLiteral("/rest/im.message.share.json"));
+        const auto account = m_host.accountScopeRevision();
         m_portalHttp.webRequest(url, {{QStringLiteral("MESSAGE_ID"), message}, {QStringLiteral("DIALOG_ID"), scope},
                          {QStringLiteral("TYPE"), QStringLiteral("TASK")}},
                    operation, QStringLiteral("result"), [this, operation, scope, account](const QJsonValue &result) {
-            if (account != m_accountScopeRevision)
+            if (account != m_host.accountScopeRevision())
                 return;
             if (result != QJsonValue(true)) {
                 emit failed(operation, QStringLiteral("Портал не подтвердил создание задачи"));
                 return;
             }
-            if (m_activeSection == 0 && m_openDialog == scope)
-                m_chatDirty = true;
-            if (!m_openTask.isEmpty() && m_taskDialogs.value(m_openTask) == scope)
-                m_taskMessagesDirty = true;
-            scheduleRefresh();
+            if (m_host.chatsSectionActive() && m_timeline.openDialog == scope)
+                m_timeline.chatDirty = true;
+            if (!m_timeline.openTask.isEmpty() && m_timeline.taskDialogs.value(m_timeline.openTask) == scope)
+                m_timeline.taskMessagesDirty = true;
+            m_host.scheduleRefresh();
             emit chatActionSucceeded(scope, QStringLiteral("Портал принял запрос на создание задачи"));
         });
         break;
@@ -192,7 +176,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
     }
 }
 
-void CloudBackend::forwardMessage(const QString &source, const QString &id, const QString &target)
+void ChatsService::forwardMessage(const QString &source, const QString &id, const QString &target)
 {
     const auto origin = portalDialog(source);
     const auto destination = portalDialog(target);
@@ -205,11 +189,9 @@ void CloudBackend::forwardMessage(const QString &source, const QString &id, cons
     if (m_portalHttp.contains(operation))
         return;
     const auto uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    m_sentTemplates.enqueue(uuid);
-    if (m_sentTemplates.size() > 64)
-        m_sentTemplates.dequeue();
+    m_timeline.rememberSentTemplate(uuid);
     const QJsonObject fields{{QStringLiteral("forwardIds"), QJsonObject{{uuid, message.toLongLong()}}}};
-    ajaxJson(QStringLiteral("im.v2.Chat.Message.send"),
+    m_portalHttp.ajaxJson(QStringLiteral("im.v2.Chat.Message.send"),
              {{QStringLiteral("dialogId"), destination}, {QStringLiteral("fields"), fields}},
              operation, [this, operation, origin, destination, uuid](const QJsonValue &value) {
         const auto result = value.toObject();
@@ -224,7 +206,7 @@ void CloudBackend::forwardMessage(const QString &source, const QString &id, cons
     });
 }
 
-void CloudBackend::createGroupChat(const QString &title, const QStringList &members)
+void ChatsService::createGroupChat(const QString &title, const QStringList &members)
 {
     const auto op = operationKey(OperationKind::CreateChat);
     const auto name = title.trimmed();
@@ -232,7 +214,7 @@ void CloudBackend::createGroupChat(const QString &title, const QStringList &memb
         emit failed(op, QStringLiteral("Укажите название и от 1 до 50 участников"));
         return;
     }
-    const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.v2.Chat.add.json"));
+    const auto url = OriginGuard(m_host.portalOrigin()).resolve(QStringLiteral("/rest/im.v2.Chat.add.json"));
     Fields fields{{QStringLiteral("fields[title]"), name}, {QStringLiteral("fields[type]"), QStringLiteral("CHAT")},
                   {QStringLiteral("fields[searchable]"), QStringLiteral("N")}};
     QSet<QString> seen;
@@ -257,7 +239,7 @@ void CloudBackend::createGroupChat(const QString &title, const QStringList &memb
     });
 }
 
-void CloudBackend::changeChatMember(const QString &dialog, const QString &user, bool add)
+void ChatsService::changeChatMember(const QString &dialog, const QString &user, bool add)
 {
     const auto scope = portalDialog(dialog);
     const auto id = portalId(user);
@@ -266,7 +248,7 @@ void CloudBackend::changeChatMember(const QString &dialog, const QString &user, 
         emit failed(op, QStringLiteral("Нужен групповой чат и числовой ID участника"));
         return;
     }
-    const auto url = OriginGuard(m_session.origin).resolve(add ? QStringLiteral("/rest/im.chat.user.add.json")
+    const auto url = OriginGuard(m_host.portalOrigin()).resolve(add ? QStringLiteral("/rest/im.chat.user.add.json")
                                                                : QStringLiteral("/rest/im.v2.Chat.deleteUser.json"));
     const auto fields = add ? Fields{{QStringLiteral("CHAT_ID"), scope.mid(4)},
                                      {QStringLiteral("USERS[0]"), id}, {QStringLiteral("HIDE_HISTORY"), QStringLiteral("Y")}}
@@ -279,6 +261,23 @@ void CloudBackend::changeChatMember(const QString &dialog, const QString &user, 
         refreshChangedChat(scope);
         emit chatActionSucceeded(scope, add ? QStringLiteral("Участник добавлен") : QStringLiteral("Участник удалён"));
     });
+}
+
+void ChatsService::refreshChangedChat(const QString &dialog, bool pins)
+{
+    if (m_timeline.openDialog == dialog)
+        m_timeline.chatDirty = true;
+    if (m_timeline.taskDialogs.value(m_timeline.openTask) == dialog) {
+        if (m_host.chatForeground())
+            requestTaskMessages(m_timeline.openTask);
+        else
+            m_timeline.taskMessagesDirty = true;
+    }
+    if (pins && m_pinnedDialog == dialog)
+        requestPinnedMessages(dialog);
+    if (m_host.chatsSectionActive())
+        m_timeline.recentDirty = true;
+    m_host.scheduleRefresh();
 }
 
 } // namespace bx

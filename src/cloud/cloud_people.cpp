@@ -1,6 +1,9 @@
 #include "cloud/cloud_backend.h"
 
 #include "core/notification_targets.h"
+#include "core/message_markup.h"
+#include "core/origin_guard.h"
+#include "cloud/cloud_rows.h"
 
 #include <QJsonArray>
 #include <QRegularExpression>
@@ -33,6 +36,12 @@ QString personName(const QJsonObject &user)
         name = first + u' ' + last;
     }
     return name.simplified().left(96);
+}
+
+QString jsonString(const QJsonObject &object, const QString &key, const QString &alias = {})
+{
+    const auto value = object.value(key).toString();
+    return value.isEmpty() && !alias.isEmpty() ? object.value(alias).toString() : value;
 }
 
 constexpr int peopleLimit = 20;
@@ -137,7 +146,7 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
     const auto context = mention ? u"IM_CHAT_SEARCH"_s : u"tasks-card"_s;
     QJsonObject options;
     if (mention) {
-        const qint64 chat = groupId.isEmpty() ? m_dialogChatIds.value(userId) : groupId.toLongLong();
+        const qint64 chat = groupId.isEmpty() ? m_timeline.dialogChatIds.value(userId) : groupId.toLongLong();
         options = {{u"exclude"_s, QJsonArray{u"chats"_s}}, {u"contextChatId"_s, chat}, {u"mentionSearch"_s, true}};
     } else {
         options = {{u"emailUsers"_s, true}, {u"inviteGuestLink"_s, true}, {u"analyticsSource"_s, u"tasks"_s}};
@@ -177,6 +186,46 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
              [deliver, mention](QJsonValue data) {
         const auto items = data.toObject().value(u"dialog"_s).toObject().value(u"items"_s).toArray();
         deliver(items, true, mention);
+    });
+}
+
+void CloudBackend::requestPerson(const QString &id)
+{
+    const auto operation = operationKey(OperationKind::Person, id);
+    if (portalTaskIdentifier(id).isEmpty()) {
+        emit failed(operation, QStringLiteral("Некорректный идентификатор пользователя"));
+        return;
+    }
+    loadPerson(id, operation, [this, operation](const Person &person) {
+        if (person.id.isEmpty())
+            return failShape(operation);
+        emit personLoaded(person);
+    });
+}
+
+void CloudBackend::loadPerson(const QString &id, const QString &operation, PersonHandler onPerson, bool requireName)
+{
+    const auto expected = portalTaskIdentifier(id);
+    const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.get.json"));
+    m_portalHttp.webRequest(url, {{QStringLiteral("ID"), expected}}, operation, QStringLiteral("result"),
+               [this, expected, requireName, onPerson = std::move(onPerson)](QJsonValue response) {
+        const auto profile = response.toObject();
+        if (portalTaskIdentifier(cloud_rows::string(profile.value(QStringLiteral("id")))) != expected)
+            return onPerson({});
+        auto name = profile.value(QStringLiteral("name")).toString();
+        if (name.isEmpty()) {
+            name = (jsonString(profile, QStringLiteral("first_name"), QStringLiteral("firstName")) + QLatin1Char(' ')
+                    + jsonString(profile, QStringLiteral("last_name"), QStringLiteral("lastName"))).trimmed();
+        }
+        name = markup::plainText(name, markup::TextFormat::PortalNotification).left(96);
+        if (requireName && name.isEmpty())
+            return onPerson({});
+        if (name.isEmpty())
+            name = QStringLiteral("Пользователь №%1").arg(expected);
+        const auto rawPosition = jsonString(profile, QStringLiteral("work_position"), QStringLiteral("workPosition"));
+        const auto position = markup::plainText(rawPosition, markup::TextFormat::PortalNotification).left(160);
+        const auto avatar = avatarUrlFromPortal(jsonString(profile, QStringLiteral("avatar"), QStringLiteral("avatarUrl")));
+        onPerson({expected, name, position, avatar});
     });
 }
 

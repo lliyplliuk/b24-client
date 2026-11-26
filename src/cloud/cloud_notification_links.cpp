@@ -1,4 +1,4 @@
-#include "cloud/cloud_backend.h"
+#include "cloud/cloud_rows.h"
 #include "cloud/cloud_notification_links.h"
 
 #include "core/notification_targets.h"
@@ -20,31 +20,11 @@ constexpr qsizetype maxTargets = 8;
 constexpr int maxLinkCandidates = 64;
 const auto authorPlaceholder = QLatin1String("#AUTHOR#");
 
-QString integerId(const QString &value)
-{
-    if (value.isEmpty() || value.size() > 19
-        || std::any_of(value.cbegin(), value.cend(), [](QChar c) { return c < QLatin1Char('0') || c > QLatin1Char('9'); }))
-        return {};
-    const auto number = value.toLongLong();
-    return number > 0 ? QString::number(number) : QString();
-}
-
-QString valueId(const QJsonValue &value)
-{
-    return integerId(value.isDouble() ? QString::number(value.toInteger()) : value.toString());
-}
-
 QString dialogIdentifier(const QString &value)
 {
     const bool group = value.startsWith(QLatin1String("chat"));
-    const auto id = integerId(group ? value.mid(4) : value);
+    const auto id = portalTaskIdentifier(group ? value.mid(4) : value);
     return id.isEmpty() || !group ? id : QStringLiteral("chat") + id;
-}
-
-QString jsonString(const QJsonObject &object, const QString &key, const QString &alias = {})
-{
-    const auto value = object.value(key).toString();
-    return value.isEmpty() && !alias.isEmpty() ? object.value(alias).toString() : value;
 }
 
 struct RawLink {
@@ -140,7 +120,7 @@ std::optional<NotificationTarget> onlineTarget(const QUrl &url)
         return std::nullopt;
     const bool taskChat = !tasks.isEmpty();
     const auto dialog = dialogIdentifier(taskChat ? tasks.first() : dialogs.first());
-    const auto message = messages.isEmpty() ? QString() : integerId(messages.first());
+    const auto message = messages.isEmpty() ? QString() : portalTaskIdentifier(messages.first());
     if (dialog.isEmpty() || (taskChat && !dialog.startsWith(QLatin1String("chat")))
         || (!messages.isEmpty() && message.isEmpty()))
         return std::nullopt;
@@ -257,7 +237,7 @@ std::optional<NotificationTarget> portalLinkTarget(const QUrl &portal, const QUr
         return NotificationTarget{NotificationTargetKind::Person, id, {}, {}, QStringLiteral("Профиль")};
 
     static const QRegularExpression project(QStringLiteral("^/workgroups/group/([0-9]+)(?:/tasks(?:/kanban)?)?/?$"));
-    if (const auto id = integerId(project.match(path).captured(1)); !id.isEmpty())
+    if (const auto id = portalTaskIdentifier(project.match(path).captured(1)); !id.isEmpty())
         return NotificationTarget{NotificationTargetKind::Project, id, {}, id, QStringLiteral("Проект")};
     return std::nullopt;
 }
@@ -330,7 +310,7 @@ void decodeNotificationContent(Notification &notification, const QUrl &portal, c
                                const QJsonObject &params, const QString &authorId, const QString &authorName)
 {
     const auto component = params.value(QStringLiteral("COMPONENT_PARAMS")).toObject();
-    const auto userId = integerId(authorId);
+    const auto userId = portalTaskIdentifier(authorId);
     const auto name = userId.isEmpty() ? QString()
         : notificationDisplayText(authorName.left(256)).remove(authorPlaceholder).simplified();
     const auto authorLink = name.isEmpty() ? QString()
@@ -416,13 +396,13 @@ std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &param
                                                         bool allowMissingMessageId)
 {
     const auto message = params.value(QStringLiteral("message")).toObject();
-    const auto messageId = valueId(message.value(QStringLiteral("id")));
+    const auto messageId = portalTaskIdentifier(cloud_rows::string(message.value(QStringLiteral("id"))));
     const auto rawDialog = params.value(QStringLiteral("dialogId"));
-    auto dialog = rawDialog.isDouble() ? valueId(rawDialog) : dialogIdentifier(rawDialog.toString());
-    auto chatId = valueId(params.value(QStringLiteral("chatId")));
-    auto messageChat = valueId(message.value(QStringLiteral("chatId")));
+    auto dialog = rawDialog.isDouble() ? portalTaskIdentifier(cloud_rows::string(rawDialog)) : dialogIdentifier(rawDialog.toString());
+    auto chatId = portalTaskIdentifier(cloud_rows::string(params.value(QStringLiteral("chatId"))));
+    auto messageChat = portalTaskIdentifier(cloud_rows::string(message.value(QStringLiteral("chatId"))));
     if (messageChat.isEmpty())
-        messageChat = valueId(message.value(QStringLiteral("chat_id")));
+        messageChat = portalTaskIdentifier(cloud_rows::string(message.value(QStringLiteral("chat_id"))));
     if (!messageChat.isEmpty() && !chatId.isEmpty() && messageChat != chatId)
         return std::nullopt;
     if (chatId.isEmpty())
@@ -434,100 +414,6 @@ std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &param
         || (dialog.startsWith(QLatin1String("chat")) && !chatId.isEmpty() && dialog.mid(4) != chatId))
         return std::nullopt;
     return NotificationTarget{NotificationTargetKind::Chat, dialog, messageId, {}, QStringLiteral("Открыть сообщение")};
-}
-
-void CloudBackend::requestMessageContext(const QString &dialogId, const QString &messageId)
-{
-    const auto operation = operationKey(OperationKind::MessageContext, dialogId, messageId);
-    const auto expectedMessage = integerId(messageId);
-    if (expectedMessage.isEmpty()) {
-        emit failed(operation, QStringLiteral("Некорректный идентификатор сообщения"));
-        return;
-    }
-    resolveDialog(dialogId, false, operation, operation,
-                  [this, dialogId, messageId, expectedMessage, operation](const QString &canonicalDialog, qint64 chatId) {
-        // The browser uses this batch for context and marks the message read in a separate command.
-        // Loading a context here only needs the read-only command in that batch.
-        const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
-        const auto method = QStringLiteral("im.v2.Chat.Message.getContext?id=%1&range=25").arg(expectedMessage);
-        m_portalHttp.webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")}, {QStringLiteral("cmd[context]"), method}},
-                   operation, QStringLiteral("result"),
-                   [this, dialogId, messageId, canonicalDialog, expectedMessage, chatId, operation](QJsonValue batch) {
-            const auto result = batch.toObject().value(QStringLiteral("result")).toObject();
-            const auto context = result.value(QStringLiteral("context")).toObject();
-            const auto rows = context.value(QStringLiteral("messages"));
-            if (!rows.isArray())
-                return failShape(operation);
-            const auto expectedChat = QString::number(chatId);
-            const auto rootChatId = context.value(QStringLiteral("chatId"));
-            const auto contextChatId = context.value(QStringLiteral("chat")).toObject().value(QStringLiteral("id"));
-            if ((!rootChatId.isUndefined() && valueId(rootChatId) != expectedChat)
-                || (!contextChatId.isUndefined() && valueId(contextChatId) != expectedChat))
-                return failShape(operation);
-            bool found = false;
-            for (const auto value : rows.toArray()) {
-                const auto row = value.toObject();
-                const auto camelChat = row.value(QStringLiteral("chatId"));
-                const auto snakeChat = row.value(QStringLiteral("chat_id"));
-                if ((camelChat.isUndefined() && snakeChat.isUndefined())
-                    || (!camelChat.isUndefined() && valueId(camelChat) != expectedChat)
-                    || (!snakeChat.isUndefined() && valueId(snakeChat) != expectedChat)) {
-                    emit failed(operation, QStringLiteral("Полученное сообщение относится к другому чату"));
-                    return;
-                }
-                if (valueId(row.value(QStringLiteral("id"))) == expectedMessage)
-                    found = true;
-            }
-            if (!found) {
-                emit failed(operation, QStringLiteral("Сообщение отсутствует в истории чата"));
-                return;
-            }
-            const auto messages = decodeMessages(context, true, canonicalDialog);
-            if (std::none_of(messages.cbegin(), messages.cend(), [&](const auto &message) { return message.id == expectedMessage; }))
-                return failShape(operation);
-            emit messageContextLoaded(dialogId, messageId, messages);
-        });
-    });
-}
-
-void CloudBackend::requestPerson(const QString &id)
-{
-    const auto operation = operationKey(OperationKind::Person, id);
-    if (integerId(id).isEmpty()) {
-        emit failed(operation, QStringLiteral("Некорректный идентификатор пользователя"));
-        return;
-    }
-    loadPerson(id, operation, [this, operation](const Person &person) {
-        if (person.id.isEmpty())
-            return failShape(operation);
-        emit personLoaded(person);
-    });
-}
-
-void CloudBackend::loadPerson(const QString &id, const QString &operation, PersonHandler onPerson, bool requireName)
-{
-    const auto expected = integerId(id);
-    const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.get.json"));
-    m_portalHttp.webRequest(url, {{QStringLiteral("ID"), expected}}, operation, QStringLiteral("result"),
-               [this, expected, requireName, onPerson = std::move(onPerson)](QJsonValue response) {
-        const auto profile = response.toObject();
-        if (valueId(profile.value(QStringLiteral("id"))) != expected)
-            return onPerson({});
-        auto name = profile.value(QStringLiteral("name")).toString();
-        if (name.isEmpty()) {
-            name = (jsonString(profile, QStringLiteral("first_name"), QStringLiteral("firstName")) + QLatin1Char(' ')
-                    + jsonString(profile, QStringLiteral("last_name"), QStringLiteral("lastName"))).trimmed();
-        }
-        name = markup::plainText(name, markup::TextFormat::PortalNotification).left(96);
-        if (requireName && name.isEmpty())
-            return onPerson({});
-        if (name.isEmpty())
-            name = QStringLiteral("Пользователь №%1").arg(expected);
-        const auto rawPosition = jsonString(profile, QStringLiteral("work_position"), QStringLiteral("workPosition"));
-        const auto position = markup::plainText(rawPosition, markup::TextFormat::PortalNotification).left(160);
-        const auto avatar = avatarUrlFromPortal(jsonString(profile, QStringLiteral("avatar"), QStringLiteral("avatarUrl")));
-        onPerson({expected, name, position, avatar});
-    });
 }
 
 } // namespace bx

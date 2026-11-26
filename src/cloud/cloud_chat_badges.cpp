@@ -1,3 +1,4 @@
+#include "cloud_chat_metadata.h"
 #include "cloud_backend.h"
 
 #include "cloud_badge_data.h"
@@ -103,7 +104,7 @@ void CloudBackend::loadChatBadges()
     if (!m_started || m_authExpired || m_badgePagePending || m_portalHttp.contains(snapshotOperation)
         || (m_chatBadgeRefresh.isValid() && !m_chatBadgeRefresh.hasExpired(badgeRefreshIntervalMs)))
         return;
-    const auto revision = ++m_chatBadgeRevision;
+    const auto revision = ++m_timeline.chatBadgeRevision;
     const auto scope = m_accountScopeRevision;
     const auto statusRevision = m_portalStatusRevision;
     const auto anchorRevision = m_anchorRevision;
@@ -174,13 +175,13 @@ void CloudBackend::applyChatCounterSnapshot(const QJsonArray &rows, quint64 revi
         }
     }
     m_haveCounterSnapshot = true;
-    m_chatCounterSnapshotRevision = revision;
+    m_timeline.chatCounterSnapshotRevision = revision;
     m_chatCounterSnapshotTotal = 0;
     for (const auto &badge : std::as_const(counters))
         m_chatCounterSnapshotTotal += visibleUnreadCount(badge.unread, badge.marked);
     m_chatCounterBadges = std::move(counters);
     m_projects.setChatClassification(std::move(taskParents), std::move(nonTaskChats));
-    for (auto it = m_recentOverlays.begin(); it != m_recentOverlays.end(); ++it) {
+    for (auto it = m_timeline.recentOverlays.begin(); it != m_timeline.recentOverlays.end(); ++it) {
         if (it->counterRevision <= revision) {
             it->counter.reset();
             it->markedUnread.reset();
@@ -207,7 +208,7 @@ void CloudBackend::publishUnreadChatCount()
     };
     QHash<qint64, Entry> changes;
     if (!m_haveCounterSnapshot) {
-        for (const auto *rows : {&m_recentChatItems, &m_recentTaskChatItems, &m_legacyTaskChats}) {
+        for (const auto *rows : {&m_timeline.recentChatItems, &m_timeline.recentTaskChatItems, &m_timeline.legacyTaskChats}) {
             for (const auto &chat : *rows) {
                 const auto key = keyFor(chat.id, chat.serverChatId);
                 if (key == 0 || (chat.unread <= 0 && !chat.markedUnread))
@@ -218,7 +219,7 @@ void CloudBackend::publishUnreadChatCount()
             }
         }
     }
-    for (auto it = m_recentOverlays.cbegin(); it != m_recentOverlays.cend(); ++it) {
+    for (auto it = m_timeline.recentOverlays.cbegin(); it != m_timeline.recentOverlays.cend(); ++it) {
         if (!it->counter && !it->markedUnread)
             continue;
         const auto key = keyFor(it.key(), it->chatId);
@@ -257,7 +258,7 @@ QHash<qint64, int> CloudBackend::chatMessageCounters() const
         if (it->messageCount > 0)
             candidates.insert(it.key(), it->messageCount);
     }
-    for (auto it = m_recentOverlays.cbegin(); it != m_recentOverlays.cend(); ++it) {
+    for (auto it = m_timeline.recentOverlays.cbegin(); it != m_timeline.recentOverlays.cend(); ++it) {
         if (!it->counter || it->chatId <= 0 || it.key() != QStringLiteral("chat") + QString::number(it->chatId))
             continue;
         if (*it->counter > 0)
@@ -270,24 +271,24 @@ QHash<qint64, int> CloudBackend::chatMessageCounters() const
 
 void CloudBackend::resetChatCounters()
 {
-    ++m_recentStatusGeneration;
-    m_chatBadgeRevision = 0;
-    m_chatCounterSnapshotRevision = 0;
+    m_chats.invalidateRecentStatuses();
+    m_timeline.chatBadgeRevision = 0;
+    m_timeline.chatCounterSnapshotRevision = 0;
     m_badgePagePending = false;
     m_badgePageOvertaken = false;
     m_chatBadgeRefresh.invalidate();
     m_haveCounterSnapshot = false;
     m_chatCounterSnapshotTotal = 0;
     m_chatCounterBadges.clear();
-    m_recentOverlays.clear();
-    m_recentChatItems.clear();
-    m_recentTaskChatItems.clear();
-    m_legacyTaskChats.clear();
+    m_timeline.recentOverlays.clear();
+    m_timeline.recentChatItems.clear();
+    m_timeline.recentTaskChatItems.clear();
+    m_timeline.legacyTaskChats.clear();
 }
 
 qint64 CloudBackend::badgeChatId(const QString &dialog) const
 {
-    const auto id = m_dialogChatIds.value(dialog);
+    const auto id = m_timeline.dialogChatIds.value(dialog);
     if (id > 0)
         return id;
     if (dialog.startsWith(QLatin1String("chat")))
@@ -415,8 +416,8 @@ bool CloudBackend::handleAnchorPull(const QString &command, const QJsonObject &p
 
 void CloudBackend::notifyAnchorAvailable(qint64 chatId)
 {
-    const auto ordinary = m_activeSection == 0 ? m_openDialog : QString{};
-    const auto task = m_taskDialogs.value(m_openTask);
+    const auto ordinary = m_activeSection == 0 ? m_timeline.openDialog : QString{};
+    const auto task = m_timeline.taskDialogs.value(m_timeline.openTask);
     for (const auto &dialog : {ordinary, task}) {
         if (dialog.isEmpty())
             continue;
@@ -436,18 +437,18 @@ void CloudBackend::republishChatBadges(qint64 changedChatId)
                 return (row.serverChatId > 0 ? row.serverChatId : badgeChatId(row.id)) == changedChatId;
             }));
     };
-    if (affected(m_recentChatItems))
-        publishRecentChats(m_recentChatItems, false);
-    if (affected(m_recentTaskChatItems))
-        publishRecentChats(m_recentTaskChatItems, true);
+    if (affected(m_timeline.recentChatItems))
+        m_chats.publishRecentChats(m_timeline.recentChatItems, false);
+    if (affected(m_timeline.recentTaskChatItems))
+        m_chats.publishRecentChats(m_timeline.recentTaskChatItems, true);
     m_projects.publishProjectTaskChatBadges(changedChatId);
 }
 
 void CloudBackend::decorateProjectTaskChat(Chat &chat) const
 {
     decorateChatBadges(chat);
-    const auto live = m_recentOverlays.constFind(chat.id);
-    if (live == m_recentOverlays.cend() || live->chatId != chat.serverChatId)
+    const auto live = m_timeline.recentOverlays.constFind(chat.id);
+    if (live == m_timeline.recentOverlays.cend() || live->chatId != chat.serverChatId)
         return;
     if (live->counter)
         chat.unread = *live->counter;
@@ -463,20 +464,12 @@ void CloudBackend::readChatMessages(const QString &dialog, const QStringList &in
 void CloudBackend::readTaskChatMessages(const QString &task, const QStringList &incoming, const QStringList &visible)
 {
     if (!task.isEmpty())
-        readVisibleChat(m_taskDialogs.value(task), incoming, visible, task);
-}
-
-std::optional<int> CloudBackend::unreadCount(const QJsonValue &value)
-{
-    bool parsed = true;
-    const auto count = value.isString() ? value.toString().toLongLong(&parsed) : value.toInteger(-1);
-    return parsed && count >= 0 && count <= std::numeric_limits<int>::max()
-        ? std::optional<int>(int(count)) : std::nullopt;
+        readVisibleChat(m_timeline.taskDialogs.value(task), incoming, visible, task);
 }
 
 void CloudBackend::applyReadHistory(const QString &dialog, const QJsonObject &receipt, const QStringList &submitted)
 {
-    auto &state = dialogMessageState(dialog);
+    auto &state = m_timeline.dialogMessageState(dialog);
     const auto exact = receipt.value(QStringLiteral("exact"));
     const bool fromPush = submitted.isEmpty();
     // A scoped HTTP acknowledgement only confirms its submitted IDs. Only an accepted
@@ -521,7 +514,7 @@ void CloudBackend::applyReadHistory(const QString &dialog, const QJsonObject &re
         state.exactlyRead.insert(id);
     }
     if (through > 0 || !confirmedIds.isEmpty()) {
-        state.readReceiptRevision = ++m_chatBadgeRevision;
+        state.readReceiptRevision = ++m_timeline.chatBadgeRevision;
         emit chatReadConfirmed(dialog, confirmedIds, through);
     }
 }
@@ -529,8 +522,8 @@ void CloudBackend::applyReadHistory(const QString &dialog, const QJsonObject &re
 void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &incoming, const QStringList &visible,
                                     const QString &task)
 {
-    const bool selected = task.isEmpty() ? m_activeSection == 0 && dialog == m_openDialog
-        : task == m_openTask && dialog == m_taskDialogs.value(task);
+    const bool selected = task.isEmpty() ? m_activeSection == 0 && dialog == m_timeline.openDialog
+        : task == m_timeline.openTask && dialog == m_timeline.taskDialogs.value(task);
     if (!m_started || !m_foreground || m_authExpired || dialog.isEmpty() || !selected)
         return;
     const auto chatId = badgeChatId(dialog);
@@ -539,7 +532,7 @@ void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &inc
     readVisibleAnchors(chatId, visible.isEmpty() ? incoming : visible);
 
     const auto operation = operationKey(OperationKind::ReadVisibleMessages, dialog);
-    auto &state = dialogMessageState(dialog);
+    auto &state = m_timeline.dialogMessageState(dialog);
     if (m_portalHttp.contains(operation)) {
         state.pendingReadIds = incoming.mid(0, maxVisibleReadIds);
         state.pendingReadTask = task;
@@ -558,7 +551,7 @@ void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &inc
     }
     if (ids.isEmpty())
         return;
-    const auto revision = m_chatBadgeRevision;
+    const auto revision = m_timeline.chatBadgeRevision;
     const auto scope = m_accountScopeRevision;
     Fields fields{{QStringLiteral("chatId"), QString::number(chatId)},
                   {QStringLiteral("actionUuid"), QUuid::createUuid().toString(QUuid::WithoutBraces)}};
@@ -568,17 +561,17 @@ void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &inc
          [this, dialog, chatId, revision, scope, ids](const QJsonValue &value) {
         if (scope != m_accountScopeRevision)
             return;
-        auto &updated = dialogMessageState(dialog);
+        auto &updated = m_timeline.dialogMessageState(dialog);
         const auto pending = std::exchange(updated.pendingReadIds, {});
         const auto pendingTask = std::exchange(updated.pendingReadTask, {});
         const auto result = value.toObject();
-        const auto counter = unreadCount(result.value(QStringLiteral("counter")));
+        const auto counter = chatUnreadCount(result.value(QStringLiteral("counter")));
         if (positiveId(result.value(QStringLiteral("chatId"))) == chatId && counter) {
-            auto &live = recentOverlay(dialog);
+            auto &live = m_timeline.recentOverlay(dialog);
             if (live.counterRevision <= revision) {
                 updated.unreadCounter = counter;
                 live.chatId = chatId;
-                live.counterRevision = ++m_chatBadgeRevision;
+                live.counterRevision = ++m_timeline.chatBadgeRevision;
                 live.counter = counter;
                 live.confirmedCounterCursor = qMax(live.confirmedCounterCursor, positiveId(result.value(QStringLiteral("lastId"))));
                 publishUnreadChatCount();

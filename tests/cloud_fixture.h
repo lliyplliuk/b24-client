@@ -182,6 +182,13 @@ private:
     QTemporaryDir m_settingsPath;
 };
 
+class CloudAccountTestCase : public CloudTestCase {
+    Q_OBJECT
+
+private slots:
+    void discardsConcurrentChatAndNoticeRepliesOnAccountChange();
+};
+
 } // namespace cloud_test
 
 class CloudTestAccess {

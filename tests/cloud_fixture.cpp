@@ -5,6 +5,7 @@
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QSettings>
+#include <QSignalSpy>
 #include <QTcpSocket>
 #include <QTest>
 #include <QWebSocket>
@@ -965,6 +966,48 @@ void CloudTestCase::initTestCase()
     QVERIFY(m_settingsPath.isValid());
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, m_settingsPath.path());
+}
+
+void CloudAccountTestCase::discardsConcurrentChatAndNoticeRepliesOnAccountChange()
+{
+    CloudFixture fixture;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,"recentItems":[],"chats":[]})";
+    fixture.noticeFixture = {QJsonObject{{"id", 41}, {"text", "Old notice"}}};
+    fixture.chatResponseOverride = ajaxResult(R"({"chatId":91,"messages":[{"id":710,"text":"Old message"}]})");
+    QVERIFY(fixture.start());
+
+    CloudBackend backend(fixture.session(), true);
+    backend.setForeground(false);
+    QSignalSpy accounts(&backend, &Backend::accountScopeChanged);
+    QSignalSpy messages(&backend, &Backend::chatMessagesLoaded);
+    QSignalSpy notices(&backend, &Backend::notificationsLoaded);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 1);
+
+    fixture.holdNextChatResponse = true;
+    fixture.holdNotificationReply = QStringLiteral("im.notify.get");
+    backend.requestChatMessages(QStringLiteral("chat91"));
+    backend.requestNotifications();
+    QTRY_VERIFY(!fixture.holdNextChatResponse && fixture.holdNotificationReply.isEmpty());
+
+    fixture.currentUserId = 22;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 2);
+    messages.clear();
+    notices.clear();
+    fixture.releaseHeldChatResponse();
+    fixture.releaseHeldNotificationReply();
+
+    fixture.chatResponseOverride = ajaxResult(R"({"chatId":91,"messages":[{"id":711,"text":"New message"}]})");
+    fixture.noticeFixture = {QJsonObject{{"id", 42}, {"text", "New notice"}}};
+    backend.requestChatMessages(QStringLiteral("chat91"));
+    backend.requestNotifications();
+    QTRY_COMPARE(messages.size(), 1);
+    QTRY_COMPARE(notices.size(), 1);
+    QCOMPARE(messages.first().at(1).value<QVector<Message>>().value(0).id, QStringLiteral("711"));
+    QCOMPARE(notices.first().first().value<QVector<Notification>>().value(0).id, QStringLiteral("42"));
 }
 
 } // namespace cloud_test

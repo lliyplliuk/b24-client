@@ -34,13 +34,33 @@ add_library(bxcore STATIC
     src/cloud/cloud_rows.cpp
     src/cloud/tasks_service.cpp
     src/cloud/projects_service.cpp
+    src/cloud/projects_service_board.cpp
+    src/cloud/projects_service_chats.cpp
     src/cloud/cloud_backend.cpp
+    src/cloud/cloud_backend_facade.cpp
+    src/cloud/cloud_link_previews.cpp
     src/cloud/cloud_channels.cpp
+    src/cloud/cloud_chat_fields.cpp
+    src/cloud/cloud_chat_metadata.cpp
+    src/cloud/chat_timeline.cpp
+    src/cloud/cloud_chat_assets.cpp
+    src/cloud/cloud_message_uploads.cpp
+    src/cloud/cloud_message_downloads.cpp
+    src/cloud/cloud_message_decoder.cpp
     src/cloud/cloud_avatars.cpp
     src/cloud/cloud_notification_links.cpp
+    src/cloud/notifications_service.h
+    src/cloud/notifications_service.cpp
+    src/cloud/notification_popups.cpp
+    src/cloud/pull_channel.h
+    src/cloud/pull_channel.cpp
     src/cloud/cloud_people.cpp
     src/cloud/cloud_chat_badges.cpp
-    src/cloud/cloud_chat_actions.cpp
+    src/cloud/chats_service.cpp
+    src/cloud/chats_service_pull.cpp
+    src/cloud/chats_service_history.cpp
+    src/cloud/chats_service_search.cpp
+    src/cloud/chats_service_actions.cpp
     src/cloud/cloud_portal_status.cpp
     src/cloud/cloud_worktime.cpp
 )

@@ -7,7 +7,7 @@
 using namespace bx;
 using namespace cloud_test;
 
-class TestCloudAccount : public CloudTestCase {
+class TestCloudAccount : public CloudAccountTestCase {
     Q_OBJECT
 
 private slots:

@@ -1,9 +1,7 @@
 #include "cloud/cloud_backend.h"
+#include "cloud/cloud_chat_metadata.h"
 #include "cloud/cloud_rows.h"
-#include "cloud/cloud_notification_links.h"
 
-#include "core/origin_guard.h"
-#include "core/notification_targets.h"
 #include "core/tunables.h"
 #include "signin/session_capture.h"
 #include "signin/session_restore.h"
@@ -11,17 +9,12 @@
 #include <QCryptographicHash>
 #include <QLoggingCategory>
 #include <QJsonArray>
-#include <QJsonDocument>
 #include <QNetworkReply>
 #include <QNetworkProxy>
-#include <QPointer>
-#include <QRandomGenerator>
-#include <QRegularExpression>
 #include <QUrlQuery>
 #include <QUuid>
 #include <algorithm>
 #include <memory>
-#include <limits>
 #include <utility>
 
 namespace bx {
@@ -33,242 +26,51 @@ Q_LOGGING_CATEGORY(sessionLog, "bitrix24.session")
 
 const QString recentOp = operationKey(OperationKind::Chats);
 const QString taskRecentOp = operationKey(OperationKind::TaskChats);
-const QString settingsIdentityOp = operationKey(OperationKind::SettingsIdentity);
-const QString recentUserStatusOp = operationKey(OperationKind::RecentUserStatus);
 const QString pushOp = operationKey(OperationKind::Push);
-const QString notificationsOp = operationKey(OperationKind::Notifications);
-const QString olderNotificationsOp = operationKey(OperationKind::NotificationsOlder);
-const QString soundsOp = operationKey(OperationKind::ChatSoundSettings);
 const QString chatIdentityOp = operationKey(OperationKind::ChatHistoryIdentity);
 const QString sessionRecoveryOp = operationKey(OperationKind::SessionRecovery);
 const QString sessionKeepaliveOp = operationKey(OperationKind::SessionKeepalive);
 const QString csrfRefreshOp = operationKey(OperationKind::CsrfRefresh);
-const QString soundMuted = QStringLiteral("soundMuted");
-const QString volumeGeneral = QStringLiteral("soundVolumeGeneral");
-const QString volumeMessages = QStringLiteral("soundVolumeMessages");
-const QString notifyScheme = QStringLiteral("notifyScheme");
-const QString notifyOnComputer = QStringLiteral("notifySchemeSendSite");
-const QString simpleNotifyScheme = QStringLiteral("simple");
-const QStringList simpleChannels{notifyOnComputer, QStringLiteral("notifySchemeSendEmail"),
-                                 QStringLiteral("notifySchemeSendPush")};
-constexpr int maxSeenEvents = 256;
-constexpr int maxNotifications = 100;
-constexpr int notificationPageSize = 50;
-constexpr int maxPendingChatPopups = 12;
-constexpr int freshPopupSeconds = 10;
-constexpr int freshHistoryPopupSeconds = 30;
-constexpr int heartbeatIntervalMs = 60000;
-constexpr int handshakeTimeoutMs = 15000;
-
-qsizetype notificationHistoryLimit(int olderPages)
-{
-    constexpr auto maxPages = (std::numeric_limits<qsizetype>::max() - maxNotifications) / notificationPageSize;
-    return maxNotifications + qMin<qsizetype>(olderPages, maxPages) * notificationPageSize;
-}
-
-void trimNotificationHistory(QVector<Notification> &notices, int olderPages)
-{
-    if (notices.size() <= maxNotifications)
-        return;
-    const auto historyLimit = notificationHistoryLimit(olderPages);
-    qsizetype ordinary = 0;
-    qsizetype visible = 0;
-    notices.removeIf([&](const Notification &notice) {
-        return notice.ordinaryChatMessage ? ++ordinary > maxNotifications : ++visible > historyLimit;
-    });
-}
-
-QString notificationRequestKey(quint64 scopeRevision, const QString &key)
-{
-    return operationKey(OperationKind::NotificationBatch, QString::number(scopeRevision), key);
-}
-
-QString validDialog(const QString &candidate)
-{
-    return candidate.startsWith(QLatin1String("chat")) ? chatDialog(candidate.mid(4)) : numericId(candidate);
-}
-
-bool matchesRequestedHistory(const QJsonObject &history, const QString &dialog, qint64 expectedChatId)
-{
-    const auto chat = history.value(QStringLiteral("chat")).toObject();
-    const auto declaredId = chat.value(QStringLiteral("id"));
-    const auto declaredDialog = chat.value(QStringLiteral("dialogId"));
-    const auto matchesId = [expectedChatId](qint64 value) {
-        return value >= 0 && (expectedChatId <= 0 || value == 0 || value == expectedChatId);
-    };
-    const auto declaredNumericId = numericId(string(declaredId)).toLongLong();
-    return (declaredId.isUndefined() || (declaredNumericId > 0 && matchesId(declaredNumericId)))
-        && (declaredDialog.isUndefined() || validDialog(string(declaredDialog)) == dialog)
-        && matchesId(explicitMessageChatId(chat)) && matchesId(explicitMessageChatId(history));
-}
-
-qint64 recentMessageId(const QJsonObject &message)
-{
-    return numericId(field(message, {"id", "ID"})).toLongLong();
-}
-
-template<typename T>
-void storeChatMetadata(QCache<QString, T> &cache, const QString &id, const T &value)
-{
-    // QCache trims before replacing a key, so update a hit in place at capacity.
-    if (auto *cached = cache.object(id))
-        *cached = value;
-    else
-        cache.insert(id, new T(value));
-}
-
-std::optional<qint64> explicitMessageAuthorId(const QJsonObject &message)
-{
-    std::optional<qint64> author;
-    for (const auto *key : {"senderId", "authorId", "author_id", "AUTHOR_ID"}) {
-        const auto value = message.value(QLatin1String(key));
-        if (value.isUndefined())
-            continue;
-        bool valid = true;
-        const auto id = value.isString() ? value.toString().toLongLong(&valid) : value.toInteger(-1);
-        if (!valid || id < 0 || (value.isString() && value.toString() != QString::number(id)) || (author && *author != id))
-            return std::nullopt;
-        author = id;
-    }
-    return author;
-}
-
-qint64 groupDialogChatId(const QString &dialog)
-{
-    return dialog.startsWith(QLatin1String("chat")) ? dialog.sliced(4).toLongLong() : 0;
-}
-
-bool isTaskChatType(const QString &type)
-{
-    const auto normalized = type.toLower();
-    return normalized == QLatin1String("taskstask") || normalized == QLatin1String("tasks")
-        || normalized == QLatin1String("tasks_task");
-}
-
-bool isTaskChatMetadata(const QString &kind, const QJsonObject &entity)
-{
-    return isTaskChatType(kind) || isTaskChatType(field(entity, {"type"}));
-}
-
-bool isRecentTaskChat(bool metadataTaskChat, bool listedTask, const QJsonArray &sections)
-{
-    return metadataTaskChat || listedTask || sections.contains(QStringLiteral("tasksTask"));
-}
-
-bool mutedListContains(const QJsonValue &list, const QString &user)
-{
-    if (user.isEmpty())
-        return false;
-    if (list.isArray()) {
-        const auto entries = list.toArray();
-        return std::any_of(entries.cbegin(), entries.cend(), [&user](const QJsonValue &entry) { return string(entry) == user; });
-    }
-    return list.toObject().value(user).toBool();
-}
-
-std::optional<bool> dismissedPersonalUser(const QString &dialog, const QJsonObject &row, const QJsonObject &user)
-{
-    if (numericId(dialog).isEmpty())
-        return false;
-    const auto invited = row.value(QStringLiteral("invited"));
-    if (invited.isObject() || invited == true)
-        return false;
-    const auto userId = numericId(field(user, {"id", "ID"}));
-    if (!userId.isEmpty() && userId != dialog)
-        return std::nullopt;
-    const auto userType = field(user, {"type"});
-    for (const auto *externalType : {"extranet", "collaber", "guest", "bot", "network", "connector"}) {
-        if (userType == QLatin1String(externalType))
-            return false;
-    }
-    for (const auto *flag : {"extranet", "network", "bot", "connector"}) {
-        if (user.value(QLatin1String(flag)) == true)
-            return false;
-    }
-    // The web messenger checks active independently of directory visibility and login method.
-    const auto active = user.value(QStringLiteral("active"));
-    return active.isBool() ? std::optional<bool>(!active.toBool()) : std::nullopt;
-}
-
-bool isPersonalMetadata(const QString &dialog, const QString &type)
-{
-    return !numericId(dialog).isEmpty() && (type.isEmpty() || type == QLatin1String("user")
-        || type == QLatin1String("private") || type == QLatin1String("im"));
-}
-
-QString userName(const QJsonObject &user)
-{
-    if (const QString name = field(user, {"name", "NAME"}); !name.isEmpty())
-        return name;
-    return (field(user, {"firstName", "FIRST_NAME"}) + QLatin1Char(' ')
-            + field(user, {"lastName", "LAST_NAME"})).trimmed();
-}
-
-QString noticeAuthorId(const QJsonObject &notice, const QJsonObject &outer = {})
-{
-    QString author;
-    for (const auto *source : {&notice, &outer}) {
-        for (const auto *key : {"author_id", "authorId", "AUTHOR_ID"}) {
-            const auto value = source->value(QLatin1String(key));
-            if (value.isUndefined())
-                continue;
-            const auto id = numericId(string(value));
-            if (id.isEmpty() || (!author.isEmpty() && author != id))
-                return {};
-            author = id;
-        }
-    }
-    return author;
-}
-
-QString noticeAuthorName(const QString &id, const QJsonValue &users)
-{
-    if (id.isEmpty())
-        return {};
-    const auto matchedName = [&id](const QJsonObject &user) {
-        auto matches = false;
-        for (const auto *key : {"id", "ID"}) {
-            const auto value = user.value(QLatin1String(key));
-            if (!value.isUndefined()) {
-                if (numericId(string(value)) != id)
-                    return QString();
-                matches = true;
-            }
-        }
-        return matches ? userName(user) : QString();
-    };
-    if (users.isArray()) {
-        for (const auto &item : users.toArray())
-            if (const auto name = matchedName(item.toObject()); !name.isEmpty())
-                return name;
-        return {};
-    }
-    const auto object = users.toObject();
-    return matchedName(object.contains(id) ? object.value(id).toObject() : object);
-}
-
-bool trustedSocket(const QUrl &url, const QUrl &portal, bool allowLoopback)
-{
-    if (!url.isValid() || !url.userInfo().isEmpty() || url.hasFragment() || url.hasQuery()
-        || url.path().isEmpty())
-        return false;
-    if (allowLoopback && OriginGuard::isLoopback(portal) && url.host() == portal.host()
-        && url.scheme() == QLatin1String("ws"))
-        return true;
-    if (url.scheme() != QLatin1String("wss") || url.port(443) != 443)
-        return false;
-    const auto host = url.host().toLower();
-    return host == portal.host().toLower() || host.endsWith(QLatin1String(".bitrix24.ru"))
-        || host.endsWith(QLatin1String(".bitrix24.com")) || host.endsWith(QLatin1String(".bitrix.info"));
-}
 
 } // namespace
 
 CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     : Backend(parent), m_session(std::move(session)), m_allowLoopback(allowLoopback),
       m_portalHttp(*this, m_http, this), m_projects(*this, m_portalHttp, this), m_tasks(*this, m_portalHttp, this),
-      m_socket(OriginGuard(m_session.origin).resolve(QStringLiteral("/")).toString(QUrl::RemovePath))
+      m_chats(*this, m_timeline, m_portalHttp, this), m_notices(*this, m_timeline, m_portalHttp, this),
+      m_pull(*this, m_portalHttp, this)
 {
+    connect(&m_notices, &NotificationsService::notificationsLoaded, this, &Backend::notificationsLoaded);
+    connect(&m_notices, &NotificationsService::notificationHistoryPageStateChanged, this, &Backend::notificationHistoryPageStateChanged);
+    connect(&m_notices, &NotificationsService::notificationsFound, this, &Backend::notificationsFound);
+    connect(&m_notices, &NotificationsService::notificationReadStateChanged, this, &Backend::notificationReadStateChanged);
+    connect(&m_notices, &NotificationsService::notificationRemoved, this, &Backend::notificationRemoved);
+    connect(&m_notices, &NotificationsService::notificationActionFinished, this, &Backend::notificationActionFinished);
+    connect(&m_notices, &NotificationsService::notificationSettingsLoaded, this, &Backend::notificationSettingsLoaded);
+    connect(&m_notices, &NotificationsService::notificationReceived, this, &CloudBackend::notificationReceived);
+    connect(&m_notices, &NotificationsService::failed, this, &Backend::failed);
+    connect(&m_chats, &ChatsService::popupSettingsChanged, &m_notices, &NotificationsService::handleSettingsPull);
+    connect(&m_chats, &ChatsService::notificationStateEvent, &m_notices, &NotificationsService::handleNotificationStatePull);
+    connect(&m_chats, &ChatsService::incomingNoticeEvent, &m_notices, &NotificationsService::handleIncomingNoticePull);
+    connect(&m_chats, &ChatsService::chatMessagesSeen, this, &Backend::chatMessagesSeen);
+    connect(&m_chats, &ChatsService::chatTypingChanged, this, &Backend::chatTypingChanged);
+    connect(&m_chats, &ChatsService::chatActionSucceeded, this, &Backend::chatActionSucceeded);
+    connect(&m_chats, &ChatsService::chatHistoryRemoved, this, &Backend::chatHistoryRemoved);
+    connect(&m_chats, &ChatsService::chatMessagesLoaded, this, &Backend::chatMessagesLoaded);
+    connect(&m_chats, &ChatsService::chatOwnReactionChanged, this, &Backend::chatOwnReactionChanged);
+    connect(&m_chats, &ChatsService::chatPinChanged, this, &Backend::chatPinChanged);
+    connect(&m_chats, &ChatsService::chatsFound, this, &Backend::chatsFound);
+    connect(&m_chats, &ChatsService::failed, this, &Backend::failed);
+    connect(&m_chats, &ChatsService::groupChatCreated, this, &Backend::groupChatCreated);
+    connect(&m_chats, &ChatsService::messageEditAccepted, this, &Backend::messageEditAccepted);
+    connect(&m_chats, &ChatsService::messageSent, this, &Backend::messageSent);
+    connect(&m_chats, &ChatsService::messagesFound, this, &Backend::messagesFound);
+    connect(&m_chats, &ChatsService::olderChatMessagesLoaded, this, &Backend::olderChatMessagesLoaded);
+    connect(&m_chats, &ChatsService::pinnedMessagesLoaded, this, &Backend::pinnedMessagesLoaded);
+    connect(&m_chats, &ChatsService::recentChatsLoaded, this, &Backend::recentChatsLoaded);
+    connect(&m_chats, &ChatsService::taskChatsFound, this, &Backend::taskChatsFound);
+    connect(&m_chats, &ChatsService::taskChatsLoaded, this, &Backend::taskChatsLoaded);
+    connect(&m_chats, &ChatsService::taskMessagesLoaded, this, &Backend::taskMessagesLoaded);
     connect(&m_tasks, &TasksService::taskCreated, this, &Backend::taskCreated);
     connect(&m_tasks, &TasksService::subtaskCreated, this, &Backend::subtaskCreated);
     connect(&m_tasks, &TasksService::taskDeleted, this, &Backend::taskDeleted);
@@ -303,25 +105,7 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     connect(&m_projects, &ProjectsService::projectsScopeLoaded, this, &Backend::projectsScopeLoaded);
 
     m_http.setProxy(QNetworkProxy::NoProxy);
-    m_socket.setProxy(QNetworkProxy::NoProxy);
-    m_socket.setMaxAllowedIncomingFrameSize(PortalHttp::maxResponse);
-    m_socket.setMaxAllowedIncomingMessageSize(PortalHttp::maxResponse);
-    for (auto timer : {&m_retry, &m_watchdog, &m_heartbeat, &m_refresh, &m_configExpiry})
-        timer->setSingleShot(true);
-
-    connect(&m_retry, &QTimer::timeout, this, &CloudBackend::connectPull);
-    connect(&m_watchdog, &QTimer::timeout, this, [this] { scheduleReconnect(); });
-    connect(&m_heartbeat, &QTimer::timeout, this, [this] {
-        if (m_socket.state() == QAbstractSocket::ConnectedState) {
-            m_watchdog.start(handshakeTimeoutMs);
-            m_socket.ping();
-        }
-    });
-    connect(&m_socket, &QWebSocket::pong, this, [this] {
-        m_watchdog.stop();
-        m_heartbeat.start(heartbeatIntervalMs);
-    });
-    connect(&m_configExpiry, &QTimer::timeout, this, [this] { scheduleReconnect(true); });
+    m_refresh.setSingleShot(true);
     connect(&m_refresh, &QTimer::timeout, this, &CloudBackend::refreshDirtyViews);
     m_historyCatchup.setInterval(15 * 1000);
     m_historyCatchup.setTimerType(Qt::VeryCoarseTimer);
@@ -329,10 +113,10 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     m_historyCatchup.setParent(this);
     connect(&m_historyCatchup, &QTimer::timeout, this, [this] {
         if (m_activeSection == 0) {
-            m_recentDirty = true;
-            m_chatDirty = !m_openDialog.isEmpty();
+            m_timeline.recentDirty = true;
+            m_timeline.chatDirty = !m_timeline.openDialog.isEmpty();
         }
-        m_taskMessagesDirty = !m_openTask.isEmpty();
+        m_timeline.taskMessagesDirty = !m_timeline.openTask.isEmpty();
         scheduleRefresh();
     });
     m_sessionKeepalive.setInterval(15 * 60 * 1000);
@@ -345,31 +129,23 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     });
     connect(this, &Backend::failed, this, [this](const QString &operation, const QString &) {
         if (operation == chatIdentityOp)
-            resumeHistoriesWithIdentity();
-        if (operation == olderNotificationsOp && m_loadingOlderNotifications) {
-            m_loadingOlderNotifications = false;
-            publishNotificationHistoryPageState();
-        }
+            m_chats.resumeHistoriesWithIdentity();
+        m_notices.handleOperationFailure(operation);
         m_tasks.handleOperationFailure(operation);
     });
-    connect(&m_socket, &QWebSocket::connected, this, [this] {
-        if (!m_started)
-            return;
-        m_attempt = 0;
-        m_watchdog.stop();
-        m_heartbeat.start(heartbeatIntervalMs);
-        const bool refreshPopupSettings = m_resumed && (!m_chatPopupSettings.isEmpty() || m_portalHttp.contains(soundsOp));
+    connect(&m_pull, &PullChannel::failed, this, &Backend::failed);
+    connect(&m_pull, &PullChannel::offline, this, [this] { setOnline(false); });
+    connect(&m_pull, &PullChannel::taskEvent, this, &CloudBackend::handleTaskPull);
+    connect(&m_pull, &PullChannel::presenceEvent, this, &CloudBackend::handlePresencePull);
+    connect(&m_pull, &PullChannel::imEvent, &m_chats, &ChatsService::handleImPull);
+    connect(&m_pull, &PullChannel::connected, this, [this] {
+        const bool refreshPopupSettings = m_resumed && m_notices.reconnectSettingsNeeded();
         if (m_resumed) {
-            for (auto &state : m_dialogMessageStates)
+            for (auto &state : m_timeline.dialogMessageStates)
                 state.muteFromPull = false;
         }
-        if (refreshPopupSettings) {
-            ++m_chatPopupSettingsGeneration;
-            m_chatPopupSettings = {};
-            m_chatPopupSettingsKnown = false;
-            m_pendingChatPopups.removeIf([](const ChatPopup &popup) { return !popup.fromHistory; });
-            m_nextChatPopupSettingsRequest = 0;
-        }
+        if (refreshPopupSettings)
+            m_notices.resetReconnectSettings();
         setOnline(true);
         if (refreshPopupSettings)
             loadChatPopupSettings();
@@ -379,12 +155,6 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
         }
         m_resumed = true;
     });
-    connect(&m_socket, &QWebSocket::disconnected, this, [this] {
-        scheduleReconnect(m_socket.closeCode() == static_cast<QWebSocketProtocol::CloseCode>(4010));
-    });
-    connect(&m_socket, QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::error),
-            this, [this](QAbstractSocket::SocketError) { scheduleReconnect(); });
-    connect(&m_socket, &QWebSocket::textMessageReceived, this, &CloudBackend::receivePull);
 }
 
 CloudBackend::~CloudBackend()
@@ -404,13 +174,13 @@ void CloudBackend::start()
     m_started = true;
     m_authExpired = false;
     m_resumed = false;
-    m_attempt = 0;
+    m_pull.resetBackoff();
     if (!PortalHttp::sessionUsable(m_session, m_allowLoopback)) {
         emit failed(pushOp, QStringLiteral("Для подключения нужны HTTPS, Cookie и CSRF веб-сессии"));
         return;
     }
     m_initialPortalStatusPending = true;
-    connectPull();
+    m_pull.connectPull();
     loadChatBadges();
     updateHistoryCatchup();
     m_sessionKeepalive.start();
@@ -421,13 +191,9 @@ void CloudBackend::stop()
     m_started = false;
     m_userId.clear();
     resetAccountScopedState();
-    m_retry.stop();
-    m_watchdog.stop();
-    m_heartbeat.stop();
     m_refresh.stop();
     m_sessionKeepalive.stop();
-    m_configExpiry.stop();
-    m_socket.abort();
+    m_pull.stop();
     setOnline(false);
 }
 
@@ -448,59 +214,39 @@ void CloudBackend::resetAccountScopedState()
     const bool projectCountsChanged = m_projects.reset();
 
     clearRasterAssets();
-    m_personalChatStatuses.clear();
+    m_chats.reset();
     m_chatAnchors.clear();
     m_chatAnchorCount = 0;
     m_pendingAnchorEvents.clear();
-    m_recentPullsAwaitingIdentity.clear();
     m_chatContacts.clear();
-    m_pinnedDialog.clear();
-    ++m_pinnedGeneration;
-    m_havePinnedSnapshot = false;
-    m_pinnedMessages.clear();
-    m_pinnedChanges.clear();
     m_registeredMessageFileUrls.clear();
-    m_replyPreviews.clear();
-    m_lastTypingRequest.clear();
-    m_historiesWaitingForIdentity.clear();
-    m_triedHistoryIdentity = false;
-    m_dialogMessageStates.clear();
+    m_timeline.replyPreviews.clear();
+    m_timeline.dialogMessageStates.clear();
     m_messageViewerMembership.clear();
     m_messageViewerCounts.clear();
-    m_taskDialogs.clear();
-    m_dialogChatIds.clear();
-    m_recentTitles.clear();
-    m_taskChatTitles.clear();
+    m_timeline.taskDialogs.clear();
+    m_timeline.dialogChatIds.clear();
 
-    m_seenEvents.clear();
-    m_seenEventIds.clear();
-    m_sentTemplates.clear();
-    m_mid.clear();
-    m_tag.clear();
-    m_time.clear();
+    m_pull.reset();
+    m_timeline.sentTemplates.clear();
 
     // MainWindow does not reopen the chat or task card on accountScopeChanged.
     // Resume history updates only when a view requests them for the new account.
-    m_openDialog.clear();
-    m_openTask.clear();
+    m_timeline.openDialog.clear();
+    m_timeline.openTask.clear();
     m_portalHttp.resetHistoryRetries();
-    m_recentDirty = false;
-    m_chatDirty = false;
-    m_taskMessagesDirty = false;
+    m_timeline.recentDirty = false;
+    m_timeline.chatDirty = false;
+    m_timeline.taskMessagesDirty = false;
     updateHistoryCatchup();
 
-    ++m_chatPopupSettingsGeneration;
-    m_chatPopupSettings = {};
-    m_chatPopupSettingsKnown = false;
-    m_notificationSettings.clear();
-    m_notificationSettingChanges.clear();
-    m_notificationSettingsRevision = 0;
-    m_nextChatPopupSettingsRequest = 0;
+    m_notices.resetSettings();
     resetChatCounters();
     if (projectCountsChanged)
         emit projectUnreadCountsChanged({}, false);
     publishUnreadChatCount();
-    resetNoticeState();
+    m_notificationsDirty = false;
+    m_notices.reset();
 
     m_portalHttp.reset(pending);
 }
@@ -546,10 +292,10 @@ void CloudBackend::updateChatViewActivity(bool wasWatching)
         m_portalHttp.invalidateHistory(true);
     } else if (!m_foreground && m_started) {
         if (m_activeSection == 0) {
-            m_recentDirty = true;
-            m_chatDirty = !m_openDialog.isEmpty();
+            m_timeline.recentDirty = true;
+            m_timeline.chatDirty = !m_timeline.openDialog.isEmpty();
         }
-        m_taskMessagesDirty = !m_openTask.isEmpty();
+        m_timeline.taskMessagesDirty = !m_timeline.openTask.isEmpty();
         scheduleRefresh();
     }
     updateHistoryCatchup();
@@ -572,23 +318,23 @@ void CloudBackend::clearOpenHistory(bool task)
 {
     if (task) {
         m_portalHttp.invalidateHistory(true);
-        m_openTask.clear();
-        m_taskMessagesDirty = false;
-        m_taskPopupHistory = {};
+        m_timeline.openTask.clear();
+        m_timeline.taskMessagesDirty = false;
+        m_notices.clearHistory(true);
     } else {
         m_portalHttp.invalidateHistory(false);
-        m_openDialog.clear();
-        m_chatDirty = false;
-        m_chatPopupHistory = {};
+        m_timeline.openDialog.clear();
+        m_timeline.chatDirty = false;
+        m_notices.clearHistory(false);
     }
     updateHistoryCatchup();
 }
 
 void CloudBackend::updateHistoryCatchup(bool restart)
 {
-    const bool watchingChat = m_activeSection == 0 && !m_openDialog.isEmpty();
+    const bool watchingChat = m_activeSection == 0 && !m_timeline.openDialog.isEmpty();
     // A task card can be open over any workspace section.
-    const bool watchingTask = !m_openTask.isEmpty();
+    const bool watchingTask = !m_timeline.openTask.isEmpty();
     const bool shouldRun = m_started && canAutoRefreshChats() && !m_authExpired && (watchingChat || watchingTask);
     // With two histories open, traffic in one must not postpone the safety refresh for the other.
     const bool restartSingleHistory = restart && !(watchingChat && watchingTask);
@@ -621,11 +367,11 @@ void CloudBackend::rejectSession()
     ++m_sessionRevision;
     auto completion = std::exchange(m_sessionConfirmationCallback, {});
     cancelSessionConfirmation();
-    m_retry.stop();
+    m_pull.cancelRetry();
     m_refresh.stop();
     m_sessionKeepalive.stop();
     updateHistoryCatchup();
-    scheduleReconnect();
+    m_pull.scheduleReconnect();
     qCWarning(sessionLog) << "Portal authorization expired; waiting for the user to renew it";
     emit messageLinkPreviewAccessChanged(false);
     emit sessionRejected();
@@ -724,8 +470,8 @@ void CloudBackend::invalidateActiveView()
 {
     switch (m_activeSection) {
     case 0:
-        m_recentDirty = true;
-        m_chatDirty = !m_openDialog.isEmpty();
+        m_timeline.recentDirty = true;
+        m_timeline.chatDirty = !m_timeline.openDialog.isEmpty();
         break;
     case 1:
         m_projects.invalidateOpenBoard();
@@ -734,7 +480,7 @@ void CloudBackend::invalidateActiveView()
         m_notificationsDirty = true;
         break;
     }
-    m_taskMessagesDirty = !m_openTask.isEmpty();
+    m_timeline.taskMessagesDirty = !m_timeline.openTask.isEmpty();
     scheduleRefresh();
 }
 
@@ -742,9 +488,9 @@ void CloudBackend::scheduleRefresh()
 {
     if (!m_started || !canAutoRefreshChats() || m_authExpired || m_refresh.isActive())
         return;
-    const bool sectionDirty = m_activeSection == 0 ? m_recentDirty || m_chatDirty
+    const bool sectionDirty = m_activeSection == 0 ? m_timeline.recentDirty || m_timeline.chatDirty
         : m_foreground && (m_activeSection == 1 ? m_projects.boardDirty() : m_activeSection == 2 && m_notificationsDirty);
-    if (sectionDirty || m_taskMessagesDirty)
+    if (sectionDirty || m_timeline.taskMessagesDirty)
         m_refresh.start(250);
 }
 
@@ -759,69 +505,34 @@ void CloudBackend::refreshDirtyViews()
         return true;
     };
     if (m_activeSection == 0) {
-        if (takeDirty(m_recentDirty, m_showTaskChats ? taskRecentOp : recentOp))
-            loadRecentChats(m_showTaskChats);
-        if (!m_openDialog.isEmpty() && takeDirty(m_chatDirty, operationKey(OperationKind::Chat, m_openDialog)))
-            requestChatMessages(m_openDialog);
+        if (takeDirty(m_timeline.recentDirty, m_timeline.showTaskChats ? taskRecentOp : recentOp))
+            m_chats.loadRecentChats(m_timeline.showTaskChats);
+        if (!m_timeline.openDialog.isEmpty() && takeDirty(m_timeline.chatDirty, operationKey(OperationKind::Chat, m_timeline.openDialog)))
+            requestChatMessages(m_timeline.openDialog);
     } else if (m_foreground && m_activeSection == 1) {
         m_projects.refreshDirtyBoard();
     } else if (m_foreground && m_activeSection == 2 && takeDirty(m_notificationsDirty,
-                                                notificationRequestKey(m_accountScopeRevision, notificationsOp))) {
+                                                m_notices.historyRequestKey())) {
         requestNotifications();
     }
-    if (!m_openTask.isEmpty() && takeDirty(m_taskMessagesDirty, operationKey(OperationKind::TaskMessages, m_openTask)))
-        requestTaskMessages(m_openTask);
+    if (!m_timeline.openTask.isEmpty() && takeDirty(m_timeline.taskMessagesDirty, operationKey(OperationKind::TaskMessages, m_timeline.openTask)))
+        requestTaskMessages(m_timeline.openTask);
 }
 
 void CloudBackend::invalidateTaskChat(const QString &taskId)
 {
     if (!taskId.isEmpty()) {
-        if (taskId == m_openTask)
-            m_taskMessagesDirty = true;
-        const auto listed = std::find_if(m_recentTaskChatItems.cbegin(), m_recentTaskChatItems.cend(),
+        if (taskId == m_timeline.openTask)
+            m_timeline.taskMessagesDirty = true;
+        const auto listed = std::find_if(m_timeline.recentTaskChatItems.cbegin(), m_timeline.recentTaskChatItems.cend(),
             [&taskId](const Chat &chat) { return chat.taskId == taskId; });
-        if (listed != m_recentTaskChatItems.cend() && m_showTaskChats)
-            m_recentDirty = true;
-        if (!m_openDialog.isEmpty() && (m_taskDialogs.value(taskId) == m_openDialog
-            || (listed != m_recentTaskChatItems.cend() && listed->id == m_openDialog)))
-            m_chatDirty = true;
+        if (listed != m_timeline.recentTaskChatItems.cend() && m_timeline.showTaskChats)
+            m_timeline.recentDirty = true;
+        if (!m_timeline.openDialog.isEmpty() && (m_timeline.taskDialogs.value(taskId) == m_timeline.openDialog
+            || (listed != m_timeline.recentTaskChatItems.cend() && listed->id == m_timeline.openDialog)))
+            m_timeline.chatDirty = true;
     }
     scheduleRefresh();
-}
-
-bool CloudBackend::isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const
-{
-    return m_projects.isCurrentResponse(kind, key, operation);
-}
-
-void CloudBackend::ajax(const QString &action, Fields fields, const QString &operation, Handler handler,
-                        const QString &requestKey)
-{
-    m_portalHttp.ajax(action, std::move(fields), operation, std::move(handler), requestKey);
-}
-
-QUrl CloudBackend::actionUrl(const QString &action) const
-{
-    return m_portalHttp.actionUrl(action);
-}
-
-void CloudBackend::ajaxJson(const QString &action, const QJsonObject &body, const QString &operation,
-                           Handler handler, const QString &requestKey)
-{
-    m_portalHttp.ajaxJson(action, body, operation, std::move(handler), requestKey);
-}
-
-void CloudBackend::ajaxJson(QUrl url, const QJsonObject &body, const QString &operation,
-                           Handler handler, const QString &requestKey)
-{
-    m_portalHttp.ajaxJson(std::move(url), body, operation, std::move(handler), requestKey);
-}
-
-void CloudBackend::componentAction(const QString &action, const Fields &fields,
-                                   const QString &operation, Handler handler, const QString &component,
-                                   const QString &requestKey)
-{
-    m_portalHttp.componentAction(action, fields, operation, std::move(handler), component, requestKey);
 }
 
 void CloudBackend::failShape(const QString &operation)
@@ -888,11 +599,6 @@ void CloudBackend::requestCurrentUser(const QString &operation,
     }, {}, candidate);
 }
 
-void CloudBackend::cancelSessionRecovery()
-{
-    m_portalHttp.cancelSessionRecovery();
-}
-
 void CloudBackend::recoverSession(const Session &candidate, std::function<bool()> stillAllowed)
 {
     if (!m_started || !m_authExpired || m_portalHttp.contains(sessionRecoveryOp))
@@ -919,13 +625,13 @@ void CloudBackend::recoverSession(const Session &candidate, std::function<bool()
         m_session = *verified;
         ++m_sessionRevision;
         m_authExpired = false;
-        m_attempt = 0;
+        m_pull.resetBackoff();
         m_sessionKeepalive.start();
         qCInfo(sessionLog) << "Portal authorization renewed";
         emit sessionUpdated(m_session);
         emit messageLinkPreviewAccessChanged(true);
         emit sessionRecovered();
-        connectPull();
+        m_pull.connectPull();
         loadChatBadges();
         invalidateActiveView();
         updateHistoryCatchup();
@@ -941,890 +647,18 @@ void CloudBackend::rememberCurrentUser(const QString &id)
     if (accountChanged) {
         ++m_sessionRevision;
         resetAccountScopedState();
-        scheduleReconnect(true);
+        m_pull.scheduleReconnect(true);
     }
     bindPortalStatusIdentity(accountChanged);
     emit accountScopeChanged();
-    const auto waiting = std::exchange(m_recentPullsAwaitingIdentity, {});
-    for (const auto &event : waiting)
-        applyRecentPull(event.command, event.dialog, event.chatId, event.params, event.extra);
-}
-
-void CloudBackend::rememberDismissalStatus(const QString &id, std::optional<bool> dismissed)
-{
-    const auto ttl = dismissed.has_value() ? 300 : 5;
-    const PersonalChatStatus status{dismissed, QDateTime::currentSecsSinceEpoch() + ttl};
-    storeChatMetadata(m_personalChatStatuses, id, status);
-}
-
-std::optional<bool> CloudBackend::cachedDismissalStatus(const QString &id) const
-{
-    const auto *cached = m_personalChatStatuses.object(id);
-    if (cached && cached->expiresAt > QDateTime::currentSecsSinceEpoch())
-        return cached->dismissed;
-    return std::nullopt;
-}
-
-Chat CloudBackend::chatFromMetadata(const QString &dialog, const QJsonObject &row, const QJsonObject &chat,
-                                    const QJsonObject &user)
-{
-    Chat result;
-    result.id = dialog;
-    auto type = field(chat, {"type", "kind"});
-    if (type.isEmpty())
-        type = field(row, {"type", "kind"});
-    // The search selector calls every result a chat, including direct user dialogs.
-    result.kind = type.isEmpty() ? field(row, {"entityType"}) : type;
-    auto entity = chat.value(QStringLiteral("entityLink")).toObject();
-    if (entity.isEmpty())
-        entity = row.value(QStringLiteral("entityLink")).toObject();
-    result.taskChat = isTaskChatMetadata(result.kind, entity);
-    if (result.taskChat)
-        result.taskId = numericId(field(entity, {"id"}));
-    QString avatar;
-    if (!dialog.startsWith(QLatin1String("chat"))) {
-        result.title = userName(user);
-        avatar = field(user, {"avatar", "avatarUrl"});
-    }
-    if (result.title.isEmpty())
-        result.title = field(chat, {"name", "title"});
-    if (result.title.isEmpty())
-        result.title = field(row, {"title", "name"});
-    if (avatar.isEmpty())
-        avatar = field(chat, {"avatar", "avatarUrl"});
-    if (avatar.isEmpty())
-        avatar = field(row, {"avatar", "avatarUrl"});
-    result.avatarUrl = avatarUrlFromPortal(avatar);
-    result.pinned = notificationFlag(row.value(QStringLiteral("pinned"))).value_or(false);
-    if (!result.taskChat && isPersonalMetadata(dialog, type)) {
-        result.kind = QStringLiteral("im");
-        const auto dismissed = dismissedPersonalUser(dialog, row, user);
-        result.dismissed = dismissed.value_or(cachedDismissalStatus(dialog).value_or(false));
-        if (dismissed)
-            rememberDismissalStatus(dialog, dismissed);
-        rememberChatContact(dialog, user, false);
-        applyChatContact(result);
-    }
-    return result;
-}
-
-void CloudBackend::requestRecentChats()
-{
-    m_showTaskChats = false;
-    loadRecentChats(false);
-    loadChatBadges();
-}
-
-void CloudBackend::requestTaskChats()
-{
-    m_showTaskChats = true;
-    loadRecentChats(true);
-    loadChatBadges();
-}
-
-void CloudBackend::requestTaskChatBadges()
-{
-    loadRecentChats(true, true);
-}
-
-void CloudBackend::requestProjectTaskChats(const QString &projectId, int offset)
-{
-    m_projects.requestProjectTaskChats(projectId, offset);
-}
-void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
-{
-    const auto operation = task ? taskRecentOp : recentOp;
-    ajax(QStringLiteral("im.v2.Recent.load"),
-         {{QStringLiteral("filter[recentSection]"), task ? QStringLiteral("tasksTask") : QStringLiteral("default")},
-          {QStringLiteral("limit"), QString::number(tunables::kPageSizeChats)}},
-         operation, [this, task, badgesOnly, operation, scope = m_accountScopeRevision,
-                     counterRevision = m_chatBadgeRevision](QJsonValue data) {
-        if (scope != m_accountScopeRevision)
-            return;
-        const auto rows = list(data, {"recentItems", "items", "recent"});
-        if (!rows.isArray())
-            return failShape(operation);
-
-        const auto root = data.toObject();
-        const auto userId = numericId(field(root, {"userId", "currentUserId"}));
-        rememberCurrentUser(userId);
-        const auto currentUser = numericId(m_userId).toLongLong();
-        QHash<qint64, QJsonObject> messages, latestMessagesByChat;
-        QHash<QString, QJsonObject> users, chatById, chatByDialog, counters;
-        for (const auto value : root.value(QStringLiteral("messages")).toArray()) {
-            const auto message = value.toObject();
-            const auto id = recentMessageId(message);
-            if (id <= 0)
-                continue;
-            messages.insert(id, message);
-            const auto messageChatId = explicitMessageChatId(message);
-            if (messageChatId > 0 && id > recentMessageId(latestMessagesByChat.value(messageChatId)))
-                latestMessagesByChat.insert(messageChatId, message);
-        }
-        for (const auto *key : {"usersShort", "users"}) {
-            for (const auto value : root.value(QLatin1String(key)).toArray()) {
-                const auto user = value.toObject();
-                const auto id = numericId(field(user, {"id", "ID"}));
-                if (id.isEmpty())
-                    continue;
-                auto merged = users.value(id);
-                for (auto it = user.constBegin(); it != user.constEnd(); ++it) {
-                    if (!it.value().isNull() && (!it.value().isString() || !it.value().toString().isEmpty()))
-                        merged.insert(it.key(), it.value());
-                }
-                users.insert(id, merged);
-            }
-        }
-        for (const auto value : root.value(QStringLiteral("chats")).toArray()) {
-            const auto chat = value.toObject();
-            chatById.insert(field(chat, {"id", "chatId"}), chat);
-            chatByDialog.insert(validDialog(field(chat, {"dialogId"})), chat);
-        }
-        const auto rawCounters = root.value(QStringLiteral("counters"));
-        for (const auto value : rawCounters.toArray()) {
-            const auto count = value.toObject();
-            counters.insert(field(count, {"chatId"}), count);
-        }
-        const auto countersObject = rawCounters.toObject();
-        for (auto it = countersObject.constBegin(); it != countersObject.constEnd(); ++it)
-            counters.insert(it.key(), it.value().isObject() ? it.value().toObject()
-                : QJsonObject{{QStringLiteral("counter"), it.value()}});
-
-        QVector<Chat> chats;
-        QVector<Chat> legacyTasks;
-        QSet<QString> taskDialogs;
-        QStringList usersWithoutStatus;
-        for (const auto row : rows.toArray()) {
-            const auto object = row.toObject();
-            const auto recentChatId = field(object, {"chatId", "CHAT_ID"});
-            auto dialogId = validDialog(field(object, {"dialogId", "DIALOG_ID", "id"}));
-            auto metadata = object.value(QStringLiteral("chat")).toObject();
-            if (metadata.isEmpty() && !recentChatId.isEmpty())
-                metadata = chatById.value(recentChatId);
-            if (metadata.isEmpty() && !dialogId.isEmpty())
-                metadata = chatByDialog.value(dialogId);
-            if (dialogId.isEmpty())
-                dialogId = validDialog(field(metadata, {"dialogId"}));
-            if (dialogId.isEmpty())
-                dialogId = chatDialog(recentChatId);
-            if (dialogId.isEmpty())
-                continue;
-            auto user = users.value(dialogId);
-            if (user.isEmpty())
-                user = object.value(QStringLiteral("user")).toObject();
-            auto chat = chatFromMetadata(dialogId, object, metadata, user);
-            if (chat.title.isEmpty())
-                chat.title = QStringLiteral("Диалог %1").arg(dialogId);
-            if (task && chat.kind.isEmpty())
-                chat.taskChat = true; // A row in the dedicated server section may omit its type.
-
-            auto rowChatId = recentChatId;
-            if (rowChatId.isEmpty())
-                rowChatId = field(metadata, {"id", "chatId"});
-            chat.serverChatId = numericId(rowChatId).toLongLong();
-            m_projects.rememberProjectUnreadTaskChat(chat);
-            const auto counter = counters.value(rowChatId);
-            bool hasCounterSnapshot = false;
-            const auto snapshotCount = counter.value(QStringLiteral("counter")).toVariant().toInt(&hasCounterSnapshot);
-            chat.unread = hasCounterSnapshot ? std::max(0, snapshotCount)
-                : std::max({0, oneOf(object, {"counter", "unreadCount"}).toVariant().toInt(),
-                             metadata.value(QStringLiteral("counter")).toVariant().toInt()});
-            const auto snapshotMarked = notificationFlag(counter.value(QStringLiteral("isMarkedAsUnread")));
-            chat.markedUnread = snapshotMarked.value_or(notificationFlag(object.value(QStringLiteral("unread"))).value_or(false)
-                || notificationFlag(metadata.value(QStringLiteral("isMarkedAsUnread"))).value_or(false));
-            auto messageId = numericId(field(object, {"messageId"})).toLongLong();
-            auto preview = object.value(QStringLiteral("message")).toObject();
-            if (preview.isEmpty())
-                preview = messages.value(messageId);
-            const auto groupChatId = groupDialogChatId(dialogId);
-            const auto expectedChatId = groupChatId > 0 ? groupChatId : chat.serverChatId;
-            const auto previewChatId = explicitMessageChatId(preview);
-            const bool foreignPreview = previewChatId != 0 && previewChatId != expectedChatId;
-            // Recent rows can point into another chat's message in the shared list.
-            const bool useChatMessage = foreignPreview || preview.isEmpty();
-            if (useChatMessage) {
-                preview = latestMessagesByChat.value(expectedChatId);
-                if (foreignPreview || !preview.isEmpty())
-                    messageId = recentMessageId(preview);
-            }
-            chat.lastMessage = field(preview, {"text"});
-            const auto updated = oneOf(object, {"dateLastActivity", "dateUpdate", "updated"});
-            const auto previewDate = date(preview.value(QStringLiteral("date")));
-            chat.updated = (useChatMessage && previewDate.isValid()) || updated.isUndefined()
-                ? previewDate : date(updated);
-            bool hasReadId = false;
-            const auto readId = field(metadata, {"lastId"}).toLongLong(&hasReadId);
-            auto &live = recentOverlay(dialogId);
-            const auto state = m_dialogMessageStates.constFind(dialogId);
-            const auto unreadId = numericId(field(metadata, {"unreadId"})).toLongLong();
-            const bool alreadyRead = chat.unread == 1 && unreadId > 0 && state != m_dialogMessageStates.cend()
-                && (unreadId <= state->confirmedReadThrough || state->exactlyRead.contains(unreadId));
-            const bool olderCursor = hasReadId && readId >= 0 && readId < live.confirmedCounterCursor;
-            // A newer own preview alone does not supersede a confirmed read.
-            const bool staleOwnCounter = live.counter && (alreadyRead || olderCursor) && currentUser > 0
-                && expectedChatId > 0 && explicitMessageChatId(preview) == expectedChatId
-                && explicitMessageAuthorId(preview) == currentUser;
-            const bool counterCurrent = m_chatCounterSnapshotRevision <= counterRevision
-                && live.counterRevision <= counterRevision && !staleOwnCounter;
-            if (!metadata.isEmpty() || !recentChatId.isEmpty())
-                rememberDialog(dialogId, {{QStringLiteral("chat"), metadata}, {QStringLiteral("chatId"), recentChatId}},
-                               counterCurrent);
-            auto &rejectedPreviewChatId = chat.taskChat ? live.rejectedTaskPreviewChatId : live.rejectedRecentPreviewChatId;
-            rejectedPreviewChatId = foreignPreview && preview.isEmpty() ? expectedChatId : 0;
-            const auto lastRead = m_dialogMessageStates.value(dialogId).lastReadId;
-            if (messageId > live.messageId && messageId > lastRead) {
-                live.messageId = messageId;
-                // A newer preview can arrive in a response carrying an older unread count.
-                if (counterCurrent) {
-                    live.incomingId = 0;
-                    if (!m_haveCounterSnapshot)
-                        live.counter.reset();
-                }
-                live.preview = {};
-            }
-            if (counterCurrent && !m_haveCounterSnapshot && live.incomingId > 0 && messageId >= live.messageId
-                && readId >= live.incomingId && readId >= lastRead
-                && (hasCounterSnapshot || unreadCount(oneOf(object, {"counter", "unreadCount"})))) {
-                live.counter = chat.unread;
-            }
-
-            storeChatMetadata(m_recentTitles, dialogId, chat.title);
-            if (!task && chat.taskChat && legacyTasks.size() < tunables::kPageSizeChats)
-                legacyTasks.append(chat);
-            if (chat.taskChat == task && chats.size() < tunables::kPageSizeChats) {
-                const auto *status = m_personalChatStatuses.object(dialogId);
-                if (!task && chat.kind == QLatin1String("im")
-                    && (!status || status->expiresAt <= QDateTime::currentSecsSinceEpoch())
-                    && !usersWithoutStatus.contains(dialogId)) {
-                    usersWithoutStatus.append(dialogId);
-                }
-                taskDialogs.insert(dialogId);
-                chats.append(std::move(chat));
-            }
-        }
-        m_projects.publishProjectUnreadCounts();
-        if (!task) {
-            m_legacyTaskChats = std::move(legacyTasks);
-            const auto generation = ++m_recentStatusGeneration;
-            publishRecentChats(chats, false);
-            if (!usersWithoutStatus.isEmpty())
-                hydrateRecentUserStatuses(chats, usersWithoutStatus, generation);
-            if (m_userId.isEmpty() && std::any_of(chats.cbegin(), chats.cend(), [](const Chat &chat) { return chat.dismissed; }))
-                withCurrentUser(settingsIdentityOp, [](qint64) {});
-            return;
-        }
-        for (const auto &legacy : std::as_const(m_legacyTaskChats)) {
-            if (chats.size() >= tunables::kPageSizeChats)
-                break;
-            if (!taskDialogs.contains(legacy.id))
-                chats.append(legacy);
-        }
-        ++m_taskTitleGeneration;
-        if (badgesOnly && !m_showTaskChats) {
-            publishRecentChats(std::move(chats), true);
-            return;
-        }
-        resolveTaskChatTitles(std::move(chats), taskRecentOp, [this](QVector<Chat> result) {
-            for (const auto &chat : result)
-                storeChatMetadata(m_recentTitles, chat.id, chat.title);
-            publishRecentChats(std::move(result), true);
-        });
-    });
-}
-
-void CloudBackend::hydrateRecentUserStatuses(QVector<Chat> chats, const QStringList &ids, quint64 generation)
-{
-    Fields fields;
-    QSet<QString> pending;
-    for (const auto &id : ids) {
-        fields.append({QStringLiteral("ID[%1]").arg(fields.size()), id});
-        pending.insert(id);
-        rememberDismissalStatus(id, std::nullopt);
-    }
-    const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.list.get.json"));
-    m_portalHttp.webRequest(url, fields, recentUserStatusOp, QStringLiteral("result"),
-               [this, pending = std::move(pending), chats = std::move(chats), generation](QJsonValue data) mutable {
-        if (data.isNull() || generation != m_recentStatusGeneration)
-            return;
-        const auto record = [this, &pending](const QJsonObject &user, const QString &id) {
-            if (pending.contains(id))
-                rememberDismissalStatus(id, dismissedPersonalUser(id, {}, user));
-        };
-        if (data.isArray()) {
-            for (const auto item : data.toArray()) {
-                const auto user = item.toObject();
-                record(user, numericId(field(user, {"id", "ID"})));
-            }
-        } else {
-            const auto keyed = data.toObject();
-            for (auto it = keyed.constBegin(); it != keyed.constEnd(); ++it) {
-                const auto id = numericId(it.key());
-                const auto user = it.value().toObject();
-                const auto embedded = oneOf(user, {"id", "ID"});
-                if (embedded.isUndefined() || numericId(string(embedded)) == id)
-                    record(user, id);
-            }
-        }
-        bool changed = false;
-        for (auto &chat : chats) {
-            if (pending.contains(chat.id) && cachedDismissalStatus(chat.id) == true && !chat.dismissed) {
-                chat.dismissed = true;
-                changed = true;
-            }
-        }
-        if (changed) {
-            publishRecentChats(std::move(chats), false);
-            if (m_userId.isEmpty())
-                withCurrentUser(settingsIdentityOp, [](qint64) {});
-        }
-    }, recentUserStatusOp + QLatin1Char(':') + QString::number(generation));
-}
-
-CloudBackend::RecentOverlay &CloudBackend::recentOverlay(const QString &dialog)
-{
-    if (!m_recentOverlays.contains(dialog) && m_recentOverlays.size() >= 3 * tunables::kPageSizeChats)
-        m_recentOverlays.erase(m_recentOverlays.begin());
-    return m_recentOverlays[dialog];
-}
-
-void CloudBackend::publishRecentChats(QVector<Chat> chats, bool task)
-{
-    QSet<QString> listed;
-    bool hasLivePreview = false;
-    for (auto &chat : chats) {
-        listed.insert(chat.id);
-        decorateChatBadges(chat);
-        applyChatContact(chat);
-        const auto live = m_recentOverlays.constFind(chat.id);
-        if (live == m_recentOverlays.cend())
-            continue;
-        if (live->counter)
-            chat.unread = *live->counter;
-        if (live->markedUnread)
-            chat.markedUnread = *live->markedUnread;
-        const auto rejectedChatId = task ? live->rejectedTaskPreviewChatId : live->rejectedRecentPreviewChatId;
-        const auto &history = live->historyPreview;
-        const bool recoveredPreview = rejectedChatId > 0 && rejectedChatId == history.chatId;
-        if (recoveredPreview) {
-            chat.lastMessage = history.text;
-            if (history.updated.isValid())
-                chat.updated = history.updated;
-            hasLivePreview = true;
-        }
-        if (live->preview.updated.isValid() && (!chat.updated.isValid() || live->preview.updated >= chat.updated)
-            && (!recoveredPreview || live->messageId >= history.messageId)) {
-            chat.lastMessage = live->preview.lastMessage;
-            chat.updated = live->preview.updated;
-            hasLivePreview = true;
-        }
-    }
-    for (const auto &live : std::as_const(m_recentOverlays)) {
-        const auto &preview = live.preview;
-        if (preview.id.isEmpty() || preview.taskChat != task || listed.contains(preview.id)
-            || (live.counter.value_or(0) == 0 && !live.markedUnread.value_or(false)))
-            continue;
-        auto chat = preview;
-        decorateChatBadges(chat);
-        applyChatContact(chat);
-        chat.unread = live.counter.value_or(0);
-        chat.markedUnread = live.markedUnread.value_or(false);
-        chats.append(std::move(chat));
-        hasLivePreview = true;
-    }
-    if (hasLivePreview) {
-        std::stable_sort(chats.begin(), chats.end(), [this](const Chat &left, const Chat &right) {
-            if (left.pinned != right.pinned)
-                return left.pinned;
-            if (left.pinned)
-                return false;
-            if (left.updated != right.updated)
-                return left.updated > right.updated;
-            return m_recentOverlays.value(left.id).messageId > m_recentOverlays.value(right.id).messageId;
-        });
-    }
-    if (chats.size() > tunables::kPageSizeChats)
-        chats.resize(tunables::kPageSizeChats);
-    if (task) {
-        m_recentTaskChatItems = std::move(chats);
-        emit taskChatsLoaded(m_recentTaskChatItems);
-    } else {
-        m_recentChatItems = std::move(chats);
-        emit recentChatsLoaded(m_recentChatItems);
-    }
-    if (!m_haveCounterSnapshot)
-        publishUnreadChatCount();
-}
-
-void CloudBackend::applyRecentPull(const QString &command, const QString &dialog, const QString &chatId,
-                                  const QJsonObject &params, const QJsonObject &extra)
-{
-    if (dialog.isEmpty())
-        return;
-    const bool messageEvent = command == QLatin1String("message") || command == QLatin1String("messageChat");
-    const bool manualRead = command == QLatin1String("chatUnread");
-    const bool readEvent = command == QLatin1String("readMessage") || command == QLatin1String("readMessageChat");
-    if (!messageEvent && !manualRead && !readEvent)
-        return;
-
-    const auto counter = unreadCount(params.value(QStringLiteral("counter")));
-    const auto marked = manualRead ? std::optional<bool>(params.value(QStringLiteral("active")).toBool())
-        : readEvent ? notificationFlag(params.value(QStringLiteral("unread"))) : std::nullopt;
-    if (!counter && !marked)
-        return;
-    const auto message = params.value(QStringLiteral("message")).toObject();
-    const auto messageId = numericId(field(message, {"id"})).toLongLong();
-    const auto author = numericId(field(message, {"senderId", "authorId"}));
-    const auto state = m_dialogMessageStates.constFind(dialog);
-    if (messageEvent) {
-        const auto groupChatId = groupDialogChatId(dialog);
-        const auto knownChatId = groupChatId > 0 ? groupChatId : badgeChatId(dialog);
-        const auto eventChatId = chatId.toLongLong();
-        const auto expectedChatId = knownChatId > 0 ? knownChatId : eventChatId;
-        const auto messageChatId = explicitMessageChatId(message);
-        if ((knownChatId > 0 && eventChatId > 0 && eventChatId != knownChatId)
-            || (messageChatId != 0 && messageChatId != expectedChatId))
-            return;
-        if (!counter || messageId <= 0 || author.isEmpty() || author == m_userId
-            || m_sentTemplates.contains(field(message, {"templateId", "uuid"})))
-            return;
-        if (messageId <= m_recentOverlays.value(dialog).messageId
-            || (state != m_dialogMessageStates.cend()
-                && (messageId <= state->lastReadId || state->exactlyRead.contains(messageId))))
-            return;
-        const auto sent = date(extra.value(QStringLiteral("server_time_unix")));
-        if (extra.value(QStringLiteral("server_time_ago")).toInteger() > freshPopupSeconds
-            || (sent.isValid() && sent.secsTo(QDateTime::currentDateTimeUtc()) > freshPopupSeconds))
-            return;
-        if (m_userId.isEmpty()) {
-            if (m_recentPullsAwaitingIdentity.size() >= 8)
-                m_recentPullsAwaitingIdentity.removeFirst();
-            m_recentPullsAwaitingIdentity.append({command, dialog, chatId, params, extra});
-            withCurrentUser(settingsIdentityOp, [this](qint64 id) {
-                if (id == 0)
-                    m_recentPullsAwaitingIdentity.clear();
-            });
-            return;
-        }
-        const auto members = params.value(QStringLiteral("userInChat")).toObject().value(chatId);
-        if (members.isArray()) {
-            const auto users = members.toArray();
-            if (std::none_of(users.cbegin(), users.cend(), [this](const QJsonValue &user) { return string(user) == m_userId; }))
-                return;
-        }
-    }
-
-    const auto sections = params.value(QStringLiteral("recentConfig")).toObject().value(QStringLiteral("sections")).toArray();
-    const auto lookup = [&dialog](const QVector<Chat> &chats) {
-        return std::find_if(chats.cbegin(), chats.cend(), [&dialog](const Chat &chat) { return chat.id == dialog; });
-    };
-    const auto ordinary = lookup(m_recentChatItems);
-    const auto task = lookup(m_recentTaskChatItems);
-    const bool listedOrdinary = ordinary != m_recentChatItems.cend();
-    const bool listedTask = task != m_recentTaskChatItems.cend();
-    const auto chat = params.value(QStringLiteral("chat")).toObject().value(chatId).toObject();
-    const auto user = params.value(QStringLiteral("users")).toObject().value(dialog).toObject();
-    auto candidate = chatFromMetadata(dialog, {}, chat, user);
-    candidate.serverChatId = chatId.toLongLong();
-    candidate.taskChat = isRecentTaskChat(candidate.taskChat, listedTask, sections);
-    const bool listed = candidate.taskChat ? listedTask : listedOrdinary;
-    const auto previous = m_recentOverlays.constFind(dialog);
-    const bool knownRow = listed || (previous != m_recentOverlays.cend() && !previous->preview.id.isEmpty());
-    if (candidate.taskChat && listedTask)
-        candidate = *task;
-    else if (!candidate.taskChat && listedOrdinary)
-        candidate = *ordinary;
-
-    const auto eventChatId = chatId.toLongLong();
-    const auto canonicalChatId = eventChatId > 0 ? eventChatId
-        : candidate.serverChatId > 0 ? candidate.serverChatId : badgeChatId(dialog);
-    m_projects.rememberProjectUnreadTaskChat(candidate);
-    const bool inRecentScope = knownRow || (candidate.taskChat ? !sections.isEmpty()
-                                                               : sections.contains(QStringLiteral("default")));
-    const bool inProjectScope = m_projects.containsChat(canonicalChatId)
-        && dialog == chatDialog(QString::number(canonicalChatId));
-    // Reads, manual marks and updates for snapshot chats also affect the global count off page.
-    if (!inRecentScope && !inProjectScope
-        && (canonicalChatId <= 0 || (messageEvent && !m_chatCounterBadges.contains(canonicalChatId))))
-        return;
-    auto &live = recentOverlay(dialog);
-    live.chatId = canonicalChatId;
-    live.counterRevision = ++m_chatBadgeRevision;
-    if (counter)
-        live.counter = counter;
-    if (marked)
-        live.markedUnread = marked;
-    live.eventTime = std::max(live.eventTime, field(extra, {"server_time_unix"}).toLongLong());
-    if (messageEvent) {
-        live.messageId = messageId;
-        live.incomingId = messageId;
-        if (inRecentScope && (!params.value(QStringLiteral("skipRecentUpdate")).toBool() || !knownRow)) {
-            if (candidate.title.isEmpty())
-                candidate.title = recentTitle(dialog, QStringLiteral("Диалог %1").arg(dialog));
-            candidate.lastMessage = field(message, {"text", "message"}).left(2000);
-            candidate.updated = date(message.value(QStringLiteral("date")));
-            if (!candidate.updated.isValid())
-                candidate.updated = date(extra.value(QStringLiteral("server_time_unix")));
-            if (!candidate.updated.isValid())
-                candidate.updated = QDateTime::currentDateTimeUtc();
-            live.preview = candidate;
-        }
-    }
-    if (inRecentScope && (knownRow || live.counter.value_or(0) > 0 || live.markedUnread.value_or(false)))
-        publishRecentChats(candidate.taskChat ? m_recentTaskChatItems : m_recentChatItems, candidate.taskChat);
-    if (inProjectScope)
-        m_projects.publishProjectTaskChatBadges(canonicalChatId);
-    publishUnreadChatCount();
-}
-
-bool CloudBackend::acceptsRecentRead(const QString &dialog, const QJsonObject &params, const QJsonObject &extra) const
-{
-    const auto live = m_recentOverlays.constFind(dialog);
-    const auto state = m_dialogMessageStates.constFind(dialog);
-    const auto currentRead = state == m_dialogMessageStates.cend() ? -1 : state->lastReadId;
-    const auto eventTime = field(extra, {"server_time_unix"}).toLongLong();
-    bool hasRead = false;
-    const auto lastRead = field(params, {"lastId"}).toLongLong(&hasRead);
-    const bool exact = notificationFlag(params.value(QStringLiteral("exact"))).value_or(false);
-    if (hasRead && !exact && lastRead < currentRead)
-        return false;
-    if (live == m_recentOverlays.cend())
-        return true;
-    if (eventTime > 0 && eventTime < live->eventTime)
-        return false;
-    if (!hasRead || live->incomingId <= lastRead || live->counter.value_or(0) <= 0)
-        return true;
-
-    const auto viewed = params.value(QStringLiteral("viewedMessages")).toArray();
-    if (std::any_of(viewed.cbegin(), viewed.cend(), [id = live->incomingId](const QJsonValue &value) {
-            return string(value).toLongLong() == id;
-        }))
-        return true;
-    // A read below the latest unread message can clear earlier messages. It cannot clear the
-    // whole chat. Require a current server event or advancing cursor before adopting a partial count.
-    const auto counter = unreadCount(params.value(QStringLiteral("counter")));
-    return counter != 0 && (lastRead > currentRead || (eventTime > 0 && eventTime > live->eventTime));
-}
-
-void CloudBackend::rememberTaskTitle(const QString &id, const QString &title)
-{
-    if (id.isEmpty() || title.isEmpty())
-        return;
-    storeChatMetadata(m_taskChatTitles, id, title);
-}
-
-QString CloudBackend::recentTitle(const QString &dialog, const QString &fallback) const
-{
-    const auto *title = m_recentTitles.object(dialog);
-    return title ? *title : fallback;
-}
-
-void CloudBackend::resolveTaskChatTitles(QVector<Chat> chats, const QString &key, std::function<void(QVector<Chat>)> deliver)
-{
-    Fields fields{{QStringLiteral("select[]"), QStringLiteral("ID")},
-                  {QStringLiteral("select[]"), QStringLiteral("TITLE")},
-                  {QStringLiteral("start"), QStringLiteral("-1")}};
-    QSet<QString> missing;
-    for (auto &chat : chats) {
-        if (chat.taskId.isEmpty())
-            continue;
-        if (const auto *title = m_taskChatTitles.object(chat.taskId)) {
-            chat.title = *title;
-        } else {
-            missing.insert(chat.taskId);
-        }
-    }
-    const auto generation = m_taskTitleGeneration;
-    const auto scope = m_accountScopeRevision;
-    // Show available rows even if the optional title batch is unavailable.
-    deliver(chats);
-    if (missing.isEmpty() || scope != m_accountScopeRevision || generation != m_taskTitleGeneration)
-        return;
-    auto ids = missing.values();
-    std::sort(ids.begin(), ids.end());
-    for (qsizetype i = 0; i < ids.size(); ++i)
-        fields.append({QStringLiteral("filter[ID][%1]").arg(i), ids.at(i)});
-    ajax(QStringLiteral("tasks.task.list"), fields, operationKey(OperationKind::TaskChatTitles),
-         [this, generation, chats = std::move(chats), missing = std::move(missing),
-          deliver = std::move(deliver)](QJsonValue data) mutable {
-        if (generation != m_taskTitleGeneration)
-            return;
-        for (const auto row : data.toObject().value(QStringLiteral("tasks")).toArray()) {
-            const auto item = row.toObject();
-            const auto id = numericId(field(item, {"id", "ID"}));
-            if (missing.contains(id))
-                rememberTaskTitle(id, field(item, {"title", "TITLE"}));
-        }
-        bool changed = false;
-        for (auto &chat : chats) {
-            const auto *title = m_taskChatTitles.object(chat.taskId);
-            if (title && chat.title != *title) {
-                chat.title = *title;
-                changed = true;
-            }
-        }
-        if (changed)
-            deliver(std::move(chats));
-    }, operationKey(OperationKind::TaskChatTitlesRequest, key, ids.join(QLatin1Char(','))));
+    m_chats.resumeRecentWithIdentity();
 }
 
 bool CloudBackend::isCurrentHistory(bool task, const QString &key, const QString &dialog) const
 {
     return canAutoRefreshChats() && !dialog.isEmpty()
-        && (task ? m_openTask == key && m_taskDialogs.value(key) == dialog
-                 : m_activeSection == 0 && m_openDialog == dialog);
-}
-
-void CloudBackend::loadMessages(const QString &key, const QString &dialogId, bool task, bool retry)
-{
-    if (m_userId.isEmpty() && (!m_triedHistoryIdentity || m_portalHttp.contains(chatIdentityOp))) {
-        auto &pending = m_historiesWaitingForIdentity;
-        pending.erase(std::remove_if(pending.begin(), pending.end(), [task](const auto &request) {
-            return request.task == task;
-        }), pending.end());
-        pending.append({key, dialogId, task});
-        if (!m_triedHistoryIdentity) {
-            m_triedHistoryIdentity = true;
-            withCurrentUser(chatIdentityOp, [this](qint64) { resumeHistoriesWithIdentity(); });
-        }
-        return;
-    }
-    const auto operation = operationKey(task ? OperationKind::TaskMessages : OperationKind::Chat, key);
-    if (m_portalHttp.contains(operation))
-        return;
-    m_portalHttp.beginHistory(dialogId, task, retry);
-    const auto generation = m_dialogMessageStates.value(dialogId).historyGeneration;
-    const auto superseded = [this, key, dialogId, task, generation, scope = m_accountScopeRevision] {
-        if (scope != m_accountScopeRevision)
-            return true;
-        if (m_dialogMessageStates.value(dialogId).historyGeneration == generation)
-            return false;
-        if (task ? m_openTask == key : m_openDialog == dialogId) {
-            (task ? m_taskMessagesDirty : m_chatDirty) = true;
-            scheduleRefresh();
-        }
-        return true;
-    };
-    const auto expectedChatId = badgeChatId(dialogId);
-    const auto groupChatId = groupDialogChatId(dialogId);
-    const auto popupChatId = groupChatId > 0 ? groupChatId : expectedChatId;
-    const bool snapshot = expectedChatId > 0;
-    const auto snapshotOperation = operationKey(snapshot ? OperationKind::ChatHistorySnapshot : OperationKind::ChatHistoryRead, operation);
-    const auto deliver = [this, key, dialogId, popupChatId, task](const QJsonObject &history, bool trustedMetadata) {
-        const auto messages = decodeMessages(history, true, dialogId);
-        if (trustedMetadata && (task ? m_openTask == key : m_openDialog == dialogId)) {
-            rememberRecentHistoryPreview(dialogId, history);
-            reconcileHistoryPopups(dialogId, popupChatId, task, history, messages);
-        }
-        if (task)
-            emit taskMessagesLoaded(key, messages);
-        else
-            emit chatMessagesLoaded(key, messages);
-    };
-    ajax(QStringLiteral("im.v2.Chat.load"),
-         {{QStringLiteral("dialogId"), dialogId}, {QStringLiteral("messageLimit"), QStringLiteral("25")}},
-         snapshotOperation,
-         [this, key, dialogId, task, operation, superseded, deliver, popupChatId,
-                             counterRevision = ++m_chatBadgeRevision](QJsonValue data) {
-        if (superseded())
-            return;
-        const auto object = data.toObject();
-        if (!matchesRequestedHistory(object, dialogId, popupChatId)) {
-            // Retain direct history rows for existing callers without accepting the conflicting chat metadata.
-            if (object.value(QStringLiteral("messages")).isArray())
-                deliver(object, false);
-            else
-                failShape(operation);
-            return;
-        }
-        const auto chat = object.value(QStringLiteral("chat")).toObject();
-        const auto publishHistory = [this, key, dialogId, task, chat, popupChatId, counterRevision, deliver]
-            (const QJsonObject &history) {
-            if (task ? m_openTask == key : m_openDialog == dialogId) {
-                const auto rows = history.value(QStringLiteral("messages")).toArray();
-                rememberUnreadHistoryRows(dialogId, popupChatId > 0 ? popupChatId : badgeChatId(dialogId),
-                                          rows, counterRevision);
-                reconcileHistoryUnread(dialogId, chat, rows, popupChatId, counterRevision);
-            }
-            deliver(history, true);
-        };
-        if (data.isObject()) {
-            const auto live = m_recentOverlays.constFind(dialogId);
-            const auto counterCurrent = m_chatCounterSnapshotRevision <= counterRevision
-                && (live == m_recentOverlays.cend() || live->counterRevision <= counterRevision);
-            rememberDialog(dialogId, object, counterCurrent);
-            rememberDialogContact(dialogId, object);
-            acceptPinnedSnapshot(dialogId, object);
-        } else if (task ? m_openTask != key : m_openDialog != dialogId) {
-            return;
-        }
-        if (object.value(QStringLiteral("messages")).isArray()) {
-            publishHistory(object);
-            return;
-        }
-        auto chatId = field(object, {"chatId", "CHAT_ID"});
-        if (chatId.isEmpty())
-            chatId = QString::number(popupChatId > 0 ? popupChatId : badgeChatId(dialogId));
-        const auto pagingChatId = numericId(chatId).toLongLong();
-        if (pagingChatId <= 0 || (popupChatId > 0 && pagingChatId != popupChatId))
-            return failShape(operation);
-
-        ajax(QStringLiteral("im.v2.Chat.Message.list"),
-             {{QStringLiteral("chatId"), chatId}, {QStringLiteral("limit"), QStringLiteral("25")}},
-             operationKey(OperationKind::ChatHistoryRead, operation), [this, operation, dialogId, pagingChatId, superseded, publishHistory](QJsonValue page) {
-            if (superseded())
-                return;
-            const auto result = page.toObject();
-            if (!result.value(QStringLiteral("messages")).isArray() || !matchesRequestedHistory(result, dialogId, pagingChatId))
-                return failShape(operation);
-            publishHistory(result);
-        }, operation);
-    }, operation);
-}
-
-void CloudBackend::rememberUnreadHistoryRows(const QString &dialog, qint64 chatId, const QJsonArray &rows, quint64 revision)
-{
-    if (chatId <= 0 || badgeChatId(dialog) != chatId)
-        return;
-    auto &state = dialogMessageState(dialog);
-    if (state.readReceiptRevision > revision)
-        return;
-    const auto currentUser = numericId(m_userId).toLongLong();
-    QSet<qint64> pageUnread;
-    for (const auto &value : rows) {
-        const auto row = value.toObject();
-        const auto id = recentMessageId(row);
-        const auto unread = row.value(QStringLiteral("unread"));
-        if (id <= 0 || !unread.isBool() || explicitMessageChatId(row) != chatId)
-            continue;
-        if (!unread.toBool() || id <= state.confirmedReadThrough || state.exactlyRead.contains(id)) {
-            state.historyUnread.remove(id);
-            pageUnread.remove(id);
-            continue;
-        }
-        const auto author = explicitMessageAuthorId(row);
-        if (author && (*author == 0 || (currentUser > 0 && *author != currentUser))
-            && pageUnread.size() < tunables::kPageSizeMessages)
-            pageUnread.insert(id);
-    }
-    state.historyUnread.subtract(pageUnread);
-    const auto excess = state.historyUnread.size() + pageUnread.size() - tunables::kRetainedChatMessages;
-    if (excess > 0) {
-        auto oldest = state.historyUnread.values();
-        std::sort(oldest.begin(), oldest.end());
-        for (qsizetype index = 0; index < excess; ++index)
-            state.historyUnread.remove(oldest.at(index));
-    }
-    state.historyUnread.unite(pageUnread);
-}
-
-void CloudBackend::reconcileHistoryUnread(const QString &dialog, const QJsonObject &chat, const QJsonArray &messages,
-                                         qint64 expectedChatId, quint64 revision)
-{
-    const auto chatId = numericId(field(chat, {"id", "chatId"})).toLongLong();
-    const auto groupId = groupDialogChatId(dialog);
-    const auto chatIdAlias = chat.value(QStringLiteral("chatId"));
-    const auto firstUnreadId = unreadCount(chat.value(QStringLiteral("unreadId")));
-    const auto readIdValue = chat.value(QStringLiteral("lastId"));
-    bool hasReadId = true;
-    const auto readId = readIdValue.isString() ? readIdValue.toString().toLongLong(&hasReadId)
-        : readIdValue.toInteger(-1);
-    if (chatId <= 0 || (expectedChatId > 0 && chatId != expectedChatId)
-        || (groupId > 0 && chatId != groupId)
-        || (!chatIdAlias.isUndefined() && numericId(string(chatIdAlias)).toLongLong() != chatId)
-        || validDialog(field(chat, {"dialogId"})) != dialog || firstUnreadId != 0
-        || !hasReadId || readId < 0
-        || m_chatCounterSnapshotRevision > revision)
-        return;
-    const auto state = m_dialogMessageStates.constFind(dialog);
-    if (state != m_dialogMessageStates.cend() && readId < state->lastReadId)
-        return;
-    auto &live = recentOverlay(dialog);
-    if (live.counterRevision > revision || live.incomingId > readId)
-        return;
-
-    // Chat metadata carries a participant count. Only its explicit no-unread cursor can
-    // repair badges, and only if the exact scoped history does not contradict it.
-    for (const auto value : messages) {
-        const auto row = value.toObject();
-        if (recentMessageId(row) > 0 && explicitMessageChatId(row) == chatId
-            && notificationFlag(row.value(QStringLiteral("unread"))).value_or(false))
-            return;
-    }
-
-    const bool changed = live.chatId != chatId || live.counter != 0;
-    live.chatId = chatId;
-    live.counterRevision = revision;
-    live.counter = 0;
-    if (changed) {
-        publishUnreadChatCount();
-        republishChatBadges(chatId);
-    }
-}
-
-void CloudBackend::rememberRecentHistoryPreview(const QString &dialog, const QJsonObject &history)
-{
-    const auto groupChatId = groupDialogChatId(dialog);
-    const auto expectedChatId = groupChatId > 0 ? groupChatId : badgeChatId(dialog);
-    if (expectedChatId <= 0)
-        return;
-    QJsonObject latest;
-    qint64 latestId = 0;
-    for (const auto &value : history.value(QStringLiteral("messages")).toArray()) {
-        const auto message = value.toObject();
-        const auto id = recentMessageId(message);
-        if (id > latestId && explicitMessageChatId(message) == expectedChatId) {
-            latest = message;
-            latestId = id;
-        }
-    }
-    if (latestId <= 0)
-        return;
-    auto &live = recentOverlay(dialog);
-    const auto text = field(latest, {"text", "message"}).left(2000);
-    const auto updated = date(latest.value(QStringLiteral("date")));
-    const auto &previous = live.historyPreview;
-    if (previous.chatId == expectedChatId
-        && (latestId < previous.messageId
-            || (latestId == previous.messageId && text == previous.text && updated == previous.updated)))
-        return;
-    live.historyPreview = {expectedChatId, latestId, text, updated};
-    const bool recoverRecent = live.rejectedRecentPreviewChatId == expectedChatId;
-    const bool recoverTask = live.rejectedTaskPreviewChatId == expectedChatId;
-    if (recoverRecent)
-        publishRecentChats(m_recentChatItems, false);
-    if (recoverTask)
-        publishRecentChats(m_recentTaskChatItems, true);
-}
-
-void CloudBackend::resumeHistoriesWithIdentity()
-{
-    const auto histories = std::exchange(m_historiesWaitingForIdentity, {});
-    for (const auto &request : histories)
-        loadMessages(request.key, request.dialog, request.task);
-}
-
-void CloudBackend::requestChatMessages(const QString &dialogId)
-{
-    const auto valid = validDialog(dialogId);
-    if (valid.isEmpty()) {
-        emit failed(operationKey(OperationKind::Chat, dialogId), QStringLiteral("Некорректный номер диалога"));
-        return;
-    }
-    if (m_openDialog != valid) {
-        m_portalHttp.invalidateHistory(false);
-        m_openDialog = valid;
-        m_chatDirty = false;
-        m_chatPopupHistory = {};
-    }
-    if (m_activeSection == 0)
-        updateHistoryCatchup(true);
-    if (m_activeSection == 0 && canAutoRefreshChats() && (m_portalHttp.atCapacity()
-        || m_portalHttp.contains(operationKey(OperationKind::Chat, dialogId)))) {
-        m_chatDirty = true;
-        scheduleRefresh();
-        return;
-    }
-    loadMessages(dialogId, valid, false);
+        && (task ? m_timeline.openTask == key && m_timeline.taskDialogs.value(key) == dialog
+                 : m_activeSection == 0 && m_timeline.openDialog == dialog);
 }
 
 QString CloudBackend::settingsScope() const
@@ -1835,266 +669,6 @@ QString CloudBackend::settingsScope() const
     const auto origin = m_session.origin.toEncoded(QUrl::RemovePath | QUrl::RemoveQuery | QUrl::RemoveFragment);
     const auto digest = QCryptographicHash::hash(origin + '\n' + identity.toUtf8(), QCryptographicHash::Sha256).toHex();
     return QString::fromLatin1(digest);
-}
-
-void CloudBackend::fetchPortalHtml(const QUrl &url, std::function<void(QString)> handler)
-{
-    m_portalHttp.fetchPortalHtml(url, std::move(handler));
-}
-
-void CloudBackend::requestProjects()
-{
-    m_projects.requestProjects();
-}
-
-void CloudBackend::requestMoreProjects()
-{
-    m_projects.requestMoreProjects();
-}
-
-void CloudBackend::requestProjectMembers(const QString &projectId)
-{
-    m_projects.requestProjectMembers(projectId);
-}
-
-void CloudBackend::requestProjectFiles(const QString &projectId, const QString &folderId, int offset)
-{
-    m_projects.requestProjectFiles(projectId, folderId, offset);
-}
-
-void CloudBackend::setChatPinned(const QString &dialogId, bool pinned)
-{
-    const auto operation = operationKey(OperationKind::ChatPin, dialogId);
-    const auto dialog = validDialog(dialogId);
-    if (dialog.isEmpty()) {
-        emit failed(operation, QStringLiteral("Некорректный номер диалога"));
-        return;
-    }
-    const auto endpoint = pinned ? QStringLiteral("im.v2.Chat.pin") : QStringLiteral("im.v2.Chat.unpin");
-    ajax(endpoint, {{QStringLiteral("dialogId"), dialog}}, operation, [this, dialogId, pinned, operation](QJsonValue result) {
-        if (result == false)
-            return failShape(operation);
-        emit chatPinChanged(dialogId, pinned);
-    });
-}
-
-void CloudBackend::setProjectPinned(const QString &projectId, bool pinned)
-{
-    m_projects.setProjectPinned(projectId, pinned);
-}
-
-void CloudBackend::createProject(const QString &name)
-{
-    m_projects.createProject(name);
-}
-
-void CloudBackend::searchProjectTasks(const QString &projectId, const QString &query)
-{
-    m_projects.searchProjectTasks(projectId, query);
-}
-
-void CloudBackend::requestProjectBoard(const QString &projectId)
-{
-    m_projects.requestProjectBoard(projectId);
-}
-
-void CloudBackend::requestMoreBoardTasks(const QString &projectId, const QString &stageId)
-{
-    m_projects.requestMoreBoardTasks(projectId, stageId);
-}
-
-void CloudBackend::requestProjectStages(const QString &projectId)
-{
-    m_projects.requestProjectStages(projectId);
-}
-
-void CloudBackend::moveTask(const QString &projectId, const QString &taskId, const QString &stageId)
-{
-    m_projects.moveTask(projectId, taskId, stageId);
-}
-
-void CloudBackend::saveStage(const QString &projectId, const QString &stageId, const QString &title,
-                             const QString &afterStageId, const QString &color)
-{
-    m_projects.saveStage(projectId, stageId, title, afterStageId, color);
-}
-
-void CloudBackend::deleteStage(const QString &projectId, const QString &stageId)
-{
-    m_projects.deleteStage(projectId, stageId);
-}
-
-void CloudBackend::createTask(const QString &projectId, const TaskEdit &edit)
-{
-    m_tasks.createTask(projectId, edit);
-}
-
-void CloudBackend::createSubtask(const QString &parentId, const QString &projectId, const TaskEdit &edit)
-{
-    m_tasks.createSubtask(parentId, projectId, edit);
-}
-
-void CloudBackend::updateTask(const QString &taskId, const TaskEdit &edit)
-{
-    m_tasks.updateTask(taskId, edit);
-}
-
-void CloudBackend::deleteTask(const QString &taskId)
-{
-    m_tasks.deleteTask(taskId);
-}
-
-void CloudBackend::requestMessageLinkPreview(const QUrl &url, LinkPreviewHandler complete)
-{
-    const auto target = portalLinkPreviewTarget(m_session.origin, url);
-    if (m_authExpired || !target) {
-        complete({});
-        return;
-    }
-    const auto operation = operationKey(OperationKind::LinkPreview, QUuid::createUuid().toString(QUuid::WithoutBraces));
-    const auto scope = settingsScope();
-    const auto finish = [this, scope, complete = std::move(complete)](MessageLinkPreview preview) {
-        if (m_authExpired || settingsScope() != scope)
-            preview = {};
-        complete(std::move(preview));
-    };
-    switch (target->kind) {
-    case NotificationTargetKind::Task:
-        m_tasks.loadTask(target->id, operation, [this, finish, scope, operation](const QJsonObject &row) {
-            if (m_authExpired || settingsScope() != scope) {
-                finish({});
-                return;
-            }
-            const auto task = taskFromRow(row);
-            MessageLinkPreview preview{notificationDisplayText(task.name).left(160), {},
-                                       MessageLinkPreviewKind::Task};
-            const auto creator = row.value(QStringLiteral("creator")).toObject();
-            const auto responsible = row.value(QStringLiteral("responsible")).toObject();
-            preview.creatorAvatarUrl = m_tasks.taskRoleAvatar({}, creator, task.creatorId);
-            preview.assigneeAvatarUrl = m_tasks.taskRoleAvatar({}, responsible, task.assigneeId);
-            if (!preview.title.isEmpty()) {
-                const auto append = [&preview](const QString &label, const QString &value) {
-                    const auto display = notificationDisplayText(value).left(180);
-                    if (!display.isEmpty())
-                        preview.details.append(label.arg(display));
-                };
-                append(QStringLiteral("Статус · %1"), task.status);
-                append(QStringLiteral("Постановщик · %1"), task.createdBy);
-                append(QStringLiteral("Исполнитель · %1"), task.assignee);
-                append(QStringLiteral("Описание · %1"), task.description);
-            }
-            const auto explicitProject = field(row, {"groupId", "GROUP_ID"});
-            const auto projectId = explicitProject.isEmpty() ? task.projectId : numericId(explicitProject);
-            const auto group = row.value(QStringLiteral("group")).toObject();
-            const auto nestedProject = numericId(field(group, {"id", "ID"}));
-            const auto fallbackName = explicitProject.isEmpty()
-                || (!projectId.isEmpty() && (nestedProject.isEmpty() || nestedProject == projectId))
-                ? task.project : QString{};
-            const bool canLoadProject = !preview.title.isEmpty() && !projectId.isEmpty()
-                && !m_authExpired && settingsScope() == scope;
-            auto applyProject = [this, finish, fallbackName, stageId = task.stageId,
-                                 stageName = task.stageName, hasStatus = !task.status.isEmpty(),
-                                 preview = std::move(preview)](Project project, QString) mutable {
-                if (!preview.title.isEmpty()) {
-                    const auto name = notificationDisplayText(project.name.isEmpty() ? fallbackName : project.name).left(180);
-                    if (!name.isEmpty())
-                        preview.details.append(QStringLiteral("Проект · %1").arg(name));
-                    if (!project.name.isEmpty())
-                        preview.project = std::move(project);
-                }
-                const auto group = preview.project ? preview.project->id : QString{};
-                auto applyStage = [finish, stageName, hasStatus, preview = std::move(preview)](Stage stage) mutable {
-                    const auto name = notificationDisplayText(stage.name.isEmpty() ? stageName : stage.name).left(180);
-                    if (!preview.title.isEmpty() && !name.isEmpty()) {
-                        preview.details.insert(hasStatus ? 1 : 0, QStringLiteral("Стадия · %1").arg(name));
-                        preview.stageColor = stage.color;
-                    }
-                    finish(std::move(preview));
-                };
-                if (group.isEmpty() || numericId(stageId).isEmpty())
-                    applyStage({});
-                else
-                    m_projects.loadLinkStage(group, stageId, std::move(applyStage));
-            };
-            if (canLoadProject)
-                m_projects.loadLinkProject(projectId, operation, std::move(applyProject));
-            else
-                applyProject({}, {});
-        }, {}, false);
-        break;
-    case NotificationTargetKind::Project:
-        m_projects.loadLinkProject(target->id, operation, [finish](Project project, const QString &text) {
-            MessageLinkPreview preview{notificationDisplayText(project.name).left(160), {}, MessageLinkPreviewKind::Project};
-            const auto description = notificationDisplayText(text).left(180);
-            if (!description.isEmpty())
-                preview.details.append(description);
-            if (!preview.title.isEmpty())
-                preview.project = std::move(project);
-            finish(std::move(preview));
-        });
-        break;
-    case NotificationTargetKind::Person:
-        loadPerson(target->id, operation, [finish](const Person &person) {
-            finish({person.name, person.position.isEmpty() ? QStringList{} : QStringList{person.position},
-                    MessageLinkPreviewKind::Person, person.avatarUrl});
-        });
-        break;
-    case NotificationTargetKind::Chat:
-        ajax(QStringLiteral("im.v2.Chat.load"),
-             {{QStringLiteral("dialogId"), target->id}, {QStringLiteral("messageLimit"), QStringLiteral("1")}},
-             operation, [this, dialogId = target->id, finish](QJsonValue value) {
-            const auto chat = value.toObject().value(QStringLiteral("chat")).toObject();
-            const auto supplied = field(chat, {"dialogId", "DIALOG_ID"});
-            if (chatDialog(field(chat, {"id", "chatId", "ID"})) != dialogId
-                || (!supplied.isEmpty() && supplied != dialogId)) {
-                finish({});
-                return;
-            }
-            finish({notificationDisplayText(field(chat, {"name", "title", "TITLE"})).left(160), {},
-                    MessageLinkPreviewKind::Chat, avatarUrlFromPortal(field(chat, {"avatar", "avatarUrl"}))});
-        });
-        break;
-    }
-}
-
-void CloudBackend::requestTask(const QString &taskId)
-{
-    m_tasks.requestTask(taskId);
-}
-
-void CloudBackend::requestTaskChecklist(const QString &taskId)
-{
-    m_tasks.requestTaskChecklist(taskId);
-}
-
-void CloudBackend::addTaskChecklistItem(const QString &taskId, const QString &parentId, const QString &title)
-{
-    m_tasks.addTaskChecklistItem(taskId, parentId, title);
-}
-
-void CloudBackend::setTaskChecklistComplete(const QString &taskId, const QString &itemId, bool complete)
-{
-    m_tasks.setTaskChecklistComplete(taskId, itemId, complete);
-}
-
-void CloudBackend::requestSubtasks(const QString &taskId)
-{
-    m_tasks.requestSubtasks(taskId);
-}
-
-void CloudBackend::requestTaskDependencies(const QString &taskId)
-{
-    m_tasks.requestTaskDependencies(taskId);
-}
-
-void CloudBackend::requestTaskHistory(const QString &taskId)
-{
-    m_tasks.requestTaskHistory(taskId);
-}
-
-void CloudBackend::requestProjectTimeline(const QString &projectId)
-{
-    m_projects.requestProjectTimeline(projectId);
 }
 
 void CloudBackend::rememberLoadedTask(const QString &taskId, const QJsonObject &task, quint64 bindingRevision)
@@ -2109,1420 +683,25 @@ void CloudBackend::rememberLoadedTask(const QString &taskId, const QJsonObject &
             m_projects.rememberProjectUnreadTask(chatId, taskId.toLongLong(), group);
             m_projects.publishProjectUnreadCounts();
         }
-        if (m_taskDialogs.size() >= tunables::kPageSizeChats)
-            m_taskDialogs.erase(m_taskDialogs.begin());
-        m_taskDialogs.insert(taskId, dialog);
+        if (m_timeline.taskDialogs.size() >= tunables::kPageSizeChats)
+            m_timeline.taskDialogs.erase(m_timeline.taskDialogs.begin());
+        m_timeline.taskDialogs.insert(taskId, dialog);
     } else {
-        m_taskDialogs.remove(taskId);
+        m_timeline.taskDialogs.remove(taskId);
     }
-}
-
-void CloudBackend::updateTaskChatProject(const QString &taskId, qint64 project)
-{
-    m_projects.updateProjectUnreadTask(taskId.toLongLong(), groupDialogChatId(m_taskDialogs.value(taskId)), project);
 }
 
 void CloudBackend::clearDeletedTaskHistory(const QString &taskId)
 {
-    if (m_openTask == taskId)
+    if (m_timeline.openTask == taskId)
         clearOpenHistory(true);
     invalidateTaskChat(taskId);
 }
 
 void CloudBackend::forgetTaskChat(const QString &taskId)
 {
-    m_taskDialogs.remove(taskId);
-    m_taskChatTitles.remove(taskId);
-}
-
-void CloudBackend::requestTaskMessages(const QString &taskId)
-{
-    if (m_openTask != taskId) {
-        m_portalHttp.invalidateHistory(true);
-        m_openTask = taskId;
-        m_taskMessagesDirty = false;
-        m_taskPopupHistory = {};
-    }
-    updateHistoryCatchup(true);
-    if (canAutoRefreshChats() && (m_portalHttp.atCapacity()
-        || m_portalHttp.contains(operationKey(OperationKind::TaskMessages, taskId)))) {
-        m_taskMessagesDirty = true;
-        scheduleRefresh();
-        return;
-    }
-    if (const auto id = m_taskDialogs.value(taskId); !id.isEmpty()) {
-        loadMessages(taskId, id, true);
-        return;
-    }
-    const auto op = operationKey(OperationKind::TaskMessages, taskId);
-    m_tasks.loadTask(taskId, op, [this, taskId, op](const QJsonObject &) {
-        const auto dialog = m_taskDialogs.value(taskId);
-        if (dialog.isEmpty()) {
-            emit failed(op, QStringLiteral("У задачи нет чата. Старые обсуждения могут быть в комментариях портала"));
-            return;
-        }
-        loadMessages(taskId, dialog, true);
-    });
-}
-
-void CloudBackend::sendMessage(const QString &key, const QString &dialogId, const QString &text, bool task,
-                               const QString &replyId)
-{
-    const auto scope = operationKey(task ? OperationKind::Task : OperationKind::Chat, key);
-    const auto op = operationKey(task ? OperationKind::SendTask : OperationKind::SendChat, key);
-    if (m_portalHttp.contains(op))
-        return;
-    if (validDialog(dialogId).isEmpty() || text.trimmed().isEmpty() || text.size() > 20000) {
-        emit failed(op, QStringLiteral("Введите сообщение длиной до 20 000 символов"));
-        return;
-    }
-    const auto reply = numericId(replyId);
-    if (!replyId.isEmpty() && reply.isEmpty()) {
-        emit failed(op, QStringLiteral("Некорректный идентификатор цитируемого сообщения"));
-        return;
-    }
-    const auto templateId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    m_sentTemplates.enqueue(templateId);
-    if (m_sentTemplates.size() > 64)
-        m_sentTemplates.dequeue();
-    Fields fields{{QStringLiteral("dialogId"), dialogId},
-                  {QStringLiteral("fields[message]"), text},
-                  {QStringLiteral("fields[templateId]"), templateId}};
-    if (!reply.isEmpty())
-        fields.append({QStringLiteral("fields[replyId]"), reply});
-    ajax(QStringLiteral("im.v2.Chat.Message.send"), std::move(fields),
-         op, [this, key, scope, op, dialogId, task](QJsonValue data) {
-        const auto id = field(data.toObject(), {"id", "messageId"});
-        if (id.isEmpty()) {
-            emit failed(op, QStringLiteral("Портал не подтвердил отправку. Проверьте историю перед повтором"));
-            return;
-        }
-        emit messageSent(scope, id);
-        if (task && m_openTask == key)
-            m_taskMessagesDirty = true;
-        else if (!task && m_openDialog == dialogId)
-            m_chatDirty = true;
-        scheduleRefresh();
-    });
-}
-
-void CloudBackend::sendChatMessage(const QString &dialogId, const QString &text)
-{
-    sendMessage(dialogId, dialogId, text, false);
-}
-
-void CloudBackend::sendChatReply(const QString &dialog, const QString &text, const QString &replyId)
-{
-    if (replyId.isEmpty()) {
-        emit failed(operationKey(OperationKind::SendChat, dialog), QStringLiteral("Выберите сообщение для ответа"));
-        return;
-    }
-    sendMessage(dialog, dialog, text, false, replyId);
-}
-
-void CloudBackend::sendTaskMessage(const QString &taskId, const QString &text)
-{
-    sendTaskMessage(taskId, text, {});
-}
-
-void CloudBackend::sendTaskReply(const QString &taskId, const QString &text, const QString &replyId)
-{
-    if (replyId.isEmpty()) {
-        emit failed(operationKey(OperationKind::SendTask, taskId), QStringLiteral("Выберите сообщение для ответа"));
-        return;
-    }
-    sendTaskMessage(taskId, text, replyId);
-}
-
-void CloudBackend::sendTaskMessage(const QString &taskId, const QString &text, const QString &replyId)
-{
-    const auto dialog = m_taskDialogs.value(taskId);
-    if (dialog.isEmpty()) {
-        emit failed(operationKey(OperationKind::SendTask, taskId), QStringLiteral("Сначала откройте чат задачи"));
-        return;
-    }
-    sendMessage(taskId, dialog, text, true, replyId);
-}
-
-QString CloudBackend::replyPreviewKey(const QString &dialog, const QString &message)
-{
-    return dialog + QLatin1Char('\n') + message;
-}
-
-void CloudBackend::resetNoticeState()
-{
-    const bool pagingVisible = m_loadingOlderNotifications || m_notificationOlderCursor.id > 0;
-    m_notifications.clear();
-    m_notificationSearchRows.clear();
-    m_notificationSearchQuery.clear();
-    m_notificationMutations.clear();
-    m_notificationRevision = 0;
-    m_notificationOlderCursor = {};
-    m_notificationOlderPages = 0;
-    m_loadingOlderNotifications = false;
-    m_notificationsDirty = false;
-    m_pendingInitialAlerts.clear();
-    m_pendingChatPopups.clear();
-    m_seenChatPopups.clear();
-    m_chatPopupHistory = {};
-    m_taskPopupHistory = {};
-    if (pagingVisible)
-        publishNotificationHistoryPageState();
-}
-
-void CloudBackend::notificationBatch(const QString &method, const QUrlQuery &parameters,
-                                     const QString &operation, std::function<void(QJsonValue)> onResult,
-                                     const QString &requestKey)
-{
-    auto command = method;
-    if (!parameters.isEmpty())
-        command += QLatin1Char('?') + parameters.toString(QUrl::FullyEncoded);
-    const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
-    m_portalHttp.webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")},
-                     {QStringLiteral("cmd[notify]"), command}},
-               operation, QStringLiteral("result"),
-               [this, operation, onResult = std::move(onResult)](QJsonValue batch) {
-        const auto result = batch.toObject().value(QStringLiteral("result")).toObject().value(QStringLiteral("notify"));
-        if (result.isUndefined() || result.isNull())
-            return failShape(operation);
-        onResult(result);
-    }, notificationRequestKey(m_accountScopeRevision, requestKey.isEmpty() ? operation : requestKey));
-}
-
-QVector<Notification> CloudBackend::decodeNotifications(const QJsonArray &rows, const QJsonValue &users,
-                                                         quint64 requestedAt) const
-{
-    QVector<Notification> items;
-    QSet<QString> ids;
-    for (const auto row : rows) {
-        if (items.size() == maxNotifications)
-            break;
-        const auto item = row.toObject();
-        const auto id = numericId(field(item, {"id"}));
-        if (id.isEmpty() || ids.contains(id))
-            continue;
-        const auto version = m_notificationMutations.constFind(id);
-        const bool newer = version != m_notificationMutations.cend() && version->revision > requestedAt;
-        if (newer && version->removed)
-            continue;
-        ids.insert(id);
-        const auto title = notificationDisplayText(field(item, {"notify_title"}));
-        Notification notice{id, field(item, {"notify_module"}),
-                            title.isEmpty() ? QStringLiteral("Уведомление Битрикс24") : title, {},
-                            date(item.value(QStringLiteral("date"))),
-                            newer ? version->read : field(item, {"notify_read"}) == QLatin1String("Y")};
-        const auto authorId = noticeAuthorId(item);
-        decodeNotificationContent(notice, m_session.origin, field(item, {"text"}),
-                                  item.value(QStringLiteral("params")).toObject(),
-                                  authorId, noticeAuthorName(authorId, users));
-        items.append(std::move(notice));
-    }
-    return items;
-}
-
-CloudBackend::NotificationCursor CloudBackend::notificationCursor(const QJsonArray &rows)
-{
-    if (rows.size() != notificationPageSize)
-        return {};
-    const auto tail = rows.last().toObject();
-    const auto id = numericId(field(tail, {"id"})).toLongLong();
-    const int type = field(tail, {"notify_type"}).toInt();
-    if (id <= 0 || (type != 1 && type != 2 && type != 4))
-        return {};
-    return {id, type == 1 ? 1 : 3};
-}
-
-void CloudBackend::publishNotificationHistoryPageState()
-{
-    const bool more = m_notificationOlderCursor.id > 0;
-    emit notificationHistoryPageStateChanged(more, m_loadingOlderNotifications);
-}
-
-void CloudBackend::publishNotificationPage(QVector<Notification> items)
-{
-    QSet<QString> ids;
-    for (const auto &item : std::as_const(items))
-        ids.insert(item.id);
-    for (const auto &live : std::as_const(m_notifications)) {
-        if (!ids.contains(live.id)) {
-            ids.insert(live.id);
-            items.append(live);
-        }
-    }
-    std::stable_sort(items.begin(), items.end(), [](const Notification &left, const Notification &right) {
-        return left.createdAt > right.createdAt;
-    });
-    trimNotificationHistory(items, m_notificationOlderPages);
-    m_notifications = std::move(items);
-    emit notificationsLoaded(m_notifications);
-    publishNotificationHistoryPageState();
-}
-
-void CloudBackend::requestNotifications()
-{
-    QUrlQuery parameters;
-    parameters.addQueryItem(QStringLiteral("LIMIT"), QString::number(notificationPageSize));
-    parameters.addQueryItem(QStringLiteral("CONVERT_TEXT"), QStringLiteral("Y"));
-    notificationBatch(QStringLiteral("im.notify.get"), parameters, notificationsOp,
-                      [this, revision = m_notificationRevision](QJsonValue result) {
-        const auto response = result.toObject();
-        const auto rows = response.value(QStringLiteral("notifications"));
-        if (!rows.isArray())
-            return failShape(notificationsOp);
-
-        const auto page = rows.toArray();
-        if (m_notificationOlderPages == 0 && !m_loadingOlderNotifications)
-            m_notificationOlderCursor = notificationCursor(page);
-        publishNotificationPage(decodeNotifications(page, response.value(QStringLiteral("users")), revision));
-    });
-}
-
-void CloudBackend::requestOlderNotifications()
-{
-    const auto cursor = m_notificationOlderCursor;
-    if (!m_started || m_loadingOlderNotifications || cursor.id <= 0)
-        return;
-    m_loadingOlderNotifications = true;
-    publishNotificationHistoryPageState();
-    QUrlQuery parameters;
-    parameters.addQueryItem(QStringLiteral("LIMIT"), QString::number(notificationPageSize));
-    parameters.addQueryItem(QStringLiteral("CONVERT_TEXT"), QStringLiteral("Y"));
-    parameters.addQueryItem(QStringLiteral("LAST_ID"), QString::number(cursor.id));
-    parameters.addQueryItem(QStringLiteral("LAST_TYPE"), QString::number(cursor.type));
-    notificationBatch(QStringLiteral("im.notify.get"), parameters, olderNotificationsOp,
-                      [this, cursor, revision = m_notificationRevision](QJsonValue result) {
-        const auto response = result.toObject();
-        const auto rows = response.value(QStringLiteral("notifications"));
-        if (!rows.isArray())
-            return failShape(olderNotificationsOp);
-        const auto page = rows.toArray();
-        const auto next = notificationCursor(page);
-        const bool advances = next.id > 0 && ((next.type == cursor.type && next.id < cursor.id)
-            || (cursor.type == 1 && next.type == 3));
-        m_notificationOlderCursor = advances ? next : NotificationCursor{};
-        if (m_notificationOlderPages < std::numeric_limits<int>::max())
-            ++m_notificationOlderPages;
-        m_loadingOlderNotifications = false;
-        publishNotificationPage(decodeNotifications(page, response.value(QStringLiteral("users")), revision));
-    });
-}
-
-void CloudBackend::searchNotifications(const QString &query)
-{
-    const auto operation = operationKey(OperationKind::SearchNotifications, query);
-    if (query.size() < 3 || query.size() > 200)
-        return failShape(operation);
-    if (m_notificationSearchQuery != query)
-        m_notificationSearchRows.clear();
-    m_notificationSearchQuery = query;
-    QUrlQuery parameters;
-    // The batch command is decoded again to build REST query parameters. Encode
-    // separators in the literal search term before constructing the command.
-    parameters.setQuery(QStringLiteral("SEARCH_TEXT=") + QString::fromLatin1(QUrl::toPercentEncoding(query)));
-    notificationBatch(QStringLiteral("im.notify.history.search"), parameters, operation,
-                      [this, query, operation, revision = m_notificationRevision](QJsonValue result) {
-        if (query != m_notificationSearchQuery)
-            return;
-        const auto response = result.toObject();
-        const auto rows = response.value(QStringLiteral("notifications"));
-        if (!rows.isArray())
-            return failShape(operation);
-        m_notificationSearchRows = decodeNotifications(rows.toArray(), response.value(QStringLiteral("users")), revision);
-        emit notificationsFound(query, m_notificationSearchRows);
-    });
-}
-
-void CloudBackend::updateNotificationReadState(const QStringList &ids, bool read, std::optional<quint64> started)
-{
-    if (ids.isEmpty())
-        return;
-    const auto revision = ++m_notificationRevision;
-    QStringList changed;
-    for (const auto &id : ids) {
-        const auto previous = m_notificationMutations.constFind(id);
-        if (previous != m_notificationMutations.cend()
-            && (previous->removed || (started && previous->revision > *started)))
-            continue;
-        if (m_notificationMutations.size() >= 256 && !m_notificationMutations.contains(id))
-            m_notificationMutations.erase(m_notificationMutations.begin());
-        m_notificationMutations.insert(id, {revision, read, false});
-        changed.append(id);
-    }
-    if (changed.isEmpty())
-        return;
-    for (auto *source : {&m_notifications, &m_notificationSearchRows})
-        for (auto &item : *source)
-            if (changed.contains(item.id))
-                item.read = read;
-    emit notificationReadStateChanged(changed, read);
-}
-
-void CloudBackend::removeNotification(const QString &id)
-{
-    if (id.isEmpty())
-        return;
-    const auto previous = m_notificationMutations.constFind(id);
-    if (previous != m_notificationMutations.cend() && previous->removed)
-        return;
-    if (m_notificationMutations.size() >= 256 && !m_notificationMutations.contains(id))
-        m_notificationMutations.erase(m_notificationMutations.begin());
-    m_notificationMutations.insert(id, {++m_notificationRevision, false, true});
-    for (auto *source : {&m_notifications, &m_notificationSearchRows})
-        source->erase(std::remove_if(source->begin(), source->end(), [&id](const Notification &item) {
-            return item.id == id;
-        }), source->end());
-    emit notificationRemoved(id);
-}
-
-void CloudBackend::markNotificationRead(const QString &id)
-{
-    const auto operation = operationKey(OperationKind::ReadNotification);
-    if (id.isEmpty() || numericId(id) != id)
-        return failShape(operation);
-    QUrlQuery parameters;
-    parameters.addQueryItem(QStringLiteral("ID"), id);
-    parameters.addQueryItem(QStringLiteral("ACTION"), QStringLiteral("Y"));
-    parameters.addQueryItem(QStringLiteral("ONLY_CURRENT"), QStringLiteral("Y"));
-    notificationBatch(QStringLiteral("im.notify.read"), parameters, operation,
-                      [this, id, operation, started = m_notificationRevision](QJsonValue result) {
-        if (result != true && result.toObject().value(QStringLiteral("result")) != true)
-            return failShape(operation);
-        updateNotificationReadState({id}, true, started);
-        emit notificationActionFinished(operation);
-    });
-}
-
-void CloudBackend::markNotificationsRead(const QStringList &ids)
-{
-    if (ids.isEmpty())
-        return;
-    const auto operation = operationKey(OperationKind::ReadNotifications);
-    QStringList selected;
-    QStringList local;
-    QSet<QString> seen;
-    QUrlQuery parameters;
-    for (const auto &id : ids) {
-        if (id.isEmpty() || seen.contains(id))
-            continue;
-        seen.insert(id);
-        if (isLocalNotificationId(id)) {
-            const auto known = std::any_of(m_notifications.cbegin(), m_notifications.cend(), [&id](const Notification &item) {
-                return item.id == id;
-            });
-            if (known)
-                local.append(id);
-            continue;
-        }
-        if (numericId(id) != id)
-            continue;
-        selected.append(id);
-        parameters.addQueryItem(QStringLiteral("IDS[]"), id);
-        if (selected.size() == maxNotifications)
-            break;
-    }
-    if (selected.isEmpty() && local.isEmpty())
-        return failShape(operation);
-    updateNotificationReadState(local, true);
-    if (selected.isEmpty()) {
-        emit notificationActionFinished(operation);
-        return;
-    }
-    parameters.addQueryItem(QStringLiteral("ACTION"), QStringLiteral("Y"));
-    auto keyIds = selected;
-    keyIds.sort();
-    const auto requestKey = operation + QLatin1Char(':') + keyIds.join(QLatin1Char(','));
-    notificationBatch(QStringLiteral("im.notify.read.list"), parameters, operation,
-                      [this, operation, selected = std::move(selected), started = m_notificationRevision](QJsonValue result) {
-        if (result != true)
-            return failShape(operation);
-        updateNotificationReadState(selected, true, started);
-        emit notificationActionFinished(operation);
-    }, requestKey);
-}
-
-void CloudBackend::markAllNotificationsRead()
-{
-    const auto operation = operationKey(OperationKind::ReadAllNotifications);
-    QStringList snapshot;
-    for (const auto *source : {&m_notifications, &m_notificationSearchRows})
-        for (const auto &item : *source)
-            if (!item.read && !snapshot.contains(item.id))
-                snapshot.append(item.id);
-    notificationBatch(QStringLiteral("im.notify.read.all"), {}, operation,
-                      [this, operation, snapshot, started = m_notificationRevision](QJsonValue result) {
-        if (result.toObject().value(QStringLiteral("result")) != true)
-            return failShape(operation);
-        updateNotificationReadState(snapshot, true, started);
-        emit notificationActionFinished(operation);
-    });
-}
-
-QString CloudBackend::notificationTaskId(const QString &dialog, const QJsonObject &eventChat) const
-{
-    QSet<QString> matching;
-    const auto add = [&matching](const QString &id) {
-        if (const auto valid = numericId(id); !valid.isEmpty())
-            matching.insert(valid);
-    };
-    const auto taskChat = isTaskChatType(field(eventChat, {"type", "kind"}));
-    const auto entity = eventChat.value(QStringLiteral("entityLink")).toObject();
-    const auto linkType = field(entity, {"type"});
-    if (isTaskChatType(linkType) || (linkType.isEmpty() && taskChat))
-        add(field(entity, {"id"}));
-    const auto entityType = field(eventChat, {"entityType", "entity_type"});
-    if (isTaskChatType(entityType) || (entityType.isEmpty() && taskChat))
-        add(field(eventChat, {"entityId", "entity_id"}));
-    for (auto it = m_taskDialogs.cbegin(); it != m_taskDialogs.cend(); ++it)
-        if (it.value() == dialog)
-            add(it.key());
-    for (const auto &known : m_recentTaskChatItems)
-        if (known.id == dialog && known.taskChat)
-            add(known.taskId);
-    return matching.size() == 1 ? *matching.cbegin() : QString();
-}
-
-void CloudBackend::deleteNotification(const QString &id)
-{
-    const auto operation = operationKey(OperationKind::DeleteNotification);
-    if (id.isEmpty() || numericId(id) != id)
-        return failShape(operation);
-    QUrlQuery parameters;
-    parameters.addQueryItem(QStringLiteral("ID"), id);
-    notificationBatch(QStringLiteral("im.notify.delete"), parameters, operation, [this, id, operation](QJsonValue result) {
-        if (result != true)
-            return failShape(operation);
-        removeNotification(id);
-        emit notificationActionFinished(operation);
-    });
-}
-
-void CloudBackend::connectPull()
-{
-    if (!m_started || m_authExpired || m_portalHttp.contains(pushOp))
-        return;
-    auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/pull.config.get.json"));
-    QUrlQuery configQuery;
-    configQuery.addQueryItem(QStringLiteral("logTag"), QStringLiteral("client_start"));
-    url.setQuery(configQuery);
-    m_portalHttp.webRequest(url, {{QStringLiteral("CACHE"), QStringLiteral("N")}}, pushOp, QStringLiteral("result"),
-               [this](QJsonValue response) {
-        const auto config = response.toObject();
-        const auto server = config.value(QStringLiteral("server")).toObject();
-        QUrl socketUrl(field(server, {"websocket_secure"}));
-        const auto channels = config.value(QStringLiteral("channels")).toObject();
-
-        QUrlQuery query;
-        const auto jwt = field(config, {"jwt"});
-        if (!jwt.isEmpty()) {
-            query.addQueryItem(QStringLiteral("token"), jwt);
-        } else {
-            QStringList ids;
-            for (const auto *kind : {"private", "shared"}) {
-                const auto id = field(channels.value(QLatin1String(kind)).toObject(), {"id"});
-                if (!id.isEmpty())
-                    ids.append(id);
-            }
-            if (!ids.isEmpty())
-                query.addQueryItem(QStringLiteral("CHANNEL_ID"), ids.join(QLatin1Char('/')));
-        }
-
-        if (query.isEmpty() || !trustedSocket(socketUrl, m_session.origin, m_allowLoopback)) {
-            emit failed(pushOp, QStringLiteral("Портал не предоставил допустимый защищённый канал уведомлений"));
-            scheduleReconnect();
-            return;
-        }
-        if (const auto clientId = field(config, {"clientId"}); !clientId.isEmpty())
-            query.addQueryItem(QStringLiteral("clientId"), clientId);
-        if (const auto hostname = field(server, {"hostname"}); !hostname.isEmpty())
-            query.addQueryItem(QStringLiteral("hostname"), hostname);
-        query.addQueryItem(QStringLiteral("format"), QStringLiteral("json"));
-        query.addQueryItem(QStringLiteral("revision"), QStringLiteral("19"));
-        if (!m_mid.isEmpty()) {
-            query.addQueryItem(QStringLiteral("mid"), m_mid);
-        } else if (!m_tag.isEmpty() && !m_time.isEmpty()) {
-            query.addQueryItem(QStringLiteral("tag"), m_tag);
-            query.addQueryItem(QStringLiteral("time"), m_time);
-        }
-        socketUrl.setQuery(query);
-        // Signed Pull channels authenticate the socket. The portal's Cookie and CSRF stay on the portal.
-        m_socket.open(socketUrl);
-        m_watchdog.start(handshakeTimeoutMs);
-
-        qint64 earliest = 0;
-        const auto addExpiry = [&earliest](qint64 expiry) {
-            if (expiry > 0 && (earliest == 0 || expiry < earliest))
-                earliest = expiry;
-        };
-        addExpiry(field(config, {"exp"}).toLongLong());
-        for (const auto *kind : {"private", "shared"})
-            addExpiry(field(channels.value(QLatin1String(kind)).toObject(), {"end"}).toLongLong());
-        if (earliest > 0) {
-            const auto seconds = std::clamp<qint64>(earliest - QDateTime::currentSecsSinceEpoch() - 10, 5, 86400);
-            m_configExpiry.start(static_cast<int>(seconds * 1000));
-        }
-    });
-}
-
-void CloudBackend::scheduleReconnect(bool immediately)
-{
-    m_watchdog.stop();
-    m_heartbeat.stop();
-    m_configExpiry.stop();
-    setOnline(false);
-    if (!m_started || m_authExpired) {
-        if (m_socket.state() != QAbstractSocket::UnconnectedState)
-            m_socket.abort();
-        return;
-    }
-    if (m_retry.isActive())
-        return;
-    const int ms = immediately ? 100
-        : std::min(tunables::kReconnectMaxDelayMs, tunables::kReconnectBaseDelayMs << std::min(m_attempt++, 5));
-    m_attempt = std::min(m_attempt, 6);
-    m_retry.start(ms + QRandomGenerator::global()->bounded(std::max(1, ms / 4)));
-    if (m_socket.state() != QAbstractSocket::UnconnectedState)
-        m_socket.abort();
-}
-
-void CloudBackend::receivePull(const QString &frame)
-{
-    if (!m_started)
-        return;
-    m_watchdog.stop();
-    m_heartbeat.start(heartbeatIntervalMs);
-    if (frame == QLatin1String("ping")) {
-        m_socket.sendTextMessage(QStringLiteral("pong"));
-        return;
-    }
-    const auto receiveJson = [this](const QByteArray &payload) {
-        const auto document = QJsonDocument::fromJson(payload);
-        if (document.isArray()) {
-            for (const auto event : document.array())
-                handlePullEvent(event.toObject());
-        } else if (document.isObject()) {
-            const auto object = document.object();
-            if (object.value(QStringLiteral("messages")).isArray()) {
-                for (const auto event : object.value(QStringLiteral("messages")).toArray())
-                    handlePullEvent(event.toObject());
-            } else {
-                handlePullEvent(object);
-            }
-        }
-    };
-    const QLatin1String prefix("#!NGINXNMS!#");
-    const QLatin1String suffix("#!NGINXNME!#");
-    if (!frame.startsWith(prefix))
-        return receiveJson(frame.toUtf8());
-    for (qsizetype offset = 0; (offset = frame.indexOf(prefix, offset)) >= 0;) {
-        const qsizetype start = offset + prefix.size();
-        const qsizetype end = frame.indexOf(suffix, start);
-        if (end < 0)
-            break;
-        receiveJson(frame.mid(start, end - start).toUtf8());
-        offset = end + suffix.size();
-    }
-}
-
-void CloudBackend::handlePullEvent(const QJsonObject &event)
-{
-    const auto mid = field(event, {"mid"});
-    const auto tag = field(event, {"tag"});
-    const auto time = field(event, {"time"});
-    if (!mid.isEmpty() && m_seenEventIds.contains(mid))
-        return;
-    if (!mid.isEmpty()) {
-        m_mid = mid;
-        m_seenEventIds.insert(mid);
-        m_seenEvents.enqueue(mid);
-        if (m_seenEvents.size() > maxSeenEvents)
-            m_seenEventIds.remove(m_seenEvents.dequeue());
-    }
-    if (!tag.isEmpty() && !time.isEmpty()) {
-        m_tag = tag;
-        m_time = time;
-    }
-
-    const auto value = event.value(QStringLiteral("text"));
-    const auto body = value.isObject() ? value.toObject()
-        : value.isString() ? QJsonDocument::fromJson(value.toString().toUtf8()).object() : event;
-    const auto module = field(body, {"module_id"});
-    const auto command = field(body, {"command"});
-    const auto params = body.value(QStringLiteral("params")).toObject();
-    const auto recentExtra = body.contains(QStringLiteral("extra")) ? body.value(QStringLiteral("extra")).toObject()
-                                                                    : event.value(QStringLiteral("extra")).toObject();
-    if (module == QLatin1String("pull")) {
-        if (command == QLatin1String("channel_expire") || command == QLatin1String("config_expire")
-            || command == QLatin1String("server_restart"))
-            scheduleReconnect(true);
-        return;
-    }
-    if (module == QLatin1String("tasks")) {
-        handleTaskPull(command, params);
-        return;
-    }
-    if (module == QLatin1String("online") && command == QLatin1String("userStatus")) {
-        handlePresencePull(params, recentExtra);
-        return;
-    }
-    if (module == QLatin1String("im"))
-        handleImPull(command, params, recentExtra, mid);
-}
-
-void CloudBackend::handleTaskPull(const QString &command, const QJsonObject &params)
-{
-    const auto fields = params.value(QStringLiteral("fields")).toObject();
-    auto taskId = numericId(field(params, {"taskId", "TASK_ID", "id", "ID"}));
-    if (taskId.isEmpty())
-        taskId = numericId(field(params.value(QStringLiteral("task")).toObject(), {"id", "ID"}));
-    if (taskId.isEmpty())
-        taskId = numericId(field(fields, {"id", "ID"}));
-    auto groupId = field(params, {"groupId", "GROUP_ID"});
-    if (groupId.isEmpty())
-        groupId = field(fields, {"GROUP_ID", "groupId"});
-    m_projects.handleTaskPull(fields, groupId, taskId, groupDialogChatId(m_taskDialogs.value(taskId)));
-    if (!taskId.isEmpty() && (!groupId.isEmpty() || command == QLatin1String("task_update")
-                             || command == QLatin1String("taskUpdate")))
-        emit taskLinkPreviewInvalidated(taskId);
-    invalidateTaskChat(taskId);
-}
-
-void CloudBackend::handlePresencePull(const QJsonObject &params, const QJsonObject &recentExtra)
-{
-    const auto age = recentExtra.value(QStringLiteral("server_time_ago")).toInteger();
-    if (age >= 0 && age < 240) {
-        handlePortalStatusPush(params.value(QStringLiteral("users")).toObject(),
-                               field(recentExtra, {"server_time_unix"}).toLongLong());
-        handleOnlinePull(params);
-    }
-}
-
-void CloudBackend::handleSettingsPull(const QJsonObject &params)
-{
-    const auto revision = ++m_notificationSettingsRevision;
-    const auto remember = [this, &params, revision](const QString &key) {
-        if (params.contains(key))
-            m_notificationSettingChanges.insert(key, {revision, params.value(key)});
-    };
-    for (const auto &key : {soundMuted, volumeGeneral, volumeMessages, notifyScheme})
-        remember(key);
-    for (const auto &key : simpleChannels)
-        remember(key);
-    if (params.contains(notifyScheme))
-        m_notificationSettings.clear();
-    applyChatPopupSettings(params, ChatPopupSettingsSource::Push);
-}
-
-QString CloudBackend::pullDialog(const QJsonObject &params, const QString &chatId) const
-{
-    auto dialog = validDialog(field(params, {"dialogId"}));
-    if (dialog.isEmpty() && !chatId.isEmpty()) {
-        const auto id = chatId.toLongLong();
-        const auto personal = std::find_if(m_recentChatItems.cbegin(), m_recentChatItems.cend(), [id](const Chat &chat) {
-            return chat.serverChatId == id;
-        });
-        dialog = personal != m_recentChatItems.cend() ? personal->id
-            : m_dialogChatIds.key(id, chatDialog(chatId));
-    }
-    return dialog;
-}
-
-void CloudBackend::handleOpponentReadPull(const QString &dialog, const QJsonObject &params)
-{
-    const auto user = numericId(field(params, {"userId"}));
-    if (dialog.isEmpty() || user.isEmpty() || m_userId.isEmpty() || user == m_userId)
-        return;
-    auto &seen = dialogMessageState(dialog).seenByOthers;
-    QStringList confirmed;
-    const auto rows = params.value(QStringLiteral("viewedMessages")).toArray();
-    for (qsizetype i = 0; i < std::min<qsizetype>(rows.size(), tunables::kPageSizeMessages); ++i) {
-        const auto id = numericId(string(rows.at(i)));
-        const auto number = id.toLongLong();
-        if (number <= 0 || seen.contains(number))
-            continue;
-        if (seen.size() >= tunables::kPageSizeMessages)
-            seen.erase(std::min_element(seen.cbegin(), seen.cend()));
-        seen.insert(number);
-        confirmed.append(id);
-    }
-    if (!confirmed.isEmpty())
-        emit chatMessagesSeen(dialog, confirmed);
-}
-
-void CloudBackend::handleTypingPull(const QString &dialog, const QJsonObject &params)
-{
-    const auto user = numericId(field(params, {"userId"}));
-    if (m_foreground && !dialog.isEmpty() && !user.isEmpty() && !m_userId.isEmpty() && user != m_userId
-        && params.value(QStringLiteral("type")) == QLatin1String("writing")) {
-        const auto duration = params.value(QStringLiteral("duration")).toInt();
-        emit chatTypingChanged(dialog, user, duration > 0 ? std::min(duration, 25000) : 25000);
-    }
-}
-
-void CloudBackend::handleReactionPull(const QString &dialog, const QJsonObject &params)
-{
-    const auto reaction = params.value(QStringLiteral("actualReactions")).toObject().value(QStringLiteral("reaction")).toObject();
-    const auto id = numericId(field(reaction, {"messageId"}));
-    const auto matches = [&](const QString &shown) {
-        return !shown.isEmpty() && (shown == dialog || (dialog.isEmpty() && !id.isEmpty()
-            && m_replyPreviews.contains(replyPreviewKey(shown, id))));
-    };
-    if (matches(m_openDialog))
-        m_chatDirty = true;
-    if (matches(m_taskDialogs.value(m_openTask)))
-        m_taskMessagesDirty = true;
-    scheduleRefresh();
-}
-
-void CloudBackend::handleHistoryRemovalPull(const QString &command, const QString &dialog, const QString &chatId, const QJsonObject &params)
-{
-    const auto mappedChat = badgeChatId(dialog);
-    if (!dialog.isEmpty() && (chatId.isEmpty() || mappedChat == 0 || mappedChat == chatId.toLongLong())) {
-        QStringList deleted;
-        if (command == QLatin1String("messageUpdate") || command == QLatin1String("messageDelete")
-            || command == QLatin1String("messageDeleteComplete")) {
-            const auto message = numericId(field(params, {"id"}));
-            if (!message.isEmpty()) {
-                m_replyPreviews.remove(replyPreviewKey(dialog, message));
-                if (command != QLatin1String("messageUpdate"))
-                    deleted.append(message);
-            }
-        } else if (command == QLatin1String("messageDeleteV2")) {
-            for (const auto &value : params.value(QStringLiteral("messages")).toArray()) {
-                const auto row = value.toObject();
-                const auto message = numericId(field(row, {"id"}));
-                const auto rowChat = field(row, {"chatId"});
-                const auto rowDialog = field(row, {"dialogId"});
-                if (message.isEmpty() || (!rowDialog.isEmpty() && rowDialog != dialog)
-                    || (!rowChat.isEmpty() && mappedChat > 0 && rowChat.toLongLong() != mappedChat))
-                    continue;
-                m_replyPreviews.remove(replyPreviewKey(dialog, message));
-                if (!deleted.contains(message))
-                    deleted.append(message);
-                if (deleted.size() >= tunables::kPageSizeMessages)
-                    break;
-            }
-        } else if (command == QLatin1String("chatHistoryDeletedForSelf") || command == QLatin1String("chatHistoryDeletedForAll")) {
-            bool validBoundary = false;
-            const auto through = field(params, {"lastId"}).toLongLong(&validBoundary);
-            if (!params.contains(QStringLiteral("lastId")) || (validBoundary && through >= 0)) {
-                if (through == 0)
-                    ++dialogMessageState(dialog).historyGeneration;
-                emit chatHistoryRemoved(dialog, {}, through);
-                if (m_openDialog == dialog)
-                    requestChatMessages(dialog);
-                if (!m_openTask.isEmpty() && m_taskDialogs.value(m_openTask) == dialog)
-                    requestTaskMessages(m_openTask);
-            }
-        }
-        if (!deleted.isEmpty())
-            emit chatHistoryRemoved(dialog, deleted);
-    }
-}
-
-void CloudBackend::handleMutePull(const QString &dialog, const QJsonObject &params)
-{
-    const auto muted = notificationFlag(params.value(QStringLiteral("muted")));
-    if (!dialog.isEmpty() && muted) {
-        auto &state = dialogMessageState(dialog);
-        state.muted = muted;
-        state.muteList = {};
-        state.muteFromPull = true;
-        deliverChatPopups();
-    }
-}
-
-void CloudBackend::handleNotificationStatePull(const QString &command, const QJsonObject &params)
-{
-    const bool remove = command == QLatin1String("notifyConfirm") || command == QLatin1String("notifyDelete");
-    if (remove) {
-        removeNotification(numericId(field(params, {"id"})));
-    } else {
-        QStringList ids;
-        for (const auto value : params.value(QStringLiteral("list")).toArray()) {
-            const auto id = numericId(string(value));
-            if (!id.isEmpty())
-                ids.append(id);
-        }
-        updateNotificationReadState(ids, command == QLatin1String("notifyRead"));
-    }
-    emit notificationsLoaded(m_notifications);
-}
-
-void CloudBackend::handleImPull(const QString &command, const QJsonObject &params, const QJsonObject &recentExtra, const QString &mid)
-{
-    if (command == QLatin1String("pinAdd") || command == QLatin1String("pinDelete")) {
-        handlePinnedPull(command, params);
-        return;
-    }
-    if (handleAnchorPull(command, params))
-        return;
-    if (command == QLatin1String("settingsUpdate")) {
-        handleSettingsPull(params);
-        return;
-    }
-    const auto chatId = numericId(field(params, {"chatId"}));
-    const auto dialog = pullDialog(params, chatId);
-    if (command == QLatin1String("readMessageOpponent") || command == QLatin1String("readMessageChatOpponent")) {
-        handleOpponentReadPull(dialog, params);
-        return;
-    }
-    if (command == QLatin1String("inputActionNotify")) {
-        handleTypingPull(dialog, params);
-        return;
-    }
-    if (command == QLatin1String("message") || command == QLatin1String("messageChat")) {
-        const auto user = numericId(field(params.value(QStringLiteral("message")).toObject(), {"senderId", "authorId"}));
-        if (!dialog.isEmpty() && !user.isEmpty() && user != m_userId)
-            emit chatTypingChanged(dialog, user, 0);
-    }
-    if (command == QLatin1String("addReaction") || command == QLatin1String("deleteReaction")) {
-        handleReactionPull(dialog, params);
-        return;
-    }
-    handleHistoryRemovalPull(command, dialog, chatId, params);
-    if (command == QLatin1String("chatMuteNotify")) {
-        handleMutePull(dialog, params);
-        return;
-    }
-    const bool readEvent = command == QLatin1String("readMessage") || command == QLatin1String("readMessageChat");
-    if (readEvent && !dialog.isEmpty()) {
-        if (!acceptsRecentRead(dialog, params, recentExtra))
-            return;
-        if (const auto counter = unreadCount(params.value(QStringLiteral("counter"))))
-            dialogMessageState(dialog).unreadCounter = counter;
-        applyReadHistory(dialog, params);
-    }
-
-    if (command == QLatin1String("notifyRead") || command == QLatin1String("notifyUnread")
-        || command == QLatin1String("notifyConfirm") || command == QLatin1String("notifyDelete")) {
-        handleNotificationStatePull(command, params);
-        return;
-    }
-    if (readEvent || command.startsWith(QLatin1String("message"))) {
-        m_recentDirty = true;
-        const auto eventChat = chatDialog(chatId);
-        const auto matches = [&](const QString &dialogId) {
-            return !dialogId.isEmpty() && (dialog == dialogId || eventChat == dialogId);
-        };
-        if (matches(m_openDialog))
-            m_chatDirty = true;
-        if (matches(m_taskDialogs.value(m_openTask)))
-            m_taskMessagesDirty = true;
-        scheduleRefresh();
-    }
-    applyRecentPull(command, dialog, chatId, params, recentExtra);
-    if (command != QLatin1String("message") && command != QLatin1String("messageChat")
-        && command != QLatin1String("notify") && command != QLatin1String("notifyAdd"))
-        return;
-
-    handleIncomingNoticePull(command, dialog, chatId, params, recentExtra, mid);
-}
-
-void CloudBackend::prepareMessagePullNotice(Notification &entry, const QString &command, const QString &content, const QJsonObject &params)
-{
-    entry.text = notificationDisplayText(content);
-    auto &targets = entry.targets;
-    targets = notificationTargets(m_session.origin, content);
-    auto target = incomingMessageTarget(params, command == QLatin1String("messageChat"), true);
-    QString taskId;
-    if (target) {
-        const auto chatMap = params.value(QStringLiteral("chat")).toObject();
-        const auto targetChatId = QString::number(groupDialogChatId(target->id));
-        auto eventChat = chatMap.value(targetChatId).toObject();
-        if (eventChat.isEmpty() && numericId(field(chatMap, {"id", "chatId", "CHAT_ID"})) == targetChatId)
-            eventChat = chatMap;
-        const auto knownDialog = oneOf(eventChat, {"dialogId"});
-        if (!knownDialog.isUndefined() && validDialog(string(knownDialog)) != target->id)
-            eventChat = {};
-        for (const auto *key : {"id", "chatId", "CHAT_ID"}) {
-            const auto reportedId = eventChat.value(QLatin1String(key));
-            if (!reportedId.isUndefined() && numericId(string(reportedId)) != targetChatId) {
-                eventChat = {};
-                break;
-            }
-        }
-        taskId = target->id.startsWith(QLatin1String("chat"))
-            ? notificationTaskId(target->id, eventChat) : QString();
-        const bool listedTask = std::any_of(m_recentTaskChatItems.cbegin(), m_recentTaskChatItems.cend(),
-            [&target](const Chat &chat) { return chat.id == target->id; });
-        const auto sections = params.value(QStringLiteral("recentConfig")).toObject().value(QStringLiteral("sections")).toArray();
-        const bool metadataTaskChat = isTaskChatMetadata(field(eventChat, {"type", "kind"}),
-            eventChat.value(QStringLiteral("entityLink")).toObject())
-            || isTaskChatType(field(eventChat, {"entityType", "entity_type"}));
-        target->taskChat = !taskId.isEmpty() || isRecentTaskChat(metadataTaskChat, listedTask, sections)
-            || std::any_of(m_taskDialogs.cbegin(), m_taskDialogs.cend(), [&target](const auto &known) {
-                return known == target->id;
-            });
-        entry.ordinaryChatMessage = !target->taskChat;
-    }
-    if (target && !target->messageId.isEmpty()) {
-        if (!taskId.isEmpty()) {
-            const auto taskLink = QStringLiteral("[URL=/tasks/task/view/%1/]Задача #%1[/URL]").arg(taskId);
-            const auto plainMessage = entry.text;
-            decodeNotificationContent(entry, m_session.origin, taskLink + QLatin1Char('\n') + content, {});
-            entry.text = plainMessage;
-        }
-        const auto duplicate = std::find_if(targets.begin(), targets.end(), [&target](const auto &link) {
-            return link.kind == NotificationTargetKind::Chat && link.id == target->id
-                && link.messageId == target->messageId;
-        });
-        if (duplicate == targets.end()) {
-            if (targets.size() >= 8)
-                targets.removeLast();
-            targets.prepend(std::move(*target));
-        } else if (target->taskChat) {
-            duplicate->taskChat = true;
-        }
-    }
-    prepareNotificationDisplay(entry);
-}
-
-void CloudBackend::preparePortalPullNotice(Notification &entry, const QString &content, const QJsonObject &notification, const QJsonObject &params)
-{
-    auto noticeParams = notification.value(QStringLiteral("params")).toObject();
-    if (noticeParams.isEmpty())
-        noticeParams = params.value(QStringLiteral("params")).toObject();
-    if (noticeParams.isEmpty())
-        noticeParams = notification.isEmpty() ? params : notification;
-    const auto authorId = noticeAuthorId(notification, params);
-    QString authorName;
-    for (const auto *source : {&params, &notification}) {
-        for (const auto *key : {"users", "user", "author"}) {
-            authorName = noticeAuthorName(authorId, source->value(QLatin1String(key)));
-            if (!authorName.isEmpty())
-                break;
-        }
-        if (!authorName.isEmpty())
-            break;
-    }
-    decodeNotificationContent(entry, m_session.origin, content, noticeParams, authorId, authorName);
-    if (entry.text.isEmpty()) {
-        entry.text = entry.title;
-        prepareNotificationDisplay(entry);
-    }
-}
-
-void CloudBackend::handleIncomingNoticePull(const QString &command, const QString &dialog, const QString &chatId, const QJsonObject &params, const QJsonObject &extra, const QString &mid)
-{
-    const auto message = params.value(QStringLiteral("message")).toObject();
-    auto notification = params.value(QStringLiteral("notify")).toObject();
-    const auto author = numericId(field(message, {"senderId", "authorId"}));
-    const auto templateId = field(message, {"templateId", "uuid"});
-    if ((!m_userId.isEmpty() && m_userId == author)
-        || (!templateId.isEmpty() && m_sentTemplates.contains(templateId)))
-        return;
-    const bool isMessage = command.startsWith(QLatin1String("message"));
-    if (!isMessage && params.value(QStringLiteral("onlyFlash")).toBool())
-        return;
-    const auto outerId = field(params, {"id"});
-    const auto nestedId = field(notification, {"id"});
-    if (!outerId.isEmpty() && !nestedId.isEmpty() && outerId != nestedId)
-        notification = {};
-    auto notifyTitle = notificationDisplayText(field(params, {"notify_title", "title"}));
-    if (notifyTitle.isEmpty())
-        notifyTitle = notificationDisplayText(field(notification, {"notify_title", "title"}));
-    const auto title = isMessage ? recentTitle(dialog, QStringLiteral("Новое сообщение"))
-        : notifyTitle.isEmpty() ? QStringLiteral("Уведомление Битрикс24") : notifyTitle;
-    QString content = field(message, {"text", "message"});
-    if (content.isEmpty())
-        content = field(notification, {"text", "message"});
-    if (content.isEmpty())
-        content = field(params, {"text", "message", "notify"});
-    if (content.isEmpty() && isMessage)
-        content = title;
-    auto id = numericId(isMessage ? field(message, {"id"}) : outerId.isEmpty() ? nestedId : outerId);
-    if (id.isEmpty())
-        id = QStringLiteral("push:") + (mid.isEmpty() ? QUuid::createUuid().toString(QUuid::WithoutBraces) : mid);
-    else if (isMessage)
-        id.prepend(QStringLiteral("message:"));
-    const auto notify = notificationFlag(params.value(QStringLiteral("notify")));
-    const auto messageNotify = notificationFlag(message.value(QStringLiteral("params")).toObject().value(QStringLiteral("NOTIFY")));
-    const auto blockedUsers = params.value(QStringLiteral("userBlockChat")).toObject().value(chatId);
-    if (isMessage && (notify == false || messageNotify == false || mutedListContains(blockedUsers, m_userId)
-                      || m_portalStatus == QLatin1String("dnd"))) {
-        rememberChatPopup(dialog, id);
-        m_pendingChatPopups.removeIf([&](const ChatPopup &popup) {
-            return popup.dialog == dialog && popup.entry.id == id;
-        });
-    }
-    if (std::any_of(m_notifications.cbegin(), m_notifications.cend(), [&id](const auto &item) { return item.id == id; }))
-        return;
-    const auto serverTime = extra.value(QStringLiteral("server_time_unix"));
-    auto published = date(serverTime);
-    if (!published.isValid()) {
-        const auto seconds = numericId(string(serverTime)).toLongLong();
-        if (seconds > 0)
-            published = QDateTime::fromSecsSinceEpoch(seconds);
-    }
-    const auto now = QDateTime::currentDateTime();
-    bool hasAge = false;
-    const auto age = extra.value(QStringLiteral("server_time_ago")).toVariant().toInt(&hasAge);
-    auto noticeModule = field(notification, {"notify_module", "module"});
-    if (noticeModule.isEmpty())
-        noticeModule = field(params, {"notify_module", "module"});
-    Notification entry{id, isMessage || noticeModule.isEmpty() ? QStringLiteral("im") : noticeModule, title, {},
-                       published.isValid() ? published : now.addSecs(hasAge ? -age : 0)};
-    if (isLocalNotificationId(id)) {
-        const auto previous = m_notificationMutations.constFind(id);
-        if (previous != m_notificationMutations.cend())
-            entry.read = previous->read;
-    }
-    if (isMessage)
-        prepareMessagePullNotice(entry, command, content, params);
-    else
-        preparePortalPullNotice(entry, content, notification, params);
-    m_notifications.prepend(entry);
-    trimNotificationHistory(m_notifications, m_notificationOlderPages);
-    emit notificationsLoaded(m_notifications);
-    if (m_portalStatus == QLatin1String("dnd"))
-        return;
-    const bool fresh = (!hasAge || age <= freshPopupSeconds)
-        && (!published.isValid() || published.secsTo(now) <= freshPopupSeconds);
-    if (!isMessage) {
-        if (fresh && field(params, {"silent"}) != QLatin1String("Y")) {
-            if (m_initialPortalStatusPending) {
-                if (m_pendingInitialAlerts.size() == maxPendingChatPopups)
-                    m_pendingInitialAlerts.dequeue();
-                m_pendingInitialAlerts.enqueue(entry);
-            } else {
-                emit notificationReceived(entry);
-            }
-        }
-        return;
-    }
-    const bool important = message.value(QStringLiteral("isImportant")).toBool();
-    if (!fresh || (!published.isValid() && !hasAge) || author.isEmpty() || dialog.isEmpty()
-        || notify == false || messageNotify == false || (!important && notify != true))
-        return;
-    const auto pullChats = params.value(QStringLiteral("chat")).toObject();
-    auto eventChat = pullChats.value(chatId).toObject();
-    if (eventChat.isEmpty() && !field(pullChats, {"id", "chatId"}).isEmpty())
-        eventChat = pullChats;
-    if (!eventChat.isEmpty())
-        rememberDialog(dialog, {{QStringLiteral("chat"), eventChat}});
-    queueChatPopup({entry, dialog, author, blockedUsers});
-}
-
-void CloudBackend::reconcileHistoryPopups(const QString &dialog, qint64 chatId, bool task, const QJsonObject &history,
-                                         const QVector<Message> &messages)
-{
-    if (chatId <= 0)
-        return;
-
-    const auto snapshot = history.value(QStringLiteral("messages")).toArray();
-    QHash<qint64, QJsonObject> rows;
-    qint64 newest = 0;
-    for (qsizetype i = 0; i < qMin<qsizetype>(snapshot.size(), tunables::kPageSizeMessages); ++i) {
-        const auto row = snapshot.at(i).toObject();
-        const auto id = recentMessageId(row);
-        const auto rowChat = explicitMessageChatId(row);
-        if (id > 0 && (rowChat == 0 || rowChat == chatId)) {
-            rows.insert(id, row);
-            newest = qMax(newest, id);
-        }
-    }
-    if (!snapshot.isEmpty() && rows.isEmpty())
-        return;
-    auto &scope = task ? m_taskPopupHistory : m_chatPopupHistory;
-    const auto previous = scope.dialog == dialog ? scope.through.value_or(-1) : -1;
-    scope = {dialog, qMax(newest, previous)};
-    const auto state = m_dialogMessageStates.constFind(dialog);
-    m_pendingChatPopups.removeIf([&](const ChatPopup &popup) {
-        if (!popup.fromHistory || popup.dialog != dialog)
-            return false;
-        const auto id = popup.entry.id.section(QLatin1Char(':'), -1).toLongLong();
-        const auto unread = rows.value(id).value(QStringLiteral("unread"));
-        if (unread.isBool())
-            return !unread.toBool();
-        return state != m_dialogMessageStates.cend() && id <= state->lastReadId && !state->historyUnread.contains(id);
-    });
-    if (previous < 0 || m_foreground || !m_workspaceVisible || (!task && m_activeSection != 0)
-        || m_authExpired || m_userId.isEmpty() || m_portalStatus == QLatin1String("dnd"))
-        return;
-    if (!m_online && m_portalStatus.isEmpty())
-        return;
-
-    const auto now = QDateTime::currentDateTime();
-    const auto title = recentTitle(dialog, QStringLiteral("Новое сообщение"));
-    const auto chat = history.value(QStringLiteral("chat")).toObject();
-    const bool taskChat = task || !notificationTaskId(dialog, chat).isEmpty();
-    for (const auto &message : messages) {
-        const auto id = numericId(message.id).toLongLong();
-        if (id <= previous || !message.unread || message.outgoing || message.system || !message.createdAt.isValid())
-            continue;
-        const auto age = message.createdAt.secsTo(now);
-        if (age < -5 || age > freshHistoryPopupSeconds)
-            continue;
-        const auto row = rows.value(id);
-        const auto author = explicitMessageAuthorId(row);
-        const auto params = oneOf(row, {"params", "PARAMS"}).toObject();
-        if (!author || *author <= 0 || QString::number(*author) == m_userId
-            || notificationFlag(oneOf(row, {"notify", "NOTIFY"})) == false
-            || notificationFlag(oneOf(params, {"NOTIFY", "notify"})) == false
-            || notificationFlag(row.value(QStringLiteral("silent"))) == true
-            || notificationFlag(row.value(QStringLiteral("isDeleted"))) == true
-            || notificationFlag(params.value(QStringLiteral("IS_DELETED"))) == true)
-            continue;
-        auto text = notificationDisplayText(message.text);
-        if (text.isEmpty())
-            text = message.attachments.isEmpty() ? QStringLiteral("Новое сообщение") : QStringLiteral("Вложение");
-        Notification entry{QStringLiteral("message:%1").arg(id), QStringLiteral("im"), title, text, message.createdAt};
-        entry.ordinaryChatMessage = !taskChat;
-        entry.targets.append({NotificationTargetKind::Chat, dialog, QString::number(id), {}, title, taskChat});
-        prepareNotificationDisplay(entry);
-        queueChatPopup({std::move(entry), dialog, QString::number(*author), {}, true});
-    }
-}
-
-bool CloudBackend::rememberChatPopup(const QString &dialog, const QString &noticeId)
-{
-    if (dialog.isEmpty() || noticeId.isEmpty())
-        return false;
-    const auto key = replyPreviewKey(dialog, noticeId);
-    if (m_seenChatPopups.contains(key))
-        return false;
-    m_seenChatPopups.insert(key, new bool(true));
-    return true;
-}
-
-void CloudBackend::queueChatPopup(ChatPopup popup)
-{
-    if (!rememberChatPopup(popup.dialog, popup.entry.id) || chatMuted(popup) || chatPopupsEnabled() == false)
-        return;
-    if (m_pendingChatPopups.size() == maxPendingChatPopups)
-        m_pendingChatPopups.dequeue();
-    m_pendingChatPopups.enqueue(std::move(popup));
-    deliverChatPopups();
-    if (!m_pendingChatPopups.isEmpty())
-        loadChatPopupSettings();
-}
-
-CloudBackend::DialogMessageState &CloudBackend::dialogMessageState(const QString &dialog)
-{
-    if (!m_dialogMessageStates.contains(dialog) && m_dialogMessageStates.size() >= tunables::kPageSizeChats) {
-        const auto taskDialog = m_taskDialogs.value(m_openTask);
-        auto candidate = m_dialogMessageStates.begin();
-        while (candidate != m_dialogMessageStates.end()
-               && (candidate.key() == m_openDialog || candidate.key() == taskDialog))
-            ++candidate;
-        if (candidate != m_dialogMessageStates.end())
-            m_dialogMessageStates.erase(candidate);
-    }
-    return m_dialogMessageStates[dialog];
-}
-
-bool CloudBackend::chatMuted(const ChatPopup &popup) const
-{
-    const auto state = m_dialogMessageStates.constFind(popup.dialog);
-    return mutedListContains(popup.muteList, m_userId)
-        || (state != m_dialogMessageStates.cend() && (state->muted.value_or(false) || mutedListContains(state->muteList, m_userId)));
-}
-
-std::optional<bool> CloudBackend::chatPopupsEnabled() const
-{
-    const auto scheme = m_chatPopupSettings.value(notifyScheme);
-    if (scheme == simpleNotifyScheme) {
-        if (const auto desktop = notificationFlag(m_chatPopupSettings.value(notifyOnComputer)))
-            return desktop;
-    }
-    if (!m_chatPopupSettingsKnown && scheme != QLatin1String("expert"))
-        return std::nullopt;
-
-    const auto isMuted = notificationFlag(m_chatPopupSettings.value(soundMuted));
-    bool generalKnown = false;
-    bool messagesKnown = false;
-    const auto general = m_chatPopupSettings.value(volumeGeneral).toVariant().toDouble(&generalKnown);
-    const auto messages = m_chatPopupSettings.value(volumeMessages).toVariant().toDouble(&messagesKnown);
-    if (isMuted == true || (generalKnown && general <= 0) || (messagesKnown && messages <= 0))
-        return false;
-    if (isMuted == false && generalKnown && messagesKnown)
-        return true;
-    return std::nullopt;
-}
-
-void CloudBackend::applyChatPopupSettings(const QJsonObject &settings, ChatPopupSettingsSource source)
-{
-    const bool push = source == ChatPopupSettingsSource::Push;
-    const bool initial = source == ChatPopupSettingsSource::InitialSnapshot;
-    if (settings.value(notifyScheme) == simpleNotifyScheme && !notificationFlag(settings.value(notifyOnComputer))) {
-        if (push && m_chatPopupSettings.value(notifyScheme) != simpleNotifyScheme) {
-            // A scheme change can omit the computer setting. Refresh it before displaying a banner.
-            m_chatPopupSettings.remove(notifyOnComputer);
-            m_chatPopupSettingsKnown = false;
-            ++m_chatPopupSettingsGeneration;
-            m_nextChatPopupSettingsRequest = 0;
-        } else if (source == ChatPopupSettingsSource::RefreshSnapshot) {
-            m_chatPopupSettings.remove(notifyOnComputer);
-        }
-    }
-    if (!push && !settings.isEmpty())
-        m_chatPopupSettingsKnown = true;
-    for (const auto *key : {&notifyScheme, &notifyOnComputer, &soundMuted, &volumeGeneral, &volumeMessages}) {
-        const auto setting = settings.value(*key);
-        if (!setting.isUndefined() && (!initial || !m_chatPopupSettings.contains(*key)))
-            m_chatPopupSettings.insert(*key, setting);
-    }
-    deliverChatPopups();
-}
-
-void CloudBackend::settleInitialPortalStatus()
-{
-    if (!std::exchange(m_initialPortalStatusPending, false))
-        return;
-    const auto pending = std::exchange(m_pendingInitialAlerts, {});
-    const auto now = QDateTime::currentDateTime();
-    for (const auto &entry : pending) {
-        if (!m_started || m_authExpired || m_portalStatus == QLatin1String("dnd"))
-            return;
-        const auto current = std::find_if(m_notifications.cbegin(), m_notifications.cend(), [&entry](const auto &item) {
-            return item.id == entry.id;
-        });
-        if (current != m_notifications.cend() && !current->read
-            && entry.createdAt.secsTo(now) <= freshPopupSeconds)
-            emit notificationReceived(entry);
-    }
-    deliverChatPopups();
-}
-
-void CloudBackend::deliverChatPopups()
-{
-    if (m_initialPortalStatusPending)
-        return;
-    if (m_authExpired || m_portalStatus == QLatin1String("dnd")) {
-        m_pendingChatPopups.clear();
-        return;
-    }
-    const auto enabled = chatPopupsEnabled();
-    if (enabled == false) {
-        m_pendingChatPopups.clear();
-        return;
-    }
-    const auto now = QDateTime::currentDateTime();
-    auto waiting = std::exchange(m_pendingChatPopups, {});
-    for (const auto &popup : waiting) {
-        if (!m_started)
-            return;
-        const bool watching = (m_activeSection == 0 && popup.dialog == m_openDialog)
-            || (!m_openTask.isEmpty() && popup.dialog == m_taskDialogs.value(m_openTask));
-        if ((!m_online && (!popup.fromHistory || m_portalStatus.isEmpty()))
-            || (popup.fromHistory && (m_foreground || !m_workspaceVisible || !watching)))
-            continue;
-        const auto maxAge = popup.fromHistory ? freshHistoryPopupSeconds : freshPopupSeconds;
-        const auto state = m_dialogMessageStates.constFind(popup.dialog);
-        const auto id = popup.entry.id.section(QLatin1Char(':'), -1).toLongLong();
-        const bool read = popup.fromHistory && state != m_dialogMessageStates.cend()
-            && (id <= state->confirmedReadThrough || state->exactlyRead.contains(id));
-        if (read || popup.author == m_userId || popup.entry.createdAt.secsTo(now) > maxAge || chatMuted(popup))
-            continue;
-        if (enabled == true && !m_userId.isEmpty())
-            emit notificationReceived(popup.entry);
-        else
-            m_pendingChatPopups.enqueue(popup);
-    }
-}
-
-void CloudBackend::requestNotificationSettings()
-{
-    requestNotificationSettings(operationKey(OperationKind::NotificationSettings));
-}
-
-void CloudBackend::requestNotificationSettings(const QString &operation, const QString &updated, int expected,
-                                               std::optional<quint64> started)
-{
-    const auto before = started.value_or(m_notificationSettingsRevision);
-    const auto popupGeneration = m_chatPopupSettingsGeneration;
-    const auto accountScope = m_accountScopeRevision;
-    withCurrentUser(operation, [this, operation, updated, expected, before, popupGeneration, accountScope](qint64 userId) {
-        if (accountScope != m_accountScopeRevision)
-            return;
-        ajax(QStringLiteral("im.v2.Settings.General.list"), {{QStringLiteral("userId"), QString::number(userId)}},
-             operation, [this, operation, updated, expected, before, popupGeneration, accountScope](QJsonValue result) {
-            if (accountScope != m_accountScopeRevision)
-                return;
-            auto data = result.toObject();
-            for (auto entry = m_notificationSettingChanges.cbegin(); entry != m_notificationSettingChanges.cend(); ++entry)
-                if (entry.value().first > before)
-                    data.insert(entry.key(), entry.value().second);
-            QVariantMap settings;
-            if (const auto muted = notificationFlag(data.value(soundMuted)))
-                settings.insert(soundMuted, *muted);
-            for (const auto &name : {volumeGeneral, volumeMessages}) {
-                bool ok = false;
-                const auto value = data.value(name).toVariant().toInt(&ok);
-                if (ok && value >= 0 && value <= 100)
-                    settings.insert(name, value);
-            }
-            if (data.value(notifyScheme) == simpleNotifyScheme) {
-                for (const auto &channel : simpleChannels)
-                    if (const auto enabled = notificationFlag(data.value(channel)))
-                        settings.insert(channel, *enabled);
-            }
-            m_notificationSettings = settings;
-            if (popupGeneration == m_chatPopupSettingsGeneration)
-                applyChatPopupSettings(data, ChatPopupSettingsSource::RefreshSnapshot);
-            if (settings.isEmpty())
-                return failShape(operation);
-            if (!updated.isEmpty() && settings.contains(updated) && data.contains(updated))
-                m_notificationSettingChanges.insert(updated, {++m_notificationSettingsRevision, data.value(updated)});
-            emit notificationSettingsLoaded(settings, updated);
-            if (!updated.isEmpty() && (!settings.contains(updated) || settings.value(updated).toInt() != expected)) {
-                emit failed(operation, QStringLiteral("Портал не подтвердил изменение настройки"));
-                return;
-            }
-        });
-    });
-}
-
-void CloudBackend::updateNotificationSetting(const QString &name, int value)
-{
-    const auto operation = operationKey(OperationKind::NotificationSettingsUpdate);
-    const bool toggle = name == soundMuted || simpleChannels.contains(name);
-    if (!m_notificationSettings.contains(name) || (!toggle && name != volumeGeneral && name != volumeMessages))
-        return failShape(operation);
-    if (value < 0 || value > (toggle ? 1 : 100))
-        return failShape(operation);
-    withCurrentUser(operation, [this, name, value, toggle, operation, started = m_notificationSettingsRevision](qint64 userId) {
-        const auto setting = toggle ? QJsonValue(value != 0) : QJsonValue(value);
-        ajaxJson(QStringLiteral("im.v2.Settings.General.update"),
-                 {{QStringLiteral("userId"), userId}, {QStringLiteral("name"), name}, {QStringLiteral("value"), setting},
-                  {QStringLiteral("actionUuid"), QUuid::createUuid().toString(QUuid::WithoutBraces)}},
-                 operation, [this, name, value, operation, started](QJsonValue response) {
-            if (response == false)
-                return failShape(operation);
-            requestNotificationSettings(operation, name, value, started);
-        });
-    });
-}
-
-void CloudBackend::loadChatPopupSettings()
-{
-    const auto now = QDateTime::currentMSecsSinceEpoch();
-    if (m_portalHttp.contains(soundsOp) || now < m_nextChatPopupSettingsRequest)
-        return;
-    m_nextChatPopupSettingsRequest = now + 3000;
-    const bool hadUser = !m_userId.isEmpty();
-    const auto generation = m_chatPopupSettingsGeneration;
-    withCurrentUser(soundsOp, [this, hadUser, generation](qint64 userId) {
-        if (generation != m_chatPopupSettingsGeneration) {
-            loadChatPopupSettings();
-            return;
-        }
-        if (!hadUser) {
-            if (!m_openDialog.isEmpty())
-                m_chatDirty = true;
-            if (!m_openTask.isEmpty())
-                m_taskMessagesDirty = true;
-            scheduleRefresh();
-        }
-        ajax(QStringLiteral("im.v2.Settings.General.list"), {{QStringLiteral("userId"), QString::number(userId)}},
-             soundsOp, [this, generation](QJsonValue data) {
-            if (generation != m_chatPopupSettingsGeneration) {
-                loadChatPopupSettings();
-                return;
-            }
-            applyChatPopupSettings(data.toObject(), ChatPopupSettingsSource::InitialSnapshot);
-        });
-    });
+    m_timeline.taskDialogs.remove(taskId);
+    m_chats.forgetTaskTitle(taskId);
 }
 
 } // namespace bx

@@ -1,7 +1,10 @@
 #pragma once
 
+#include "cloud/notifications_service.h"
 #include "cloud/projects_service.h"
+#include "cloud/pull_channel.h"
 #include "cloud/tasks_service.h"
+#include "cloud/chats_service.h"
 #include "core/backend.h"
 #include "core/session.h"
 #include "core/tunables.h"
@@ -15,7 +18,6 @@
 #include <QQueue>
 #include <QSet>
 #include <QTimer>
-#include <QWebSocket>
 #include <functional>
 #include <memory>
 
@@ -27,7 +29,7 @@ namespace bx {
 
 namespace signin { class SessionRestore; }
 
-class CloudBackend final : public Backend, private PortalSession, private ProjectsHost, private TasksHost {
+class CloudBackend final : public Backend, private NotificationsHost, private PullHost, private PortalSession, private ProjectsHost, private ChatsHost, private TasksHost {
     Q_OBJECT
 
 public:
@@ -143,7 +145,22 @@ signals:
     void sessionRecovered();
 
 private:
+    bool popupWorkspaceVisible() const override;
+    QString popupPortalStatus() const override;
+    bool initialStatusPending() const override;
+    void popupIdentityResolved() override;
     friend class ::CloudTestAccess;
+    void clearPopupHistory(bool task) override { m_notices.clearHistory(task); }
+    void loadChatTask(const QString &taskId, const QString &operation, std::function<void(QJsonObject)> onTask) override;
+    bool chatForeground() const override { return m_foreground; }
+    bool chatOnline() const override { return m_online; }
+    bool chatsSectionActive() const override { return m_activeSection == 0; }
+    bool hasProjectChat(qint64 chatId) const override { return m_projects.containsChat(chatId); }
+    bool hasChatCounter(qint64 chatId) const override { return m_chatCounterBadges.contains(chatId); }
+    void publishProjectChatBadges(qint64 chatId) override { m_projects.publishProjectTaskChatBadges(chatId); }
+    void trackProjectChat(const Chat &chat) override { m_projects.rememberProjectUnreadTaskChat(chat); }
+    void publishProjectChatCounts() override { m_projects.publishProjectUnreadCounts(); }
+
 
     const Session &currentSession() const override { return m_session; }
     quint64 sessionRevision() const override { return m_sessionRevision; }
@@ -152,8 +169,8 @@ private:
     bool authExpired() const override { return m_authExpired; }
     bool allowLoopback() const override { return m_allowLoopback; }
     void confirmPortalSession(quint64 revision) override { confirmSession(revision); }
-    void reconnectPortal() override { scheduleReconnect(); }
-    void retryHistory(const QString &key, const QString &dialog, bool task) override { loadMessages(key, dialog, task, true); }
+    void reconnectPortal() override { m_pull.scheduleReconnect(); }
+    void retryHistory(const QString &key, const QString &dialog, bool task) override { m_chats.loadMessages(key, dialog, task, true); }
     void applyRenewedSession(const Session &renewed) override;
     void portalRequestFailed(const QString &operation, const QString &detail) override { emit failed(operation, detail); }
     QString currentUserId() const override { return m_userId; }
@@ -209,54 +226,14 @@ private:
     qsizetype taskImageMaxBytes() const override { return m_messageImageAssets.maxBytes; }
     void uploadTaskFile(const QString &taskId, const QString &localPath, const QString &operation) override;
     void resetAccountScopedState();
-    void rememberCurrentUser(const QString &id);
+    void rememberCurrentUser(const QString &id) override;
     void loadPerson(const QString &id, const QString &operation, PersonHandler onPerson, bool requireName = false);
-    void loadMessages(const QString &key, const QString &dialogId, bool task, bool retry = false);
-    void resumeHistoriesWithIdentity();
-    void loadRecentChats(bool task, bool badgesOnly = false);
-    void publishRecentChats(QVector<Chat> chats, bool task);
-    void rememberRecentHistoryPreview(const QString &dialog, const QJsonObject &history);
-    void reconcileHistoryUnread(const QString &dialog, const QJsonObject &chat, const QJsonArray &messages,
-                                qint64 expectedChatId, quint64 revision);
-    void applyRecentPull(const QString &command, const QString &dialog, const QString &chatId,
-                         const QJsonObject &params, const QJsonObject &extra);
-    bool acceptsRecentRead(const QString &dialog, const QJsonObject &params, const QJsonObject &extra) const;
-    void hydrateRecentUserStatuses(QVector<Chat> chats, const QStringList &ids, quint64 generation);
-    void rememberDismissalStatus(const QString &id, std::optional<bool> dismissed);
-    std::optional<bool> cachedDismissalStatus(const QString &id) const;
-    void resolveTaskChatTitles(QVector<Chat> chats, const QString &key, std::function<void(QVector<Chat>)> deliver);
     void rememberTaskTitle(const QString &id, const QString &title) override;
     QString recentTitle(const QString &dialog, const QString &fallback) const;
-    Chat chatFromMetadata(const QString &dialog, const QJsonObject &row, const QJsonObject &chat,
-                          const QJsonObject &user);
     void fetchPortalHtml(const QUrl &url, std::function<void(QString)> handler);
-    void sendMessage(const QString &key, const QString &dialogId, const QString &text, bool task,
-                     const QString &replyId = {});
-    void sendTaskMessage(const QString &taskId, const QString &text, const QString &replyId);
-    void refreshChangedChat(const QString &dialog, bool pins = false);
-    QHash<QString, qint64> m_lastTypingRequest;
-    void connectPull();
-    void receivePull(const QString &frame);
-    void handlePullEvent(const QJsonObject &event);
-    void handleTaskPull(const QString &command, const QJsonObject &params);
-    void handlePresencePull(const QJsonObject &params, const QJsonObject &recentExtra);
-    void handleSettingsPull(const QJsonObject &params);
-    QString pullDialog(const QJsonObject &params, const QString &chatId) const;
-    void handleOpponentReadPull(const QString &dialog, const QJsonObject &params);
-    void handleTypingPull(const QString &dialog, const QJsonObject &params);
-    void handleReactionPull(const QString &dialog, const QJsonObject &params);
-    void handleHistoryRemovalPull(const QString &command, const QString &dialog, const QString &chatId, const QJsonObject &params);
-    void handleMutePull(const QString &dialog, const QJsonObject &params);
-    void handleNotificationStatePull(const QString &command, const QJsonObject &params);
-    void handleImPull(const QString &command, const QJsonObject &params, const QJsonObject &recentExtra, const QString &mid);
-    void prepareMessagePullNotice(Notification &entry, const QString &command, const QString &content, const QJsonObject &params);
-    void preparePortalPullNotice(Notification &entry, const QString &content, const QJsonObject &notification, const QJsonObject &params);
-    void handleIncomingNoticePull(const QString &command, const QString &dialog, const QString &chatId, const QJsonObject &params, const QJsonObject &extra, const QString &mid);
+    void handleTaskPull(const QJsonObject &fields, const QString &groupId, const QString &taskId, bool invalidatePreview);
+    void handlePresencePull(const QJsonObject &params, qint64 timestamp);
     void loadChatPopupSettings();
-    enum class ChatPopupSettingsSource { Push, InitialSnapshot, RefreshSnapshot };
-    void applyChatPopupSettings(const QJsonObject &settings, ChatPopupSettingsSource source);
-    void requestNotificationSettings(const QString &operation, const QString &updated = {}, int expected = -1,
-                                     std::optional<quint64> started = {});
     void readPortalStatus(const QString &operation, std::function<void(const QString &, bool)> onStatus);
     void loadInitialPortalStatus();
     void settleInitialPortalStatus();
@@ -265,17 +242,14 @@ private:
     struct PendingPortalStatus { QString status; qint64 stamp = 0; };
     QHash<QString, PendingPortalStatus> m_unboundPortalStatuses;
     bool m_initialPortalStatusPending = false;
-    QQueue<Notification> m_pendingInitialAlerts;
     void rememberPortalStatus(const QString &status, bool notifyUnchanged = false);
     QString m_portalStatus;
     quint64 m_portalStatusRevision = 0;
     qint64 m_lastPortalStatusPushTime = 0;
-    std::optional<bool> chatPopupsEnabled() const;
     void deliverChatPopups();
-    void scheduleReconnect(bool immediately = false);
     void invalidateActiveView();
-    void updateHistoryCatchup(bool restart = false);
-    bool canAutoRefreshChats() const { return m_foreground || m_workspaceVisible; }
+    void updateHistoryCatchup(bool restart = false) override;
+    bool canAutoRefreshChats() const override { return m_foreground || m_workspaceVisible; }
     void updateChatViewActivity(bool wasWatching);
     void rejectSession() override;
     void confirmSession(quint64 revision, std::function<void(bool)> onConfirmed = {});
@@ -326,33 +300,21 @@ private:
     void loadChatAssets(qint64 chatId, ChatAssetKind kind, qint64 boundary, const QString &operation,
                         std::function<void(QVector<ChatAsset>, QString)> complete);
     void resolveDialog(const QString &scopeId, bool task, const QString &operation,
-                       const QString &requestKey, ResolvedDialog onDialog);
-    void rememberDialog(const QString &dialogId, const QJsonObject &payload, bool rememberCounter = true);
-    void rememberChatContact(const QString &dialogId, const QJsonObject &user, bool publish);
-    void rememberDialogContact(const QString &dialogId, const QJsonObject &payload);
-    void applyChatContact(Chat &chat) const;
+                       const QString &requestKey, ResolvedDialog onDialog) override;
+    void rememberDialog(const QString &dialogId, const QJsonObject &payload, bool rememberCounter = true) override;
+    void rememberChatContact(const QString &dialogId, const QJsonObject &user, bool publish) override;
+    void rememberDialogContact(const QString &dialogId, const QJsonObject &payload) override;
+    void applyChatContact(Chat &chat) const override;
     void handleOnlinePull(const QJsonObject &params);
     struct ChatContact {
         QDateTime onlineUntil;
         QString position;
     };
     QHash<QString, ChatContact> m_chatContacts;
-    QVector<Message> decodePinnedMessages(const QJsonObject &payload) const;
-    void acceptPinnedSnapshot(const QString &dialog, const QJsonObject &payload);
-    void handlePinnedPull(const QString &command, const QJsonObject &params);
-    void publishPinnedMessages();
-    QString m_pinnedDialog;
-    quint64 m_pinnedGeneration = 0;
-    bool m_havePinnedSnapshot = false;
-    QVector<Message> m_pinnedMessages;
-    QHash<QString, std::optional<Message>> m_pinnedChanges;
     MessageFile decodeChatFile(const QString &id, const QJsonObject &file) const;
-    QVector<Message> decodeMessages(const QJsonObject &data, bool sortChronologically, const QString &dialog = {}) const;
+    QVector<Message> decodeMessages(const QJsonObject &data, bool sortChronologically, const QString &dialog = {}) const override;
     mutable QCache<QString, bool> m_messageViewerMembership{tunables::kPageSizeChats};
     mutable QCache<QString, qint64> m_messageViewerCounts{4 * tunables::kPageSizeMessages};
-    struct ReplyPreview { QString author; QString text; QVector<MessageFile> files; };
-    static QString replyPreviewKey(const QString &dialog, const QString &message);
-    mutable QCache<QString, ReplyPreview> m_replyPreviews{128};
     struct MessageFileSource {
         qint64 size;
         bool photo;
@@ -380,52 +342,8 @@ private:
                                        const QString &kind, const QString &operation);
     void uploadChunk(const std::shared_ptr<Upload> &upload, qint64 offset);
     void commitUpload(const std::shared_ptr<Upload> &upload);
-    QHash<QString, qint64> m_dialogChatIds;
-    struct DialogMessageState {
-        qint64 lastReadId = -1;
-        qint64 confirmedReadThrough = 0;
-        quint64 historyGeneration = 0;
-        quint64 readReceiptRevision = 0;
-        std::optional<int> unreadCounter;
-        std::optional<bool> muted;
-        bool muteFromPull = false;
-        QJsonValue muteList;
-        QSet<qint64> exactlyRead;
-        QSet<qint64> historyUnread;
-        QSet<qint64> seenByOthers;
-        QStringList pendingReadIds;
-        QString pendingReadTask;
-    };
-    struct ChatPopup {
-        Notification entry;
-        QString dialog;
-        QString author;
-        QJsonValue muteList;
-        bool fromHistory = false;
-    };
-    struct ChatPopupHistory {
-        QString dialog;
-        std::optional<qint64> through;
-    };
     void reconcileHistoryPopups(const QString &dialog, qint64 chatId, bool task, const QJsonObject &history,
-                                const QVector<Message> &messages);
-    bool rememberChatPopup(const QString &dialog, const QString &noticeId);
-    void queueChatPopup(ChatPopup popup);
-    DialogMessageState &dialogMessageState(const QString &dialog);
-    bool chatMuted(const ChatPopup &popup) const;
-    QHash<QString, DialogMessageState> m_dialogMessageStates;
-    QJsonObject m_chatPopupSettings;
-    QVariantMap m_notificationSettings;
-    QHash<QString, QPair<quint64, QJsonValue>> m_notificationSettingChanges;
-    quint64 m_notificationSettingsRevision = 0;
-    QQueue<ChatPopup> m_pendingChatPopups;
-    QCache<QString, bool> m_seenChatPopups{256};
-    ChatPopupHistory m_chatPopupHistory;
-    ChatPopupHistory m_taskPopupHistory;
-    qint64 m_nextChatPopupSettingsRequest = 0;
-    quint64 m_chatPopupSettingsGeneration = 0;
-    bool m_chatPopupSettingsKnown = false;
-
+                                const QVector<Message> &messages) override;
     Session m_session;
     bool m_allowLoopback;
     bool m_started = false;
@@ -439,50 +357,18 @@ private:
     bool m_foreground = true;
     bool m_workspaceVisible = false;
     int m_activeSection = 0;
-    bool m_recentDirty = false;
-    bool m_chatDirty = false;
-    bool m_taskMessagesDirty = false;
     bool m_notificationsDirty = false;
-    int m_attempt = 0;
     QNetworkAccessManager m_http;
     PortalHttp m_portalHttp;
     ProjectsService m_projects;
     TasksService m_tasks;
-    QWebSocket m_socket;
-    QTimer m_retry;
-    QTimer m_watchdog;
-    QTimer m_heartbeat;
+    ChatTimeline m_timeline;
+    ChatsService m_chats;
+    NotificationsService m_notices;
+    PullChannel m_pull;
     QTimer m_refresh;
-    QTimer m_configExpiry;
     QTimer m_historyCatchup;
     QTimer m_sessionKeepalive;
-    QHash<QString, QString> m_taskDialogs;
-    QCache<QString, QString> m_recentTitles{2 * tunables::kPageSizeChats};
-    QCache<QString, QString> m_taskChatTitles{2 * tunables::kPageSizeChats};
-    QVector<Chat> m_legacyTaskChats;
-    QVector<Chat> m_recentTaskChatItems;
-    QVector<Chat> m_recentChatItems;
-    struct RecentOverlay {
-        Chat preview;
-        struct HistoryPreview {
-            qint64 chatId = 0;
-            qint64 messageId = 0;
-            QString text;
-            QDateTime updated;
-        } historyPreview;
-        qint64 rejectedRecentPreviewChatId = 0;
-        qint64 rejectedTaskPreviewChatId = 0;
-        qint64 chatId = 0;
-        qint64 messageId = 0;
-        qint64 incomingId = 0;
-        qint64 eventTime = 0;
-        qint64 confirmedCounterCursor = 0;
-        quint64 counterRevision = 0;
-        std::optional<int> counter;
-        std::optional<bool> markedUnread;
-    };
-    RecentOverlay &recentOverlay(const QString &dialog);
-    QHash<QString, RecentOverlay> m_recentOverlays;
     struct ChatCounterBadge { int unread = 0; bool marked = false; int messageCount = 0; };
     struct ChatBadgeAnchor {
         qint64 message = 0;
@@ -496,20 +382,18 @@ private:
     struct PendingAnchorEvent { QString command; QJsonObject params; quint64 revision; };
     void loadChatBadges() override;
     void applyChatCounterSnapshot(const QJsonArray &rows, quint64 revision);
-    void publishUnreadChatCount();
+    void publishUnreadChatCount() override;
     void resetChatCounters();
     void decorateProjectTaskChat(Chat &chat) const override;
-    qint64 badgeChatId(const QString &dialog) const;
-    void decorateChatBadges(Chat &chat) const;
+    qint64 badgeChatId(const QString &dialog) const override;
+    void decorateChatBadges(Chat &chat) const override;
     bool updateAnchors(const QString &command, const QJsonObject &params, quint64 revision);
     void notifyAnchorAvailable(qint64 chatId = 0);
     bool handleAnchorPull(const QString &command, const QJsonObject &params);
-    void republishChatBadges(qint64 changedChatId = 0);
+    void republishChatBadges(qint64 changedChatId = 0) override;
     void readVisibleChat(const QString &dialog, const QStringList &incoming, const QStringList &visible,
                          const QString &task = {});
-    static std::optional<int> unreadCount(const QJsonValue &value);
     void applyReadHistory(const QString &dialog, const QJsonObject &receipt, const QStringList &submitted = {});
-    void rememberUnreadHistoryRows(const QString &dialog, qint64 chatId, const QJsonArray &rows, quint64 revision);
     void readVisibleAnchors(qint64 chatId, const QStringList &visible);
     quint64 m_anchorRevision = 0;
     bool m_badgePagePending = false;
@@ -517,59 +401,12 @@ private:
     bool m_badgePageOvertaken = false;
     qsizetype m_chatAnchorCount = 0;
     bool m_haveCounterSnapshot = false;
-    quint64 m_chatBadgeRevision = 0;
-    quint64 m_chatCounterSnapshotRevision = 0;
     quint64 m_accountScopeRevision = 0;
     qint64 m_chatCounterSnapshotTotal = 0;
     std::optional<qint64> m_unreadChatCount;
     QHash<qint64, ChatCounterBadge> m_chatCounterBadges;
     QHash<qint64, QVector<ChatBadgeAnchor>> m_chatAnchors;
     QVector<PendingAnchorEvent> m_pendingAnchorEvents;
-    struct PendingRecentPull { QString command; QString dialog; QString chatId; QJsonObject params; QJsonObject extra; };
-    QVector<PendingRecentPull> m_recentPullsAwaitingIdentity;
-    bool m_showTaskChats = false;
-    struct PersonalChatStatus { std::optional<bool> dismissed; qint64 expiresAt; };
-    QCache<QString, PersonalChatStatus> m_personalChatStatuses{2 * tunables::kPageSizeChats};
-    quint64 m_recentStatusGeneration = 0;
-    quint64 m_taskTitleGeneration = 0;
-    struct HistoryRequest { QString key; QString dialog; bool task; };
-    QVector<HistoryRequest> m_historiesWaitingForIdentity;
-    bool m_triedHistoryIdentity = false;
-    void notificationBatch(const QString &method, const QUrlQuery &parameters, const QString &operation,
-                           std::function<void(QJsonValue)> onResult, const QString &requestKey = {});
-    void resetNoticeState();
-    struct NotificationCursor {
-        qint64 id = 0;
-        int type = 0;
-    };
-    static NotificationCursor notificationCursor(const QJsonArray &rows);
-    void publishNotificationPage(QVector<Notification> items);
-    void publishNotificationHistoryPageState();
-    QVector<Notification> decodeNotifications(const QJsonArray &rows, const QJsonValue &users, quint64 requestedAt) const;
-    QString notificationTaskId(const QString &dialog, const QJsonObject &eventChat) const;
-    void updateNotificationReadState(const QStringList &ids, bool read, std::optional<quint64> started = {});
-    void removeNotification(const QString &id);
-    struct NotificationMutation {
-        quint64 revision;
-        bool read;
-        bool removed;
-    };
-    QVector<Notification> m_notifications;
-    QVector<Notification> m_notificationSearchRows;
-    QString m_notificationSearchQuery;
-    QHash<QString, NotificationMutation> m_notificationMutations;
-    quint64 m_notificationRevision = 0;
-    NotificationCursor m_notificationOlderCursor;
-    int m_notificationOlderPages = 0;
-    bool m_loadingOlderNotifications = false;
-    QQueue<QString> m_seenEvents;
-    QSet<QString> m_seenEventIds;
-    QQueue<QString> m_sentTemplates;
-    QString m_mid;
-    QString m_tag;
-    QString m_time;
-    QString m_openDialog;
-    QString m_openTask;
     QString m_userId;
 
 };

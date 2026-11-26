@@ -24,7 +24,7 @@ void CloudBackend::rememberPortalStatus(const QString &status, bool notifyUnchan
     const bool changed = m_portalStatus != status;
     m_portalStatus = status;
     if (status == QLatin1String("dnd"))
-        m_pendingChatPopups.clear();
+        m_notices.clearPendingPopups();
     if (changed || notifyUnchanged)
         emit portalStatusLoaded(status);
     if (m_unboundPortalStatuses.isEmpty())
