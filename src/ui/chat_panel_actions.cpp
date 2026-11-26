@@ -1,4 +1,6 @@
 #include "ui/chat_panel.h"
+#include "ui/workspace_directory.h"
+#include "ui/reaction_catalog.h"
 #include "ui/message_files.h"
 #include "ui/workspace_message_previews.h"
 #include "core/operations.h"
@@ -19,7 +21,6 @@
 #include <memory>
 #include <utility>
 #include <QInputDialog>
-#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPersistentModelIndex>
@@ -520,33 +521,31 @@ void ChatPanel::showChatAssets(const QString &scope, QWidget *parent)
     fetch(0);
 }
 
-void ChatPanel::promptGroupChat()
+QVariantMap ChatPanel::reactionFrequency() const
 {
-    if (!writable())
-        return;
-    bool accepted = false;
-    const auto name = QInputDialog::getText(window(), QStringLiteral("Новый групповой чат"),
-                                           QStringLiteral("Название"), QLineEdit::Normal, {}, &accepted).trimmed();
-    if (!accepted || name.isEmpty())
-        return;
-    const auto members = QInputDialog::getText(window(), QStringLiteral("Участники нового чата"),
-        QStringLiteral("ID сотрудников через запятую"), QLineEdit::Normal, {}, &accepted);
-    if (accepted && writable()) {
-        static const QRegularExpression separators(QStringLiteral("[,\\s]+"));
-        m_backend->createGroupChat(name, members.split(separators, Qt::SkipEmptyParts));
+    const auto key = chatPreferenceKey(m_backend->settingsScope(), QLatin1String("reactionFrequency"));
+    if (key.isEmpty())
+        return {};
+    auto settings = chatPreferences();
+    settings.beginGroup(key);
+    QVariantMap frequency;
+    for (const auto &code : settings.childKeys()) {
+        if (ui::findReaction(code))
+            frequency.insert(code, settings.value(code));
     }
+    return frequency;
 }
 
-void ChatPanel::promptChatMember(const QString &dialog, bool add)
+void ChatPanel::incrementReactionFrequency(const QString &code)
 {
-    if (!writable())
+    const auto key = chatPreferenceKey(m_backend->settingsScope(), QLatin1String("reactionFrequency"));
+    if (key.isEmpty())
         return;
-    bool accepted = false;
-    const auto title = add ? QStringLiteral("Добавить участника") : QStringLiteral("Удалить участника");
-    const auto id = QInputDialog::getText(window(), title, QStringLiteral("ID сотрудника"),
-                                        QLineEdit::Normal, {}, &accepted).trimmed();
-    if (accepted && !id.isEmpty() && writable())
-        m_backend->changeChatMember(dialog, id, add);
+    auto settings = chatPreferences();
+    settings.beginGroup(key);
+    const auto count = settings.value(code).toULongLong();
+    if (count < std::numeric_limits<qulonglong>::max())
+        settings.setValue(code, count + 1);
 }
 
 } // namespace bx

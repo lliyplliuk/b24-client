@@ -80,6 +80,10 @@ add_library(bxwidgets STATIC
     src/ui/workspace_presentation.cpp
     src/ui/task_card_controller.h
     src/ui/task_card_controller.cpp
+    src/ui/task_card_controller_events.cpp
+    src/ui/task_card_controller_errors.cpp
+    src/ui/task_card_controller_history.cpp
+    src/ui/task_card_controller_files.cpp
     src/ui/main_window.cpp
     src/ui/avatar_painter.cpp
     src/ui/card_row_painter.cpp
@@ -150,8 +154,14 @@ add_library(bxwidgets STATIC
     src/ui/composer_send_controller.cpp
     src/ui/chat_panel.h
     src/ui/chat_panel.cpp
+    src/ui/chat_panel_directory.cpp
+    src/ui/chat_panel_history.cpp
+    src/ui/chat_panel_search.cpp
+    src/ui/chat_panel_composer.cpp
     src/ui/chat_panel_events.cpp
     src/ui/chat_panel_actions.cpp
+    src/ui/history_surface.h
+    src/ui/history_surface.cpp
     src/ui/message_files.cpp
     src/ui/workspace_message_viewers.cpp
     src/ui/workspace_message_previews.cpp
@@ -209,6 +219,10 @@ endforeach()
 if(Qt6Test_FOUND)
     enable_testing()
     add_subdirectory(tests)
+    add_executable(tst_history_surface tests/tst_history_surface.cpp)
+    target_link_libraries(tst_history_surface PRIVATE bxwidgets Qt6::Test)
+    add_test(NAME tst_history_surface COMMAND tst_history_surface)
+    set_tests_properties(tst_history_surface PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
     add_executable(tst_ui_workspace_presentation tests/tst_ui_workspace_presentation.cpp)
     target_link_libraries(tst_ui_workspace_presentation PRIVATE bxwidgets Qt6::Test)
     add_test(NAME tst_ui_workspace_presentation COMMAND tst_ui_workspace_presentation)

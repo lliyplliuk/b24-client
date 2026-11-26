@@ -74,6 +74,7 @@ signals:
 private:
     bool writable() const { return m_workspace.writable(); }
     void connectBackend();
+    void bindHistory(ui::TaskCardDialog *card);
     void onTaskUpdated(const QString &taskId);
     void confirmTaskDeletion(ui::TaskCardDialog *card);
     void onTaskDeleted(const QString &taskId);

@@ -94,6 +94,9 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+    QWidget *createMessageSearch(QWidget *reading);
+    QWidget *createDirectory(QWidget *parent);
+    void createComposer(QWidget *parent, ui::HistoryList *history);
     void openMessageViewers(const QString &messageId, const QPoint &anchor);
     void onChatSelected();
     void focusChatComposer();

@@ -1,4 +1,5 @@
 #include "ui/chat_panel.h"
+#include "ui/history_surface.h"
 #include "ui/chat_widgets.h"
 #include "ui/task_dialogs.h"
 #include "ui/reaction_catalog.h"
@@ -112,12 +113,18 @@ void ChatPanel::connectBackend()
         }
         updateChatContactPresentation();
     });
-    connect(m_backend, &Backend::pinnedMessagesLoaded, this,
-            [this](const QString &dialog, const QVector<Message> &messages) {
-        if (dialog.isEmpty())
-            return;
-        if (dialog == m_currentChatId)
-            m_chatPinned->setMessages(messages);
+    auto *surface = new ui::HistorySurface(m_backend, false, [this] {
+        return ui::HistorySurface::View{static_cast<ui::HistoryList *>(m_chatMessages), m_currentChatId,
+                                        m_currentChatId, m_active, m_messageSearchActive, !m_contextDialogId.isEmpty()};
+    }, this);
+    connect(surface, &ui::HistorySurface::pinsChanged, m_chatPinned, &ui::PinnedMessageBar::setMessages);
+    connect(surface, &ui::HistorySurface::olderPageAdded, this, [this] {
+        emit avatarRowsChanged();
+        emit avatarsRequested();
+    });
+    connect(surface, &ui::HistorySurface::historyCleared, this, [this] {
+        resetMessageContext();
+        showEmpty(m_chatMessages, m_chatEmpty, QStringLiteral("Сообщений пока нет"));
     });
     connect(m_backend, &Backend::chatMessagesLoaded, this,
             [this](const QString &chatId, const QVector<Message> &messages) {
@@ -126,36 +133,6 @@ void ChatPanel::connectBackend()
             static_cast<ui::HistoryList *>(m_chatMessages)->showHistory(chatId, m_chatEmpty, messages);
             emit avatarRowsChanged();
             emit avatarsRequested();
-        }
-    });
-    connect(m_backend, &Backend::olderChatMessagesLoaded, this,
-            [this](const QString &scope, const QString &before, bool task, const QVector<Message> &messages, bool more) {
-        if (task || !m_active || scope != m_currentChatId || m_messageSearchActive)
-            return;
-        auto *history = static_cast<ui::HistoryList *>(m_chatMessages);
-        if (history->addOlder(scope, before, messages, more)) {
-            emit avatarRowsChanged();
-            emit avatarsRequested();
-        }
-    });
-    connect(m_backend, &Backend::chatReadConfirmed, this,
-            [this](const QString &dialog, const QStringList &ids, qint64 readThrough) {
-        if (dialog.isEmpty())
-            return;
-        if (m_currentChatId == dialog && !m_messageSearchActive && m_contextDialogId.isEmpty())
-            static_cast<ui::HistoryList *>(m_chatMessages)->confirmRead(ids, readThrough);
-    });
-    connect(m_backend, &Backend::chatHistoryRemoved, this,
-            [this](const QString &dialog, const QStringList &ids, qint64 through) {
-        if (dialog.isEmpty())
-            return;
-        const bool cleared = ids.isEmpty() && through == 0;
-        if (dialog == m_currentChatId) {
-            static_cast<ui::HistoryList *>(m_chatMessages)->removeHistory(ids, through);
-            if (cleared && !m_messageSearchActive) {
-                resetMessageContext();
-                showEmpty(m_chatMessages, m_chatEmpty, QStringLiteral("Сообщений пока нет"));
-            }
         }
     });
     connect(m_backend, &Backend::chatBadgeAnchorAvailable, this, [this](const QString &dialog) {
@@ -234,31 +211,6 @@ void ChatPanel::connectBackend()
             [this](const auto &query, const auto &chats) { onChatsFound(0, query, chats); });
     connect(m_backend, &Backend::taskChatsFound, this,
             [this](const auto &query, const auto &chats) { onChatsFound(1, query, chats); });
-}
-
-void ChatPanel::showMessageContext(const QString &dialogId, const QString &messageId, const QVector<Message> &messages)
-{
-    if (!m_active || m_currentChatId != dialogId ||
-        m_contextDialogId != dialogId || m_contextMessageId != messageId)
-        return;
-    static_cast<ui::HistoryList *>(m_chatMessages)->showContext(dialogId, m_chatEmpty, messages);
-    emit avatarRowsChanged();
-    emit avatarsRequested();
-    if (!focusChatMessage(messageId)) {
-        resetMessageContext();
-        m_backend->requestChatMessages(dialogId);
-        emit statusChanged(QStringLiteral("Сообщение не найдено в истории чата"));
-    }
-}
-
-void ChatPanel::showSearchResponse(const QString &scopeId, const QString &query, const QVector<Message> &messages)
-{
-    if (!m_active || scopeId != m_messageSearchScope || !m_messageSearchActive)
-        return;
-    if (query != m_messageSearchQuery)
-        m_historySearch.request(scopeId, m_messageSearchQuery);
-    else if (query == m_messageSearch->text().trimmed())
-        showMessageResults(messages);
 }
 
 bool ChatPanel::handleFailure(const QString &operation, OperationKind kind, const QStringList &ids,
@@ -364,16 +316,6 @@ bool ChatPanel::failMessageContext(const QStringList &ids, const QString &reason
         return true;
     }
     return false;
-}
-
-void ChatPanel::chatSearchFailed(const QString &scope, const QString &query, const QString &reason)
-{
-    if (!m_active || !m_messageSearchActive || scope != m_messageSearchScope)
-        return;
-    if (query != m_messageSearchQuery)
-        m_historySearch.request(m_messageSearchScope, m_messageSearchQuery);
-    else if (query == m_messageSearch->text().trimmed())
-        showEmpty(m_chatMessages, m_chatEmpty, reason);
 }
 
 void ChatPanel::refreshMentionAvatars()
