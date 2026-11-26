@@ -633,6 +633,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     m_messageSearchTimer->setInterval(300);
     connect(m_messageSearchTimer, &QTimer::timeout, this, &MainWindow::runMessageSearch);
     m_visibleChatReadTimer = new QTimer(this);
+    m_visibleChatReadTimer->setObjectName(QStringLiteral("visibleChatReadTimer"));
     m_visibleChatReadTimer->setSingleShot(true);
     m_visibleChatReadTimer->setInterval(160);
     connect(m_visibleChatReadTimer, &QTimer::timeout, this, &MainWindow::reportVisibleChatRead);
@@ -1960,6 +1961,7 @@ QWidget *MainWindow::buildNotificationsPanel()
     m_notifications = new QListWidget(panel);
     m_notifications->setAccessibleName(QStringLiteral("Уведомления"));
     m_noticeReadTimer = new QTimer(panel);
+    m_noticeReadTimer->setObjectName(QStringLiteral("noticeReadTimer"));
     m_noticeReadTimer->setSingleShot(true);
     m_noticeReadTimer->setInterval(160);
     connect(m_noticeReadTimer, &QTimer::timeout, this, &MainWindow::readVisibleNotices);

@@ -10,6 +10,7 @@
 #include "ui/workspace_presentation.h"
 #include "ui/workspace_style.h"
 
+#include <QAbstractEventDispatcher>
 #include <QApplication>
 #include <QTemporaryDir>
 #include <QTabBar>
@@ -63,6 +64,40 @@
 using namespace bx;
 
 namespace {
+
+// These clocks are value members without a QObject parent. Explicit instantiation
+// gives the tests access without changing widget ownership or exposing a UI API.
+template<typename Owner, typename Clock, Clock Owner::*member>
+struct WidgetClock {
+    friend Clock &testClock(Owner &owner) { return owner.*member; }
+};
+
+QTimer &testClock(ui::ChatComposer &);
+template struct WidgetClock<ui::ChatComposer, QTimer, &ui::ChatComposer::m_typingExpiry>;
+QTimer &testClock(ui::TaskCardDialog &);
+template struct WidgetClock<ui::TaskCardDialog, QTimer, &ui::TaskCardDialog::m_copyFeedbackTimer>;
+QVariantAnimation &testClock(ui::HistoryList &);
+template struct WidgetClock<ui::HistoryList, QVariantAnimation, &ui::HistoryList::m_wheelAnimation>;
+QTimer &testClock(ui::LoadingClock &);
+template struct WidgetClock<ui::LoadingClock, QTimer, &ui::LoadingClock::m_timer>;
+
+void fireTimer(QTimer &timer)
+{
+    QVERIFY(timer.isActive());
+    QTimerEvent event(timer.timerId());
+    QCoreApplication::sendEvent(&timer, &event);
+}
+
+void deliverPendingTimer(MainWindow &window, const QString &name)
+{
+    QCoreApplication::sendPostedEvents();
+    auto *timer = window.findChild<QTimer *>(name);
+    QVERIFY(timer);
+    QCOMPARE(timer->interval(), 160);
+    QVERIFY(timer->isSingleShot());
+    if (timer->isActive())
+        fireTimer(*timer);
+}
 
 template<typename Widget>
 Widget *findAccessible(const QWidget *window, const QString &name)
@@ -2144,7 +2179,7 @@ private slots:
         const auto compactPath = qEnvironmentVariable("B24_COMPACT_SCREENSHOT");
         if (!compactPath.isEmpty()) {
             window->resize(720, 500);
-            QTest::qWait(60);
+            QCoreApplication::processEvents();
             QVERIFY(window->grab().save(compactPath));
         }
         for (const auto &stage : {QStringLiteral("К выполнению"), QStringLiteral("Готово")}) {
@@ -2164,12 +2199,14 @@ private slots:
         const bool sample = ok && sampleMs > 0 && sampleMs <= 10000;
         if (sample) {
             qInfo("B24_UI_OPEN");
+            // Keep the requested sampling window open for the external smoke profiler.
             QTest::qWait(sampleMs);
         }
         window->close();
         QTRY_VERIFY(window.isNull());
         if (sample) {
             qInfo("B24_UI_CLOSED");
+            // Keep the requested sampling window open for the external smoke profiler.
             QTest::qWait(sampleMs);
         }
         demo.stop();
@@ -2423,37 +2460,45 @@ private slots:
         QVERIFY(nativeNotch > 3);
         const int chatNotch = qRound(nativeNotch / 8.0);
         auto *scroll = history.verticalScrollBar();
+        auto &wheel = testClock(history);
+        const auto finishNotch = [&wheel] {
+            QCOMPARE(wheel.state(), QAbstractAnimation::Running);
+            wheel.setCurrentTime(wheel.duration());
+        };
         const int middle = scroll->maximum() / 2;
         scroll->setValue(middle);
         send(history, {0, -120});
         QCOMPARE(scroll->value(), middle);
-        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), middle + chatNotch, 500);
+        finishNotch();
+        QCOMPARE(scroll->value(), middle + chatNotch);
         send(history, {0, 120});
         QCOMPARE(scroll->value(), middle + chatNotch);
-        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), middle, 500);
+        finishNotch();
+        QCOMPARE(scroll->value(), middle);
 
         send(history, {0, -120});
         send(history, {0, -120});
         QCOMPARE(scroll->value(), middle);
-        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), middle + 2 * chatNotch, 500);
+        finishNotch();
+        QCOMPARE(scroll->value(), middle + 2 * chatNotch);
 
         const int beforeChange = scroll->value();
         send(history, {0, -120});
         send(history, {0, 120});
-        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), beforeChange - chatNotch, 500);
+        finishNotch();
+        QCOMPARE(scroll->value(), beforeChange - chatNotch);
 
         const auto precisePixels = QPoint(0, -17);
         const int preciseMovement = movement(native, {0, -120}, precisePixels, Qt::ScrollUpdate);
         const int beforePrecise = scroll->value();
         send(history, {0, -120});
         send(history, {0, -120}, precisePixels, Qt::ScrollUpdate);
-        QCOMPARE(scroll->value(), beforePrecise + preciseMovement);
-        QTest::qWait(150);
+        QCOMPARE(wheel.state(), QAbstractAnimation::Stopped);
         QCOMPARE(scroll->value(), beforePrecise + preciseMovement);
 
         send(history, {0, -120});
         scroll->setValue(middle);
-        QTest::qWait(150);
+        QCOMPARE(wheel.state(), QAbstractAnimation::Stopped);
         QCOMPARE(scroll->value(), middle);
         QVERIFY(qAbs(movement(history, {0, -30}) - movement(native, {0, -30})) <= 1);
         QCOMPARE(movement(history, {0, -120}, {}, Qt::NoScrollPhase, Qt::ControlModifier),
@@ -2466,13 +2511,15 @@ private slots:
         send(history, {0, 120});
         send(history, {0, 120});
         send(history, {0, -120});
-        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), nearTop + chatNotch, 500);
+        finishNotch();
+        QCOMPARE(scroll->value(), nearTop + chatNotch);
         QVERIFY(older.isEmpty());
 
         scroll->setValue(nearTop);
         send(history, {0, 120});
         send(history, {0, 120});
-        QTRY_COMPARE_WITH_TIMEOUT(scroll->value(), scroll->minimum(), 500);
+        finishNotch();
+        QCOMPARE(scroll->value(), scroll->minimum());
         QTRY_COMPARE_WITH_TIMEOUT(older, QStringList{QStringLiteral("101")}, 500);
         send(history, {0, 120});
         QCOMPARE(older, QStringList{QStringLiteral("101")});
@@ -2872,10 +2919,21 @@ private slots:
         emit backend->chatTypingChanged(personal.id, another, 1000);
         QCOMPARE(typing->text(), QStringLiteral("Печатает…"));
         QCOMPARE(backend->personRequests, QStringList{another});
-        QTest::qWait(750);
+        auto *composer = dynamic_cast<ui::ChatComposer *>(typing->parentWidget());
+        QVERIFY(composer);
+        auto &expiry = testClock(*composer);
+        QVERIFY(expiry.isActive());
+        QCOMPARE(expiry.interval(), 1000);
+        // Qt can reuse a stopped timer's ID. Mark the next registration so a
+        // restart during name resolution is detectable even on those versions.
+        const auto registeredType = expiry.timerType();
+        expiry.setTimerType(registeredType == Qt::PreciseTimer ? Qt::CoarseTimer : Qt::PreciseTimer);
         emit backend->personLoaded(Person{another, QStringLiteral("Павел <дежурный>"), {}, {}});
         QCOMPARE(typing->text(), QStringLiteral("Павел <дежурный> печатает…"));
-        QTest::qWait(400);
+        const auto registrations = QAbstractEventDispatcher::instance()->registeredTimers(&expiry);
+        QCOMPARE(registrations.size(), 1);
+        QCOMPARE(registrations.first().timerType, registeredType);
+        fireTimer(expiry);
         QVERIFY(!typing->isVisible());
         emit backend->chatTypingChanged(personal.id, another, 1000);
         QCOMPARE(typing->text(), QStringLiteral("Павел <дежурный> печатает…"));
@@ -3013,7 +3071,8 @@ private slots:
         auto *search = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск по сообщениям"));
         auto *searchToggle = findAccessible<QPushButton>(&window, QStringLiteral("Найти в чате"));
         QVERIFY(history && search && searchToggle);
-        QTRY_VERIFY(!backend->reads.isEmpty());
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(!backend->reads.isEmpty());
         const auto last = backend->reads.constLast();
         QCOMPARE(last.scope, QStringLiteral("c-1"));
         QVERIFY(!last.task && last.visible.contains(QStringLiteral("1031")));
@@ -3026,12 +3085,13 @@ private slots:
         QApplication::setActiveWindow(&other);
         const auto beforeBackground = backend->reads.size();
         history->scrollToTop();
-        QTest::qWait(230);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
         QCOMPARE(backend->reads.size(), beforeBackground);
         other.close();
         QApplication::setActiveWindow(&window);
         history->setFocus(Qt::OtherFocusReason);
-        QTRY_VERIFY(backend->reads.size() > beforeBackground);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(backend->reads.size() > beforeBackground);
         QVERIFY(backend->reads.constLast().incoming.contains(QStringLiteral("1000")));
         QVERIFY(!backend->reads.constLast().visible.contains(QStringLiteral("1031")));
 
@@ -3045,7 +3105,7 @@ private slots:
         found.text = query;
         emit backend->messagesFound(QStringLiteral("c-1"), query, false, {found});
         QTRY_COMPARE(history->count(), 1);
-        QTest::qWait(230);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
         QCOMPARE(backend->reads.size(), beforeSearch);
 
         auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
@@ -3055,7 +3115,8 @@ private slots:
         auto *card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
         QVERIFY(card);
         QApplication::setActiveWindow(card);
-        QTRY_VERIFY(backend->reads.size() > beforeSearch);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(backend->reads.size() > beforeSearch);
         const auto task = backend->reads.constLast();
         QVERIFY(task.task);
         QCOMPARE(task.scope, QStringLiteral("501"));
@@ -3079,18 +3140,20 @@ private slots:
         auto *chats = findAccessible<QListWidget>(&window, QStringLiteral("Недавние чаты"));
         QVERIFY(history && chats);
         QTRY_COMPARE(history->count(), 1);
-        QTest::qWait(220);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
         QVERIFY(backend->reads.isEmpty());
 
         emit backend->connectionChanged(true);
-        QTRY_VERIFY(!backend->reads.isEmpty());
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(!backend->reads.isEmpty());
         QCOMPARE(backend->reads.last().scope, QStringLiteral("c-1"));
         QCOMPARE(backend->reads.last().incoming, QStringList{message.id});
         const auto before = backend->reads.size();
         QVERIFY(chats->currentItem());
         QTest::mouseClick(chats->viewport(), Qt::LeftButton, Qt::NoModifier,
                           chats->visualItemRect(chats->currentItem()).center());
-        QTRY_VERIFY(backend->reads.size() > before);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(backend->reads.size() > before);
         QCOMPARE(backend->reads.last().incoming, QStringList{message.id});
     }
 
@@ -3162,7 +3225,10 @@ private slots:
         window.resize(930, 555);
         window.show();
         QApplication::setActiveWindow(&window);
-        QTRY_VERIFY(!backend->reads.isEmpty());
+        auto *readTimer = window.findChild<QTimer *>(QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(readTimer);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(!backend->reads.isEmpty());
         QVERIFY(backend->reads.last().visible.contains(QStringLiteral("728")));
         QVERIFY(backend->reads.last().incoming.isEmpty());
 
@@ -3170,11 +3236,13 @@ private slots:
         backend->chats.first().hasReaction = true;
         emit backend->recentChatsLoaded(backend->chats);
         emit backend->chatBadgeAnchorAvailable(QStringLiteral("chat999"));
-        QTest::qWait(210);
+        QVERIFY(!readTimer->isActive());
         QCOMPARE(backend->reads.size(), regularBefore);
 
         emit backend->chatBadgeAnchorAvailable(QStringLiteral("c-1"));
-        QTRY_VERIFY_WITH_TIMEOUT(backend->reads.size() > regularBefore, 1800);
+        QCOMPARE(backend->reads.size(), regularBefore);
+        fireTimer(*readTimer);
+        QVERIFY(backend->reads.size() > regularBefore);
         QCOMPARE(backend->reads.last().scope, QStringLiteral("c-1"));
         QVERIFY(backend->reads.last().visible.contains(QStringLiteral("728")));
         QVERIFY(!backend->reads.last().visible.contains(QStringLiteral("701")));
@@ -3185,14 +3253,17 @@ private slots:
         auto *card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
         QVERIFY(card);
         QApplication::setActiveWindow(card);
-        QTRY_VERIFY(backend->reads.size() > afterRegular);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+        QVERIFY(backend->reads.size() > afterRegular);
         QVERIFY(backend->reads.last().task);
         const auto taskBefore = backend->reads.size();
         emit backend->chatBadgeAnchorAvailable(QStringLiteral("c-1"));
-        QTest::qWait(210);
+        QVERIFY(!readTimer->isActive());
         QCOMPARE(backend->reads.size(), taskBefore);
         emit backend->chatBadgeAnchorAvailable(QStringLiteral("chat67"));
-        QTRY_VERIFY_WITH_TIMEOUT(backend->reads.size() > taskBefore, 1800);
+        QCOMPARE(backend->reads.size(), taskBefore);
+        fireTimer(*readTimer);
+        QVERIFY(backend->reads.size() > taskBefore);
         QVERIFY(backend->reads.last().task);
         QCOMPARE(backend->reads.last().scope, QStringLiteral("501"));
         QCOMPARE(backend->reads.last().visible, QStringList{taskMessage.id});
@@ -3332,8 +3403,8 @@ private slots:
             auto *messages = findAccessible<QListWidget>(surface, historyName);
             auto *bar = findAccessible<QPushButton>(surface, QStringLiteral("Закреплённые сообщения"));
             QVERIFY(messages && bar && bar->isVisible());
-            QTRY_VERIFY(!backend->reads.isEmpty());
-            QTest::qWait(180);
+            deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
+            QVERIFY(!backend->reads.isEmpty());
             const auto reads = backend->reads.size();
             bar->click();
             QVERIFY(!QApplication::activePopupWidget());
@@ -3343,7 +3414,7 @@ private slots:
             QCOMPARE(messages->count(), history.size());
             const auto focused = messages->visualItemRect(messages->currentItem());
             QVERIFY(qAbs(focused.center().y() - messages->viewport()->rect().center().y()) <= 40);
-            QTest::qWait(180);
+            deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
             QCOMPARE(backend->reads.size(), reads);
 
             auto *day = messages->findChild<QLabel *>(QStringLiteral("chatStickyDay"));
@@ -3448,7 +3519,11 @@ private slots:
         QCOMPARE(feedback->text(), QStringLiteral("Ссылка скопирована"));
         QCoreApplication::sendPostedEvents(card, QEvent::LayoutRequest);
         QCOMPARE(copyLink->geometry(), linkGeometry);
-        QVERIFY(QTest::qWaitFor([feedback] { return feedback->text().isEmpty(); }, 3000));
+        auto &feedbackTimer = testClock(*card);
+        QVERIFY(feedbackTimer.isActive());
+        QCOMPARE(feedbackTimer.interval(), 1800);
+        fireTimer(feedbackTimer);
+        QVERIFY(feedback->text().isEmpty());
 
         const auto clipboard = QGuiApplication::clipboard()->text();
         card->setLink(QString());
@@ -3934,7 +4009,7 @@ private slots:
         QVERIFY(!apply->isEnabled());
         card.setPeopleResults(request, {{QStringLiteral("14"), QStringLiteral("Борис"), {}, {}}});
         if (const auto path = qEnvironmentVariable("B24_REQUISITE_POPUP_DIR"); !path.isEmpty()) {
-            QTest::qWait(20);
+            QCoreApplication::processEvents();
             QVERIFY(card.grab().save(path + QStringLiteral("/people-popup.png")));
         }
         QTest::keyClick(search, Qt::Key_Return);
@@ -4000,7 +4075,7 @@ private slots:
         QVERIFY(currentProjectPill);
         QCOMPARE(currentProjectPill->text(), QStringLiteral("Стройка"));
         if (const auto path = qEnvironmentVariable("B24_REQUISITE_POPUP_DIR"); !path.isEmpty()) {
-            QTest::qWait(20);
+            QCoreApplication::processEvents();
             QVERIFY(card.grab().save(path + QStringLiteral("/project-popup.png")));
         }
         QTest::keyClick(projectSearch, Qt::Key_Escape);
@@ -4268,7 +4343,7 @@ private slots:
         QVERIFY(!pillValues(field).front()->parentWidget()->property("pending").toBool());
 
         if (const auto dir = qEnvironmentVariable("B24_PICKER_DESIGN_DIR"); !dir.isEmpty()) {
-            QTest::qWait(20);
+            QCoreApplication::processEvents();
             QVERIFY(card->grab().save(dir + QStringLiteral("/people-wide.png")));
         }
 
@@ -4308,7 +4383,7 @@ private slots:
         QTRY_VERIFY(suggestions->height() < wideListHeight);
         QVERIFY(card->rect().contains(popup->geometry()));
         if (const auto dir = qEnvironmentVariable("B24_PICKER_DESIGN_DIR"); !dir.isEmpty()) {
-            QTest::qWait(30);
+            QCoreApplication::processEvents();
             QVERIFY(card->grab().save(dir + QStringLiteral("/people-compact.png")));
         }
 
@@ -4394,7 +4469,7 @@ private slots:
             card->resize(1070, 650);
             QTRY_VERIFY(popup->width() >= 390);
             QTRY_VERIFY(wrapsInOrder());
-            QTest::qWait(30);
+            QCoreApplication::processEvents();
             QVERIFY(popup->grab().save(dir + QStringLiteral("/observers-wide.png")));
         }
         auto *remove = findAccessible<QPushButton>(popup, QStringLiteral("Удалить наблюдателя Новый наблюдатель"));
@@ -4469,7 +4544,7 @@ private slots:
         if (const auto output = qEnvironmentVariable("B24_REQUISITE_SCREENSHOT"); !output.isEmpty()) {
             card->resize(900, 650);
             details->ensureWidgetVisible(findAccessible<QPushButton>(card, QStringLiteral("Наблюдатели")), 4, 4);
-            QTest::qWait(20);
+            QCoreApplication::processEvents();
             QVERIFY(card->grab().save(output));
         }
     }
@@ -4973,7 +5048,7 @@ private slots:
         QCOMPARE(stage->item(0)->checkState(), Qt::Checked);
         QVERIFY(!stage->item(1)->icon().isNull());
         if (const auto path = qEnvironmentVariable("B24_REQUISITE_POPUP_DIR"); !path.isEmpty()) {
-            QTest::qWait(20);
+            QCoreApplication::processEvents();
             QVERIFY(card->grab().save(path + QStringLiteral("/stage-popup.png")));
         }
         stage->setCurrentRow(1);
@@ -5274,23 +5349,23 @@ private slots:
         QTRY_VERIFY(column && column->verticalScrollBar()->maximum() > 100);
         QVERIFY(!board->findChild<QPushButton *>(QStringLiteral("moreStageTasks")));
         QCOMPARE(column->count(), 24);
-        QTest::qWait(70);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QVERIFY(backend->boardPageRequests.isEmpty());
 
         auto *scrollbar = column->verticalScrollBar();
         scrollDown(column);
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QVERIFY(backend->boardPageRequests.isEmpty());
         scrollbar->setValue(scrollbar->maximum());
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QVERIFY(backend->boardPageRequests.isEmpty());
         scrollbar->setValue(0);
         scrollbar->setSliderPosition(scrollbar->maximum());
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QVERIFY(backend->boardPageRequests.isEmpty());
         scrollDown(column, QPoint(120, -1));
         scrollDown(column, QPoint(120, -1), QPoint(120, -1));
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QVERIFY(backend->boardPageRequests.isEmpty());
         const int threshold = (2 * scrollbar->maximum() + 2) / 3;
         scrollbar->setValue(threshold - 1);
@@ -5303,7 +5378,7 @@ private slots:
         emit backend->boardTasksPageLoaded(QStringLiteral("999"), firstStage, second, false);
         QCOMPARE(column->count(), 24);
         scrollDown(column);
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QCOMPARE(backend->boardPageRequests.size(), 1);
 
         column->setCurrentRow(5);
@@ -5317,7 +5392,7 @@ private slots:
         QVERIFY(!loadingVisible(status));
         QVERIFY(!status->isVisible());
         QVERIFY(findAccessible<QLabel>(board, QStringLiteral("Задач в колонке: 79")));
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QCOMPARE(backend->boardPageRequests.size(), 1);
 
         scrollbar->setValue(0);
@@ -5358,7 +5433,7 @@ private slots:
         emit backend->boardTasksPageLoaded(project, firstStage, third, false);
         QCOMPARE(list->count(), 79);
         QCOMPARE(list->item(78)->data(workspace::Id).toString(), QStringLiteral("578"));
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QCOMPARE(backend->boardPageRequests.size(), 3);
 
         auto *kanbanButton = findAccessible<QPushButton>(&window, QStringLiteral("Вид Канбан"));
@@ -5373,7 +5448,7 @@ private slots:
         emit backend->failed(QStringLiteral("board-column:101:602"), QStringLiteral("Нет связи"));
         QVERIFY(!loadingVisible(status));
         scrollDown(shortColumn);
-        QTest::qWait(60);
+        QCoreApplication::sendPostedEvents(board, QEvent::MetaCall);
         QCOMPARE(backend->boardPageRequests.size(), 4);
     }
 
@@ -5461,7 +5536,6 @@ private slots:
         push.id = QStringLiteral("m-10");
         push.text = QStringLiteral("Свежее сообщение");
         emit backend->chatMessagesLoaded(QStringLiteral("c-1"), QVector<Message>{push, push});
-        QTest::qWait(60);
         QCOMPARE(messages->count(), 1);
         QCOMPARE(messages->item(0)->data(workspace::Detail).toString(), QStringLiteral("Привет из поиска"));
 
@@ -6063,6 +6137,7 @@ private slots:
         window.resize(900, 540);
         window.show();
         QApplication::setActiveWindow(&window);
+        QTRY_COMPARE(QGuiApplication::applicationState(), Qt::ApplicationActive);
         auto *sections = window.findChild<QListWidget *>(QStringLiteral("sections"));
         auto *filter = findAccessible<QCheckBox>(&window, QStringLiteral("Только непрочитанные уведомления"));
         QVERIFY(sections && filter);
@@ -6072,17 +6147,22 @@ private slots:
         auto *list = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
         QVERIFY(list);
         QTRY_COMPARE(list->count(), 16);
+        auto *readTimer = window.findChild<QTimer *>(QStringLiteral("noticeReadTimer"));
+        QVERIFY(readTimer && readTimer->isActive());
         QDialog options(&window);
         options.setWindowModality(Qt::WindowModal);
         options.show();
         QApplication::setActiveWindow(&options);
-        QTest::qWait(180);
+        fireTimer(*readTimer);
         QVERIFY(backend->noticeReadBatches.isEmpty());
         options.close();
         QApplication::setActiveWindow(&window);
+        QCoreApplication::processEvents();
+        QTRY_VERIFY(window.isActiveWindow() && !QApplication::activeModalWidget());
         list->verticalScrollBar()->setValue(1);
         list->verticalScrollBar()->setValue(0);
-        QTRY_COMPARE(backend->noticeReadBatches.size(), 1);
+        deliverPendingTimer(window, QStringLiteral("noticeReadTimer"));
+        QCOMPARE(backend->noticeReadBatches.size(), 1);
         const auto first = backend->noticeReadBatches.constFirst();
         QVERIFY(!first.isEmpty());
         QVERIFY(first.contains(QStringLiteral("950")));
@@ -6096,14 +6176,15 @@ private slots:
         emit backend->notificationActionFinished(QStringLiteral("read-notifications"));
         QTRY_COMPARE(list->count(), 16 - first.size());
         QCOMPARE(list->indexAt(QPoint(4, 4)).data(workspace::Id).toString(), QString::number(950 - first.size()));
-        QTest::qWait(180);
+        deliverPendingTimer(window, QStringLiteral("noticeReadTimer"));
         QCOMPARE(backend->noticeReadBatches.size(), 1);
 
         list->verticalScrollBar()->setValue(list->verticalScrollBar()->maximum());
-        QTRY_COMPARE(backend->noticeReadBatches.size(), 2);
+        deliverPendingTimer(window, QStringLiteral("noticeReadTimer"));
+        QCOMPARE(backend->noticeReadBatches.size(), 2);
         QVERIFY(backend->noticeReadBatches.last().contains(QStringLiteral("935")));
         emit backend->failed(QStringLiteral("read-notifications"), QStringLiteral("Ошибка фикстуры"));
-        QTest::qWait(180);
+        deliverPendingTimer(window, QStringLiteral("noticeReadTimer"));
         QCOMPARE(backend->noticeReadBatches.size(), 2);
     }
 
@@ -6643,7 +6724,7 @@ private slots:
         QCOMPARE(history->currentItem()->data(workspace::Id).toString(), wanted.id);
         emit backend->chatMessagesLoaded(QStringLiteral("chat42"), {stale});
         QCOMPARE(history->currentItem()->data(workspace::Id).toString(), wanted.id);
-        QTest::qWait(230);
+        deliverPendingTimer(window, QStringLiteral("visibleChatReadTimer"));
         QVERIFY(std::none_of(backend->reads.cbegin(), backend->reads.cend(), [](const auto &read) {
             return read.scope == QStringLiteral("chat42") && read.visible.contains(QStringLiteral("42"));
         }));
@@ -7294,7 +7375,7 @@ private slots:
         auto deliverUnavailable = std::move(requests.last().second);
         deliverUnavailable(std::nullopt);
         emit backend->chatMessagesLoaded(QStringLiteral("chat91"), backend->messages);
-        QTest::qWait(100);
+        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
         QCOMPARE(requests.size(), 2);
 
         history->setCurrentRow(3);
@@ -7907,7 +7988,10 @@ private slots:
         };
         const auto firstFrame = rowImage();
         QVERIFY(!firstFrame.isNull());
-        QTRY_VERIFY_WITH_TIMEOUT(rowImage() != firstFrame, 500);
+        auto &animationTimer = testClock(*ui::LoadingClock::shared());
+        QVERIFY(animationTimer.isActive());
+        fireTimer(animationTimer);
+        QVERIFY(rowImage() != firstFrame);
 
         QByteArray bytes;
         QBuffer buffer(&bytes);
@@ -7925,7 +8009,7 @@ private slots:
             for (int x = 0; x < finalFrame.width() && !hasImage; ++x)
                 hasImage = finalFrame.pixelColor(x, y) == thumbnailColor;
         QCOMPARE(hasImage, succeeds);
-        QTest::qWait(210);
+        QVERIFY(!ui::LoadingClock::shared()->isRunning());
         QCOMPARE(rowImage(), finalFrame);
         QCOMPARE(backend->imageRequests.size(), fallback ? 2 : 1);
     }
@@ -9528,7 +9612,7 @@ private slots:
             QVERIFY(panel->parentWidget()->rect().contains(panel->geometry()));
             const auto screenshot = qEnvironmentVariable(screenshotVariable);
             if (!screenshot.isEmpty()) {
-                QTest::qWait(40);
+                QCoreApplication::processEvents();
                 QVERIFY(host->grab().save(screenshot));
             }
 
@@ -11215,7 +11299,7 @@ private slots:
         const auto threshold = [&] { return scroll->minimum() + ((scroll->maximum() - scroll->minimum()) * 2 + 2) / 3; };
         scroll->setValue(threshold() / 2);
         scroll->triggerAction(QAbstractSlider::SliderSingleStepAdd);
-        QTest::qWait(40);
+        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
         QVERIFY(scroll->value() < threshold());
         QCOMPARE(backend->projectMoreRequests, 0);
         const auto boundary = threshold();
@@ -11229,7 +11313,7 @@ private slots:
         QTRY_COMPARE(backend->projectMoreRequests, 1);
         emit backend->projectsMoreAvailable(true); // This signal precedes the fetched page.
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
-        QTest::qWait(40);
+        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 1);
 
         emit backend->failed(QStringLiteral("projects"), QStringLiteral("Страница недоступна"));
@@ -11237,7 +11321,7 @@ private slots:
         QVERIFY(more->text().contains(QStringLiteral("Повторить")));
         scroll->setValue(threshold() - 1);
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
-        QTest::qWait(40);
+        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 1);
         more->click();
         QCOMPARE(backend->projectMoreRequests, 2);
@@ -11253,7 +11337,7 @@ private slots:
         QTRY_COMPARE(scroll->value(), position);
         QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), selection);
         QTRY_VERIFY(more->isHidden());
-        QTest::qWait(40);
+        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 2);
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
         QTRY_COMPARE(backend->projectMoreRequests, 3);
@@ -11261,7 +11345,7 @@ private slots:
         emit backend->projectsLoaded(extended);
         scroll->setValue(scroll->minimum());
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
-        QTest::qWait(40);
+        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 3);
         QVERIFY(more->isHidden());
     }
