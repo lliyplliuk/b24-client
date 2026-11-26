@@ -1099,7 +1099,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     connect(m_backend, &Backend::notificationHistoryPageStateChanged, this, [this](bool hasMore, bool loading) {
         m_noticeHasOlder = hasMore;
         m_noticeOlderLoading = loading;
-        updateNotificationPager();
+        scheduleOlderNotifications();
     });
     connect(m_backend, &Backend::notificationReadStateChanged, this,
             [this](const QStringList &ids, bool read) {
@@ -1192,7 +1192,7 @@ void MainWindow::setSessionRecoveryAvailable(bool available)
             requestNotificationHistory();
     }
     updateRailWorkday();
-    updateNotificationPager();
+    scheduleOlderNotifications();
 }
 
 void MainWindow::showProfileSettings()
@@ -1967,8 +1967,6 @@ QWidget *MainWindow::buildNotificationsPanel()
 
     m_noticeRead = new QAction(QStringLiteral("Отметить прочитанным"), panel);
     m_noticeRead->setObjectName(QStringLiteral("readNotice"));
-    m_noticeOlder = ui::button(QStringLiteral("Загрузить более ранние"), QStringLiteral("Более ранние уведомления"), panel);
-    m_noticeOlder->hide();
     m_noticeDelete = new QAction(QStringLiteral("Удалить уведомление"), panel);
     m_noticeDelete->setObjectName(QStringLiteral("deleteNotice"));
     m_noticeSearchTimer = new QTimer(panel);
@@ -1976,7 +1974,6 @@ QWidget *MainWindow::buildNotificationsPanel()
     m_noticeSearchTimer->setInterval(280);
     connect(m_noticeSearchTimer, &QTimer::timeout, this, &MainWindow::runNotificationSearch);
     connect(m_noticeSearch, &QLineEdit::textChanged, m_noticeSearchTimer, qOverload<>(&QTimer::start));
-    connect(m_noticeSearch, &QLineEdit::textChanged, this, &MainWindow::updateNotificationPager);
     connect(m_noticeSearch, &QLineEdit::returnPressed, this, &MainWindow::runNotificationSearch);
     connect(m_noticeUnreadOnly, &QCheckBox::toggled, this, [this] {
         m_noticeExpandedId.clear();
@@ -1993,7 +1990,10 @@ QWidget *MainWindow::buildNotificationsPanel()
     connect(m_notifications->verticalScrollBar(), &QScrollBar::valueChanged, this, [this] {
         scheduleAvatars();
         scheduleVisibleNoticeRead();
+        scheduleOlderNotifications();
     });
+    connect(m_notifications->verticalScrollBar(), &QScrollBar::rangeChanged,
+            this, &MainWindow::scheduleOlderNotifications);
     connect(m_notifications, &QListWidget::currentItemChanged, this, [this](QListWidgetItem *item) {
         if (item)
             m_noticeSelectedId = item->data(workspace::Id).toString();
@@ -2025,10 +2025,6 @@ QWidget *MainWindow::buildNotificationsPanel()
             return;
         beginAction(QStringLiteral("read-all-notifications"));
         m_backend->markAllNotificationsRead();
-    });
-    connect(m_noticeOlder, &QPushButton::clicked, this, [this] {
-        if (m_noticeOlder->isVisible() && m_noticeOlder->isEnabled())
-            m_backend->requestOlderNotifications();
     });
     connect(m_noticeDelete, &QAction::triggered, this, [this, beginAction] {
         const auto *row = m_notifications->currentItem();
@@ -2084,7 +2080,6 @@ QWidget *MainWindow::buildNotificationsPanel()
     m_notificationsEmpty = emptyState(QStringLiteral("Уведомлений пока нет"), panel);
     m_notificationsEmpty->setAccessibleName(QStringLiteral("Состояние уведомлений"));
     layout->addWidget(m_notificationsEmpty, 1);
-    layout->addWidget(m_noticeOlder, 0, Qt::AlignLeft);
     m_notifications->hide();
     return panel;
 }
@@ -2125,6 +2120,7 @@ void MainWindow::showEvent(QShowEvent *event)
 {
     QMainWindow::showEvent(event);
     updateRailWorkday();
+    scheduleOlderNotifications();
 }
 
 void MainWindow::hideEvent(QHideEvent *event)
@@ -2136,8 +2132,10 @@ void MainWindow::hideEvent(QHideEvent *event)
 void MainWindow::changeEvent(QEvent *event)
 {
     QMainWindow::changeEvent(event);
-    if (event->type() == QEvent::WindowStateChange)
+    if (event->type() == QEvent::WindowStateChange) {
         updateRailWorkday();
+        scheduleOlderNotifications();
+    }
     if (event->type() == QEvent::ActivationChange && !isActiveWindow() && m_taskChatPressActive)
         m_taskChatPressEnd->start(0);
 }
@@ -2146,6 +2144,7 @@ void MainWindow::onSectionChanged(int index)
 {
     if (index == 2) {
         m_failedNoticeRead.clear();
+        m_noticeOlderFailed = false;
     } else if (m_lastSection == 2) {
         m_noticeReadTimer->stop();
         m_readNoticesAfterPending = false;
@@ -2253,8 +2252,10 @@ void MainWindow::refreshCurrentSection(bool reloadProjectDirectory)
 
 void MainWindow::onRefresh()
 {
-    if (m_lastSection == 2)
+    if (m_lastSection == 2) {
         m_failedNoticeRead.clear();
+        m_noticeOlderFailed = false;
+    }
     for (const auto &url : m_avatars.keys()) {
         const auto *photo = m_avatars.object(url);
         if (photo && photo->isNull())
@@ -2657,6 +2658,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         return;
     }
     if (operation == QLatin1String("notifications-older")) {
+        m_noticeOlderFailed = true;
         if (m_lastSection == 2 && m_noticeQuery.isEmpty())
             setStatus(reason);
         return;
@@ -2961,7 +2963,9 @@ void MainWindow::onConnectionChanged(bool online)
             requestNotificationHistory();
         scheduleVisibleChatRead();
         m_failedNoticeRead.clear();
+        m_noticeOlderFailed = false;
         scheduleVisibleNoticeRead();
+        scheduleOlderNotifications();
         if (m_externalLinkHistory)
             scheduleAvatars();
     }
@@ -5113,6 +5117,7 @@ void MainWindow::resetNotificationAccount()
     m_noticeHistoryState = NoticeHistoryState::Ready;
     m_noticeHasOlder = false;
     m_noticeOlderLoading = false;
+    m_noticeOlderFailed = false;
     m_noticeSearchResults.clear();
     m_noticeSearchPending = false;
     m_noticeSelectedId.clear();
@@ -5317,7 +5322,7 @@ void MainWindow::finishVisibleNoticeRead(bool success)
 
 void MainWindow::updateNotificationActions()
 {
-    updateNotificationPager();
+    scheduleOlderNotifications();
     const bool canWrite = writable() && m_noticeAction.isEmpty();
     const auto *row = m_notifications->currentItem();
     const bool validRow = row && !portalTaskIdentifier(row->data(workspace::Id).toString()).isEmpty();
@@ -5421,14 +5426,24 @@ void MainWindow::showNoticeMenu(QListWidgetItem *item, const QPoint &position)
     menu->popup(m_notifications->viewport()->mapToGlobal(position));
 }
 
-void MainWindow::updateNotificationPager()
+void MainWindow::scheduleOlderNotifications()
 {
-    const bool visible = m_noticeHasOlder && m_online && m_sessionRecovery->isHidden()
-        && m_noticeQuery.isEmpty() && m_noticeSearch->text().trimmed().isEmpty();
-    m_noticeOlder->setVisible(visible);
-    m_noticeOlder->setEnabled(visible && !m_noticeOlderLoading && m_noticeHistoryState != NoticeHistoryState::Loading);
-    m_noticeOlder->setText(m_noticeOlderLoading ? QStringLiteral("Загружаем более ранние…")
-                                               : QStringLiteral("Загрузить более ранние"));
+    if (m_noticePageCheckQueued || m_lastSection != 2 || !m_noticeHasOlder || m_noticeOlderLoading || m_noticeOlderFailed)
+        return;
+    m_noticePageCheckQueued = true;
+    QTimer::singleShot(0, this, [this] {
+        m_noticePageCheckQueued = false;
+        if (m_lastSection != 2 || !isVisible() || isMinimized() || !m_noticeHasOlder || m_noticeOlderLoading || m_noticeOlderFailed
+            || !m_online || !m_sessionRecovery->isHidden() || m_noticeHistoryState != NoticeHistoryState::Ready
+            || !m_noticeQuery.isEmpty() || !m_noticeSearch->text().trimmed().isEmpty())
+            return;
+        if (!m_notifications->count() && m_noticeUnreadOnly->isChecked())
+            return;
+        const auto *scroll = m_notifications->verticalScrollBar();
+        const auto olderEdge = m_noticeSort->currentIndex() == 1 ? scroll->minimum() : scroll->maximum();
+        if (!m_notifications->count() || scroll->value() == olderEdge)
+            m_backend->requestOlderNotifications();
+    });
 }
 
 void MainWindow::openNotificationTarget(int row, int action)

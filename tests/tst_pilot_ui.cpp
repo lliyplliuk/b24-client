@@ -5864,10 +5864,9 @@ private slots:
         QVERIFY(presentation(list->item(1)).excerpt.startsWith(QStringLiteral("После закрытия")));
         emit backend->connectionChanged(true);
         emit backend->notificationHistoryPageStateChanged(true, false);
-        auto *older = findAccessible<QPushButton>(&window, QStringLiteral("Более ранние уведомления"));
-        QVERIFY(older && older->isVisible());
         QCoreApplication::processEvents();
-        QVERIFY(older->mapToGlobal(QPoint()).y() > list->mapToGlobal(list->rect().bottomLeft()).y());
+        QVERIFY(!findAccessible<QPushButton>(&window, QStringLiteral("Более ранние уведомления")));
+        QCOMPARE(backend->olderNoticeRequests, 0);
         const auto screenshot = qEnvironmentVariable("B24_NOTICE_SCREENSHOT");
         if (!screenshot.isEmpty())
             QVERIFY(window.grab().save(screenshot));
@@ -6138,7 +6137,7 @@ private slots:
         QCOMPARE(list->indexAt(QPoint(4, 0)).row(), 0);
     }
 
-    void loadsEarlierNotificationsOnlyOnExplicitRequest()
+    void loadsEarlierNotificationsAtTheHistoryEdge()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());
         backend->accountScope = QStringLiteral("fixture/first-account");
@@ -6159,33 +6158,36 @@ private slots:
         auto *search = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск уведомлений"));
         auto *filter = findAccessible<QCheckBox>(&window, QStringLiteral("Только непрочитанные уведомления"));
         auto *sort = findAccessible<QComboBox>(&window, QStringLiteral("Порядок уведомлений"));
-        auto *older = findAccessible<QPushButton>(&window, QStringLiteral("Более ранние уведомления"));
-        QVERIFY(list && search && filter && sort && older);
+        QVERIFY(list && search && filter && sort);
         QTRY_COMPARE(list->count(), 16);
-        QVERIFY(!older->isVisible());
-        emit backend->notificationHistoryPageStateChanged(true, false);
-        QVERIFY(older->isVisible() && older->isEnabled());
+        auto *scroll = list->verticalScrollBar();
+        QVERIFY(scroll->maximum() > 0);
         window.onConnectionChanged(false);
-        QVERIFY(!older->isVisible());
+        list->scrollToBottom();
+        emit backend->notificationHistoryPageStateChanged(true, false);
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->olderNoticeRequests, 0);
+        list->scrollToTop();
         window.onConnectionChanged(true);
-        QVERIFY(older->isVisible() && older->isEnabled());
         search->setText(QStringLiteral("задача"));
-        QVERIFY(!older->isVisible());
+        list->scrollToBottom();
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->olderNoticeRequests, 0);
         QTRY_COMPARE(backend->noticeQuery, search->text());
         search->clear();
-        QTRY_VERIFY(older->isVisible() && older->isEnabled());
-        filter->setChecked(true);
-        sort->setCurrentIndex(1);
-        QCOMPARE(list->count(), 15);
-        list->scrollToItem(list->item(5), QAbstractItemView::PositionAtTop);
+        QTRY_COMPARE(list->count(), 16);
+        scroll->setValue(scroll->maximum() / 2);
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->olderNoticeRequests, 0);
+        list->scrollToBottom();
+        QTRY_COMPARE(backend->olderNoticeRequests, 1);
+        QVERIFY(!findAccessible<QPushButton>(&window, QStringLiteral("Более ранние уведомления")));
+        list->scrollToTop();
+        list->scrollToBottom();
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->olderNoticeRequests, 1);
         const auto top = list->indexAt(QPoint(4, 0)).data(workspace::Id).toString();
         QVERIFY(!top.isEmpty());
-        QCOMPARE(backend->olderNoticeRequests, 0);
-        older->click();
-        QCOMPARE(backend->olderNoticeRequests, 1);
-        QVERIFY(older->isVisible() && !older->isEnabled());
-        older->click();
-        QCOMPARE(backend->olderNoticeRequests, 1);
 
         Notification earlier;
         earlier.id = QStringLiteral("954");
@@ -6193,20 +6195,32 @@ private slots:
         earlier.createdAt = newest.addSecs(-16);
         backend->notifications.append(earlier);
         emit backend->notificationsLoaded(backend->notifications);
-        QCOMPARE(list->count(), 16);
-        QCOMPARE(list->item(0)->data(workspace::Id).toString(), earlier.id);
+        QCOMPARE(list->count(), 17);
+        QCOMPARE(list->item(16)->data(workspace::Id).toString(), earlier.id);
         QCOMPARE(list->indexAt(QPoint(4, 0)).data(workspace::Id).toString(), top);
+        emit backend->notificationHistoryPageStateChanged(true, false);
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->olderNoticeRequests, 1);
+        filter->setChecked(true);
+        sort->setCurrentIndex(1);
         QVERIFY(filter->isChecked());
         QCOMPARE(sort->currentIndex(), 1);
-        emit backend->notificationHistoryPageStateChanged(false, false);
-        QVERIFY(!older->isVisible());
+        QTRY_COMPARE(backend->olderNoticeRequests, 2);
         emit backend->notificationHistoryPageStateChanged(true, false);
-        QVERIFY(older->isVisible());
+        emit backend->failed(QStringLiteral("notifications-older"), QStringLiteral("Нет ответа"));
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->olderNoticeRequests, 2);
+        QApplication::setActiveWindow(&window);
+        QTest::keyClick(&window, Qt::Key_F5);
+        QTRY_COMPARE(backend->olderNoticeRequests, 3);
         backend->notifications.clear();
         backend->accountScope = QStringLiteral("fixture/second-account");
         emit backend->accountScopeChanged();
-        QVERIFY(!older->isVisible());
-        QCOMPARE(backend->olderNoticeRequests, 1);
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->olderNoticeRequests, 3);
+        emit backend->notificationsLoaded({earlier});
+        emit backend->notificationHistoryPageStateChanged(true, false);
+        QTRY_COMPARE(backend->olderNoticeRequests, 4);
         QVERIFY(backend->noticeReadBatches.isEmpty());
     }
 

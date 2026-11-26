@@ -168,7 +168,7 @@ private:
     void setRailUnreadCount(int row, qint64 count);
     void setRailStatus(int row, const QString &detail);
     void requestNotificationHistory();
-    void updateNotificationPager();
+    void scheduleOlderNotifications();
     void requestRailWorkday();
     void updateRailWorkday();
     void showProjects();
@@ -446,13 +446,14 @@ private:
     QComboBox *m_noticeSort = nullptr;
     QAction *m_noticeRead = nullptr;
     QPushButton *m_noticeReadAll = nullptr;
-    QPushButton *m_noticeOlder = nullptr;
     QAction *m_noticeDelete = nullptr;
     enum class NoticeHistoryState { Ready, Loading, Failed };
     NoticeHistoryState m_noticeHistoryState = NoticeHistoryState::Ready;
     bool m_noticeHistoryRequested = false;
     bool m_noticeHasOlder = false;
     bool m_noticeOlderLoading = false;
+    bool m_noticeOlderFailed = false;
+    bool m_noticePageCheckQueued = false;
     bool m_noticeSearchPending = false;
     QString m_noticeProjectId;
     QPointer<QDialog> m_personDialog;
