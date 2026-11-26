@@ -63,7 +63,24 @@ add_library(bxwidgets STATIC
     src/ui/main_window.cpp
     src/ui/task_dialogs.cpp
     src/ui/chat_widgets.cpp
-    src/ui/workspace_style.cpp
+    src/ui/avatar_painter.cpp
+    src/ui/card_row_painter.cpp
+    src/ui/directory_row_painter.cpp
+    src/ui/file_preview_painter.cpp
+    src/ui/file_row_layout.cpp
+    src/ui/link_preview_painter.cpp
+    src/ui/message_row_layout.cpp
+    src/ui/message_row_painter.cpp
+    src/ui/notice_row_painter.cpp
+    src/ui/preview_animation.cpp
+    src/ui/row_interaction.cpp
+    src/ui/row_paint_primitives.cpp
+    src/ui/row_painter.cpp
+    src/ui/row_text_selection.cpp
+    src/ui/workspace_directory.cpp
+    src/ui/workspace_row_style.cpp
+    src/ui/workspace_rows.cpp
+    src/ui/workspace_theme.cpp
     src/ui/composer_send_controller.cpp
     src/ui/chat_panel.h
     src/ui/chat_panel.cpp
@@ -77,6 +94,12 @@ add_library(bxwidgets STATIC
     src/ui/public_link_preview.cpp
     src/ui/board_widget.h
     src/ui/board_widget.cpp
+    src/ui/board_card_painter.cpp
+    src/ui/board_column.cpp
+    src/ui/board_column_grip.cpp
+    src/ui/board_columns.cpp
+    src/ui/board_drag_list.cpp
+    src/ui/board_paging.cpp
     src/ui/connection_dialog.h
     src/ui/connection_dialog.cpp
     src/ui/dialog_chrome.cpp
@@ -120,6 +143,10 @@ endforeach()
 if(Qt6Test_FOUND)
     enable_testing()
     add_subdirectory(tests)
+    add_executable(tst_ui_workspace_presentation tests/tst_ui_workspace_presentation.cpp)
+    target_link_libraries(tst_ui_workspace_presentation PRIVATE bxwidgets Qt6::Test)
+    add_test(NAME tst_ui_workspace_presentation COMMAND tst_ui_workspace_presentation)
+    set_tests_properties(tst_ui_workspace_presentation PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
     target_link_libraries(tst_message_markup PRIVATE bxwidgets)
     add_executable(tst_signin_session src/signin/session_capture_test.cpp)
     target_link_libraries(tst_signin_session PRIVATE bxchromesignin Qt6::Test)

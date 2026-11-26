@@ -11,13 +11,14 @@
 
 class QLabel;
 class QListWidget;
+class QListWidgetItem;
 class QPixmap;
 class QScrollArea;
 class QVBoxLayout;
 
 namespace bx {
 
-class KanbanTaskList;
+class BoardDragList;
 
 // Kanban board of one project: one column per stage, tasks listed inside.
 // The same model (QVector<Stage>) feeds both the kanban columns and the flat
@@ -60,8 +61,9 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
-    friend class KanbanTaskList;
+    friend class BoardDragList;
 
+    static QListWidgetItem *addListedTask(QListWidget *list, const Task &task, const Stage &stage);
     void clearColumns();
     bool matches(const Task &task) const;
     QString noMatchesText() const;
