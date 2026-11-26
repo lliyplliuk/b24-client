@@ -60,7 +60,13 @@ add_library(bxwidgets STATIC
     src/ui/chat_widgets.cpp
     src/ui/workspace_style.cpp
     src/ui/composer_send_controller.cpp
-    src/ui/chat_action_ui.cpp
+    src/ui/chat_panel.h
+    src/ui/chat_panel.cpp
+    src/ui/chat_panel_events.cpp
+    src/ui/chat_panel_actions.cpp
+    src/ui/message_files.cpp
+    src/ui/workspace_message_viewers.cpp
+    src/ui/workspace_message_previews.cpp
     src/ui/chat_video_previews.cpp
     src/ui/message_menu_window.cpp
     src/ui/public_link_preview.cpp

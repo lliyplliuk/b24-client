@@ -2630,6 +2630,33 @@ private slots:
         QCOMPARE(closed.first().first().toBool(), false);
     }
 
+    void closingTaskCardAndSwitchingChatsReportTheirOwnHistory()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        MainWindow window(backend.get());
+        window.show();
+        auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
+        auto *tabs = window.findChild<QTabBar *>(QStringLiteral("chatScopeTabs"));
+        QVERIFY(history && tabs);
+        QTRY_COMPARE(history->count(), 1);
+        const auto messageId = history->item(0)->data(workspace::ReceiptMessageId);
+
+        QSignalSpy closed(&window, &MainWindow::historyClosed);
+        window.openTaskCard(backend->stages.first().tasks.first().id);
+        auto *card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
+        QVERIFY(card && card->isVisible());
+        QVERIFY(closed.isEmpty());
+        QVERIFY(card->close());
+        QCOMPARE(closed.size(), 1);
+        QCOMPARE(closed.takeFirst().first().toBool(), true);
+        QCOMPARE(history->count(), 1);
+        QCOMPARE(history->item(0)->data(workspace::ReceiptMessageId), messageId);
+
+        tabs->setCurrentIndex(1);
+        QCOMPARE(closed.size(), 1);
+        QCOMPARE(closed.takeFirst().first().toBool(), false);
+    }
+
     void earlierHistoryKeepsViewportAndChatScope()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());

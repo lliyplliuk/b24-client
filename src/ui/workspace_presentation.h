@@ -19,6 +19,10 @@ class QMenu;
 
 namespace bx::ui {
 
+class ChatComposer;
+struct ChatDraft;
+void switchDraft(ChatComposer *composer, QHash<QString, ChatDraft> &drafts, const QString &from, const QString &to);
+
 QMenu *directoryPinMenu(QWidget *parent, bool pinned, std::function<bool()> canChange,
                         std::function<void()> togglePin);
 

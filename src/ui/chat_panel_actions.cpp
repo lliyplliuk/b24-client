@@ -1,4 +1,6 @@
-#include "ui/main_window.h"
+#include "ui/chat_panel.h"
+#include "ui/message_files.h"
+#include "ui/workspace_message_previews.h"
 #include "core/operations.h"
 #include "ui/task_dialogs.h"
 #include "ui/reaction_palette.h"
@@ -35,29 +37,31 @@ bool editableMessage(const QModelIndex &message)
 }
 } // namespace
 
-QWidget *MainWindow::messageActionOwner(const QAbstractItemModel *model, const QString &dialog)
+QWidget *ChatPanel::messageActionOwner(const QAbstractItemModel *model, const QString &dialog)
 {
+    auto *card = m_workspace.card();
     if (!model || dialog.isEmpty())
         return nullptr;
-    if (m_card && m_card->isVisible() && m_card->taskChatDialogId() == dialog && m_card->messageList()->model() == model)
-        return m_card;
-    if ((!m_card || !m_card->isVisible()) && m_lastSection == 0 && m_currentChatId == dialog
+    if (card && card->isVisible() && card->taskChatDialogId() == dialog && card->messageList()->model() == model)
+        return card;
+    if ((!card || !card->isVisible()) && m_active && m_currentChatId == dialog
         && m_chatMessages->isVisible() && m_chatMessages->model() == model)
-        return this;
+        return window();
     return nullptr;
 }
 
-bool MainWindow::beginMessageEdit(const QPersistentModelIndex &message, const QString &dialog)
+bool ChatPanel::beginMessageEdit(const QPersistentModelIndex &message, const QString &dialog)
 {
     if (!writable() || m_backend->isDemo() || m_backend->portalOrigin().host().isEmpty() || !editableMessage(message))
         return false;
     auto *owner = messageActionOwner(message.model(), dialog);
     if (!owner)
         return false;
-    const bool cardHistory = owner == m_card;
-    auto *composer = cardHistory ? m_card->composer() : m_chatComposer;
-    if (!composer || composer->input()->isReadOnly() || !m_pendingUpload.isEmpty()
-        || (cardHistory ? m_taskSendController.pending() : m_chatSendController.pending()))
+    auto *card = m_workspace.card();
+    const bool cardHistory = owner == card;
+    auto *composer = cardHistory ? card->composer() : m_chatComposer;
+    if (!composer || composer->input()->isReadOnly() || m_workspace.uploadPending()
+        || (cardHistory ? m_workspace.taskSendPending() : m_chatSendController.pending()))
         return false;
     const auto id = message.data(workspace::ReceiptMessageId).toString();
     const auto resolve = messageActionTarget(message, dialog);
@@ -69,7 +73,7 @@ bool MainWindow::beginMessageEdit(const QPersistentModelIndex &message, const QS
     return true;
 }
 
-bool MainWindow::editLatestMessage(const ui::HistoryList *history, const QString &dialog)
+bool ChatPanel::editLatestMessage(const ui::HistoryList *history, const QString &dialog)
 {
     if (!history->showingLiveHistory())
         return false;
@@ -81,7 +85,7 @@ bool MainWindow::editLatestMessage(const ui::HistoryList *history, const QString
     return false;
 }
 
-std::function<QPersistentModelIndex()> MainWindow::messageActionTarget(const QPersistentModelIndex &message,
+std::function<QPersistentModelIndex()> ChatPanel::messageActionTarget(const QPersistentModelIndex &message,
                                                                       const QString &dialog)
 {
     const QPointer<QAbstractItemModel> model(const_cast<QAbstractItemModel *>(message.model()));
@@ -94,14 +98,14 @@ std::function<QPersistentModelIndex()> MainWindow::messageActionTarget(const QPe
     };
 }
 
-void MainWindow::recordConfirmedReaction(const QString &dialog, const QString &id, const QString &code)
+void ChatPanel::recordConfirmedReaction(const QString &dialog, const QString &id, const QString &code)
 {
     if (m_reactionAccountScope == m_backend->settingsScope()
         && m_pendingReactionAdds.remove(Backend::reactionOperationKey(dialog, id, code)))
         incrementReactionFrequency(code);
 }
 
-void MainWindow::actOnMessageReaction(const QPersistentModelIndex &message, const QString &dialog, const QString &code,
+void ChatPanel::actOnMessageReaction(const QPersistentModelIndex &message, const QString &dialog, const QString &code,
                                       const QPoint &anchor, QWidget *parent)
 {
     const auto id = message.data(workspace::ReceiptMessageId).toString();
@@ -129,7 +133,8 @@ void MainWindow::actOnMessageReaction(const QPersistentModelIndex &message, cons
     auto *owner = messageActionOwner(message.model(), dialog);
     if (!owner || (parent && owner != parent))
         return;
-    auto *history = owner == m_card ? m_card->messageList() : m_chatMessages;
+    auto *card = m_workspace.card();
+    auto *history = owner == card ? card->messageList() : m_chatMessages;
     auto *palette = new ui::ReactionPalette(own, ui::rankedReactionChoices(reactionFrequency()), history);
     connect(palette, &QMenu::aboutToHide, palette, &QObject::deleteLater);
     connect(m_backend, &Backend::accountScopeChanged, palette, &QMenu::close);
@@ -143,7 +148,7 @@ void MainWindow::actOnMessageReaction(const QPersistentModelIndex &message, cons
     ui::showMessageMenuWindow(*palette, QRect(anchor, QSize(1, 1)));
 }
 
-void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &message,
+void ChatPanel::addMessageActions(QMenu &menu, const QPersistentModelIndex &message,
                                    const QString &dialog, bool taskChat, const QString &href)
 {
     const auto resolve = messageActionTarget(message, dialog);
@@ -151,7 +156,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
     QVector<QUrl> links;
     const auto candidates = href.isEmpty() ? message.data(workspace::MessageLinks).toStringList() : QStringList{href};
     for (const auto &candidate : candidates) {
-        const auto url = messageLinkDestination(candidate);
+        const auto url = m_workspace.messageLinkDestination(candidate);
         if (!url.isEmpty() && !links.contains(url))
             links.append(url);
     }
@@ -160,7 +165,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
                 [this, resolve, url] {
             const auto links = resolve().data(workspace::MessageLinks).toStringList();
             if (std::any_of(links.cbegin(), links.cend(), [this, &url](const QString &href) {
-                return messageLinkDestination(href) == url;
+                return m_workspace.messageLinkDestination(href) == url;
             }))
                 QGuiApplication::clipboard()->setText(url.toString(QUrl::FullyEncoded));
         });
@@ -176,7 +181,8 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
     }
     const auto id = message.data(workspace::ReceiptMessageId).toString();
     if (auto *owner = messageActionOwner(message.model(), dialog)) {
-        auto *list = owner == m_card ? m_card->messageList() : m_chatMessages;
+        auto *card = m_workspace.card();
+        auto *list = owner == card ? card->messageList() : m_chatMessages;
         const auto *painter = static_cast<const workspace::RowPainter *>(list->itemDelegate());
         const auto photos = painter->photoOriginals(message);
         if (!photos.isEmpty()) {
@@ -189,7 +195,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
                     const auto current = resolve();
                     if (auto *parent = messageActionOwner(current.model(), dialog);
                         parent && workspace::RowPainter::hasOriginal(current, file))
-                        saveMessageFile(file, parent);
+                        m_workspace.files->saveMessageFile(file, parent);
                 });
             }
         }
@@ -217,7 +223,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
                 showChatAssets(dialog, parent);
         });
     }
-    addPublicLinkPreviewActions(menu, message, resolve);
+    m_workspace.previews->addPublicLinkPreviewActions(menu, message, resolve);
     if (!writable() || m_backend->isDemo())
         return;
 
@@ -276,7 +282,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
             }
         }
         bool accepted = false;
-        const auto choice = QInputDialog::getItem(this, QStringLiteral("Переслать сообщение"),
+        const auto choice = QInputDialog::getItem(window(), QStringLiteral("Переслать сообщение"),
             QStringLiteral("Получатель или ID диалога"), recipients, 0, true, &accepted).trimmed();
         if (accepted && !choice.isEmpty() && writable() && resolve().isValid())
             m_backend->forwardMessage(dialog, id, recipientIds.value(choice, choice));
@@ -286,7 +292,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
         connect(menu.addAction(QStringLiteral("Создать задачу из сообщения…")), &QAction::triggered, this,
                 [this, resolve, dialog, id] {
             const auto message = resolve();
-            if (!writable() || !m_sessionRecovery->isHidden() || !message.isValid())
+            if (!writable() || !m_workspace.sessionReady() || !message.isValid())
                 return;
             auto *parent = messageActionOwner(message.model(), dialog);
             const auto name = QStringLiteral("createTaskFromMessageConfirm");
@@ -317,7 +323,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
             connect(create, &QPushButton::clicked, confirm,
                     [this, parent, resolve, dialog, id] {
                 const auto message = resolve();
-                if (writable() && m_sessionRecovery->isHidden() && messageActionOwner(message.model(), dialog) == parent &&
+                if (writable() && m_workspace.sessionReady() && messageActionOwner(message.model(), dialog) == parent &&
                     message.isValid() &&
                     message.data(workspace::ReceiptMessageId).toString() == id &&
                     !message.data(workspace::SystemMessage).toBool())
@@ -345,7 +351,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
     connect(menu.addAction(QStringLiteral("Удалить…")), &QAction::triggered, this, [this, resolve, dialog, id] {
         const auto currentOwner = [this, resolve, dialog, id]() -> QWidget * {
             const auto message = resolve();
-            if (!writable() || !m_sessionRecovery->isHidden()
+            if (!writable() || !m_workspace.sessionReady()
                 || !message.isValid() || message.data(workspace::ReceiptMessageId).toString() != id
                 || !message.data(workspace::Outgoing).toBool() || message.data(workspace::SystemMessage).toBool())
                 return nullptr;
@@ -374,7 +380,7 @@ void MainWindow::addMessageActions(QMenu &menu, const QPersistentModelIndex &mes
     });
 }
 
-void MainWindow::showChatAssets(const QString &scope, QWidget *parent)
+void ChatPanel::showChatAssets(const QString &scope, QWidget *parent)
 {
     if (scope.isEmpty() || m_backend->isDemo())
         return;
@@ -442,9 +448,9 @@ void MainWindow::showChatAssets(const QString &scope, QWidget *parent)
                 return;
             const auto &asset = page.rows.at(row);
             if (!asset.link.isEmpty())
-                openMessageLink(asset.link.toString(QUrl::FullyEncoded));
+                emit linkRequested(asset.link.toString(QUrl::FullyEncoded));
             else if (asset.file.isVideo && workspace::RowPainter::downloadable(asset.file)) {
-                playMessageVideo(asset.file, dialog, [owner = QPointer<QDialog>(dialog)] {
+                m_workspace.files->playMessageVideo(asset.file, dialog, [owner = QPointer<QDialog>(dialog)] {
                     return owner && owner->isVisible();
                 });
             } else if (asset.file.isImage && (!asset.file.previewUrl.isEmpty() || !asset.file.downloadUrl.isEmpty())) {
@@ -454,9 +460,9 @@ void MainWindow::showChatAssets(const QString &scope, QWidget *parent)
                         if (candidate.link.isEmpty())
                             loaded.append(candidate.file);
                 }
-                openMessagePhoto(asset.file, dialog, loaded);
+                m_workspace.files->openMessagePhoto(asset.file, dialog, loaded);
             } else
-                saveMessageFile(asset.file, dialog);
+                m_workspace.files->saveMessageFile(asset.file, dialog);
         });
         tabs->addTab(tab, labels[size_t(i)]);
     }
@@ -514,16 +520,16 @@ void MainWindow::showChatAssets(const QString &scope, QWidget *parent)
     fetch(0);
 }
 
-void MainWindow::promptGroupChat()
+void ChatPanel::promptGroupChat()
 {
     if (!writable())
         return;
     bool accepted = false;
-    const auto name = QInputDialog::getText(this, QStringLiteral("Новый групповой чат"),
+    const auto name = QInputDialog::getText(window(), QStringLiteral("Новый групповой чат"),
                                            QStringLiteral("Название"), QLineEdit::Normal, {}, &accepted).trimmed();
     if (!accepted || name.isEmpty())
         return;
-    const auto members = QInputDialog::getText(this, QStringLiteral("Участники нового чата"),
+    const auto members = QInputDialog::getText(window(), QStringLiteral("Участники нового чата"),
         QStringLiteral("ID сотрудников через запятую"), QLineEdit::Normal, {}, &accepted);
     if (accepted && writable()) {
         static const QRegularExpression separators(QStringLiteral("[,\\s]+"));
@@ -531,13 +537,13 @@ void MainWindow::promptGroupChat()
     }
 }
 
-void MainWindow::promptChatMember(const QString &dialog, bool add)
+void ChatPanel::promptChatMember(const QString &dialog, bool add)
 {
     if (!writable())
         return;
     bool accepted = false;
     const auto title = add ? QStringLiteral("Добавить участника") : QStringLiteral("Удалить участника");
-    const auto id = QInputDialog::getText(this, title, QStringLiteral("ID сотрудника"),
+    const auto id = QInputDialog::getText(window(), title, QStringLiteral("ID сотрудника"),
                                         QLineEdit::Normal, {}, &accepted).trimmed();
     if (accepted && !id.isEmpty() && writable())
         m_backend->changeChatMember(dialog, id, add);

@@ -1,9 +1,28 @@
 #include "ui/workspace_presentation.h"
+#include "ui/chat_widgets.h"
 
 #include <QMenu>
 #include <utility>
 
 namespace bx::ui {
+
+void switchDraft(ChatComposer *composer, QHash<QString, ChatDraft> &drafts,
+                 const QString &from, const QString &to)
+{
+    composer->finishMessageEdit();
+    if (!from.isEmpty()) {
+        const auto draft = composer->draft();
+        if (draft.isEmpty()) {
+            drafts.remove(from);
+        } else {
+            constexpr int limit = 30;
+            if (drafts.size() >= limit && !drafts.contains(from))
+                drafts.erase(drafts.begin());
+            drafts.insert(from, draft);
+        }
+    }
+    composer->setDraft(drafts.take(to));
+}
 
 QMenu *directoryPinMenu(QWidget *parent, bool pinned, std::function<bool()> canChange,
                         std::function<void()> togglePin)

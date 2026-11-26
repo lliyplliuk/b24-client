@@ -9,6 +9,12 @@
 
 namespace bx {
 
+inline QSettings chatPreferences()
+{
+    return QSettings(QSettings::defaultFormat(), QSettings::UserScope, QStringLiteral("bitrix24-client"),
+                     QStringLiteral("bitrix24-client"));
+}
+
 class DirectorySplitter final : public QSplitter {
 public:
     DirectorySplitter(const QString &key, int regularWidth, int compactWidth, QWidget *parent)
