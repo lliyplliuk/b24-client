@@ -231,6 +231,8 @@ QString actionLabel(const NotificationTarget &target, bool preferTargetLabel = t
     }
     switch (target.kind) {
     case NotificationTargetKind::Chat:
+        if (target.taskChat && !target.messageId.isEmpty())
+            return QStringLiteral("Открыть в чате задачи");
         return target.messageId.isEmpty() ? QStringLiteral("Открыть чат") : QStringLiteral("Открыть сообщение");
     case NotificationTargetKind::Task:
         return QStringLiteral("Открыть задачу");
@@ -5212,12 +5214,16 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
         const auto quote = quotedReply.match(row.excerpt);
         if (quote.hasMatch())
             row.excerpt.remove(quote.capturedStart(), quote.capturedLength());
-        if (!title.isEmpty() && title != QStringLiteral("Новое сообщение"))
-            row.excerpt.remove(taskPrefix);
-        row.excerpt = row.excerpt.simplified().left(512);
         const auto message = std::find_if(notice.targets.cbegin(), notice.targets.cend(), [](const auto &target) {
             return target.kind == NotificationTargetKind::Chat && !target.messageId.isEmpty();
         });
+        const bool taskChatMessage = message != notice.targets.cend() && message->taskChat;
+        if (taskChatMessage || (!title.isEmpty() && title != QStringLiteral("Новое сообщение")))
+            row.excerpt.remove(taskPrefix);
+        row.excerpt = row.excerpt.simplified();
+        if (taskChatMessage)
+            row.excerpt.prepend(QStringLiteral("Сообщение в чате задачи: "));
+        row.excerpt.truncate(512);
         const auto task = std::find_if(notice.targets.cbegin(), notice.targets.cend(), [](const auto &target) {
             return target.kind == NotificationTargetKind::Task;
         });

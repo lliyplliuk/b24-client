@@ -5809,6 +5809,41 @@ private slots:
         QVERIFY(indicator->isHidden());
     }
 
+    void labelsTaskChatMessageNotice()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        Notification taskNotice;
+        taskNotice.id = QStringLiteral("801");
+        taskNotice.title = QStringLiteral("Ошибка маршрутизации");
+        taskNotice.text = QStringLiteral("Задача #123727 Не открывается ни один маршрут");
+        taskNotice.createdAt = QDateTime::currentDateTime();
+        taskNotice.targets = {{NotificationTargetKind::Task, QStringLiteral("123727")},
+                              {NotificationTargetKind::Chat, QStringLiteral("chat42"), QStringLiteral("502")}};
+        taskNotice.targets.last().taskChat = true;
+        auto chatNotice = taskNotice;
+        chatNotice.id = QStringLiteral("800");
+        chatNotice.createdAt = taskNotice.createdAt.addSecs(-1);
+        chatNotice.targets.removeFirst();
+        chatNotice.targets.first().taskChat = false;
+        backend->notifications = {taskNotice, chatNotice};
+
+        MainWindow window(backend.get(), true);
+        window.show();
+        auto *sections = window.findChild<QListWidget *>(QStringLiteral("sections"));
+        QVERIFY(sections);
+        sections->setCurrentRow(2);
+        auto *list = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
+        QVERIFY(list);
+        QTRY_COMPARE(list->count(), 2);
+        const auto chat = list->item(1)->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
+        QCOMPARE(chat.excerpt, QStringLiteral("Не открывается ни один маршрут"));
+        QCOMPARE(chat.primaryLabel, QStringLiteral("Открыть сообщение"));
+        const auto task = list->item(0)->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
+        QCOMPARE(task.primaryTarget, 1);
+        QCOMPARE(task.excerpt, QStringLiteral("Сообщение в чате задачи: Не открывается ни один маршрут"));
+        QCOMPARE(task.primaryLabel, QStringLiteral("Открыть в чате задачи"));
+    }
+
     void rendersNoticeBodyLinksAndKeepsDistinctTitle()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());
