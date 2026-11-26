@@ -687,11 +687,7 @@ public:
         }
         if (m_messageActions)
             return;
-        m_messageActions = new GlyphButton(Glyph::More, QStringLiteral("Действия сообщения"), viewport());
-        m_messageActions->setFixedSize(workspace::RowPainter::messageActionSize, workspace::RowPainter::messageActionSize);
-        m_messageActions->setFocusPolicy(Qt::NoFocus);
-        m_messageActions->setCursor(Qt::PointingHandCursor);
-        m_messageActions->hide();
+        m_messageActions = createMessageHoverButton(Glyph::More, QStringLiteral("Действия сообщения"));
         viewport()->setMouseTracking(true);
         connect(m_messageActions, &QPushButton::clicked, this, [this] {
             const auto message = m_hoverMessage;
@@ -704,7 +700,17 @@ public:
     void setReactionActions(std::function<void(const QModelIndex &, const QString &, const QPoint &)> action,
                             std::function<bool()> allowed)
     {
-        static_cast<workspace::RowPainter *>(itemDelegate())->setReactionActions(std::move(action), std::move(allowed));
+        auto *delegate = static_cast<workspace::RowPainter *>(itemDelegate());
+        delegate->setReactionActions(std::move(action), std::move(allowed));
+        if (m_messageReaction)
+            return;
+        m_messageReaction = createMessageHoverButton(Glyph::Emoji, QStringLiteral("Добавить реакцию"));
+        connect(m_messageReaction, &QPushButton::clicked, this, [this, delegate] {
+            const auto message = m_hoverMessage;
+            const auto anchor = m_messageReaction->mapToGlobal(m_messageReaction->rect().bottomLeft());
+            clearMessageHover();
+            delegate->openReactionPalette(message, anchor);
+        });
     }
 
     bool focusOnMessage(const QString &id)
@@ -844,7 +850,7 @@ protected:
     bool viewportEvent(QEvent *event) override
     {
         if (event->type() == QEvent::Leave && m_messageActions && m_messageActions->isVisible() &&
-            !m_messageActions->geometry().contains(viewport()->mapFromGlobal(QCursor::pos())))
+            !m_hoverActionsBounds.contains(viewport()->mapFromGlobal(QCursor::pos())))
             clearMessageHover();
         return QListWidget::viewportEvent(event);
     }
@@ -1221,12 +1227,25 @@ private:
             m_onBrowsingOlder(active);
     }
 
+    GlyphButton *createMessageHoverButton(Glyph glyph, const QString &name)
+    {
+        auto *button = new GlyphButton(glyph, name, viewport());
+        constexpr int size = workspace::RowPainter::messageActionSize;
+        button->setFixedSize(size, size);
+        button->setFocusPolicy(Qt::NoFocus);
+        button->setCursor(Qt::PointingHandCursor);
+        button->hide();
+        return button;
+    }
+
     void hoverMessage(const QPoint &point)
     {
         if (!m_messageActions || !m_messageMenu)
             return;
+        const auto *delegate = static_cast<const workspace::RowPainter *>(itemDelegate());
         if (m_hoverMessage.isValid() && m_messageActions->isVisible()
-            && (m_hoverBounds.contains(point) || m_messageActions->geometry().contains(point)))
+            && (m_hoverBounds.contains(point) || m_hoverActionsBounds.contains(point))
+            && (!m_messageReaction || m_messageReaction->isVisible() == delegate->canReact(m_hoverMessage)))
             return;
         auto index = indexAt(point);
         if (!index.isValid() && m_hoverMessage.isValid())
@@ -1236,20 +1255,21 @@ private:
             clearMessageHover();
             return;
         }
-        const auto *delegate = static_cast<const workspace::RowPainter *>(itemDelegate());
         const auto bubble = delegate->receiptArea(index, visualRect(index));
         const auto size = m_messageActions->size();
+        const bool showReaction = m_messageReaction && delegate->canReact(index);
+        const int width = showReaction ? workspace::RowPainter::messageActionGroupWidth : size.width();
         const auto height = viewport()->height() - size.height();
         if (bubble.isEmpty() || height < 0) {
             clearMessageHover();
             return;
         }
         constexpr int gap = workspace::RowPainter::messageActionGap;
-        const int left = bubble.left() - gap - size.width();
+        const int left = bubble.left() - gap - width;
         const int right = bubble.right() + 1 + gap;
-        const bool rightFits = right + size.width() <= viewport()->width();
+        const bool rightFits = right + width <= viewport()->width();
         const bool useLeft = left >= 0 && (point.x() < bubble.left() || !rightFits);
-        const QRect bounds(QPoint(useLeft ? left : right, qBound(0, bubble.top() + 1, height)), size);
+        const QPoint position(useLeft ? left : right, qBound(0, bubble.top() + 1, height));
         constexpr int leftTolerance = 50;
         const auto reachable = bubble.adjusted(-leftTolerance, 0, viewport()->rect().right() - bubble.right(), 0);
         if ((!useLeft && !rightFits) || !reachable.contains(point)) {
@@ -1258,9 +1278,16 @@ private:
         }
         m_hoverMessage = index;
         m_hoverBounds = reachable;
-        m_messageActions->setGeometry(bounds);
+        m_hoverActionsBounds = QRect(position, QSize(width, size.height()));
+        m_messageActions->setGeometry(QRect(position + QPoint(width - size.width(), 0), size));
         m_messageActions->show();
         m_messageActions->raise();
+        if (m_messageReaction) {
+            m_messageReaction->move(position);
+            m_messageReaction->setVisible(showReaction);
+            if (showReaction)
+                m_messageReaction->raise();
+        }
     }
 
     void clearMessageHover()
@@ -1268,6 +1295,8 @@ private:
         m_hoverMessage = QPersistentModelIndex();
         if (m_messageActions)
             m_messageActions->hide();
+        if (m_messageReaction)
+            m_messageReaction->hide();
     }
 
     bool historyRemoved(qint64 id) const
@@ -1425,6 +1454,8 @@ private:
     QPersistentModelIndex m_hoverMessage;
     QRect m_hoverBounds;
     GlyphButton *m_messageActions = nullptr;
+    GlyphButton *m_messageReaction = nullptr;
+    QRect m_hoverActionsBounds;
 };
 
 class EmojiTile final : public QPushButton {

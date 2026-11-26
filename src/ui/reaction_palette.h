@@ -58,13 +58,17 @@ public:
         m_list->setFlow(QListView::LeftToRight);
         m_list->setWrapping(true);
         m_list->setSelectionMode(QAbstractItemView::SingleSelection);
-        m_list->setGridSize(QSize(40, 40));
+        constexpr int cell = 40;
+        constexpr int columns = 10;
+        constexpr int layoutMargin = 4;
+        m_list->setGridSize(QSize(cell, cell));
         m_list->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
         m_list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        m_list->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+        m_list->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         m_list->setUniformItemSizes(true);
         m_list->setMouseTracking(true);
-        m_list->setFixedSize(290, 200);
+        const int rows = (int(choices.size()) + columns - 1) / columns;
+        m_list->setFixedSize(columns * cell + layoutMargin, rows * cell + layoutMargin);
         m_list->setFont(workspace::reactionFont(24));
         for (const auto *reaction : choices) {
             const auto code = QString::fromLatin1(reaction->code);

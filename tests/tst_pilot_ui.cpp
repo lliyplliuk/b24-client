@@ -8282,6 +8282,7 @@ private slots:
     {
         QFETCH(bool, task);
         std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->demoMode = false;
         Message message{QStringLiteral("701"), QStringLiteral("Анна"), QStringLiteral("Короткое сообщение"),
                         QDateTime::currentDateTime()};
         backend->messages = backend->taskMessages = {message};
@@ -8289,6 +8290,14 @@ private slots:
         MainWindow window(backend.get());
         window.resize(810, 620);
         window.show();
+        emit backend->connectionChanged(true);
+        const auto dialog = backend->chats.first().id;
+        const auto feedback = QStringLiteral("Сообщение переслано");
+        emit backend->chatActionSucceeded(dialog, feedback);
+        emit backend->chatActionSucceeded(dialog, {});
+        const auto *status = findAccessible<QLabel>(&window, QStringLiteral("Состояние"));
+        QVERIFY(status && status->isVisible());
+        QCOMPARE(status->text(), feedback);
         QWidget *owner = &window;
         if (task) {
             window.openTaskCard(QStringLiteral("501"));
@@ -8300,7 +8309,8 @@ private slots:
                                                                : QStringLiteral("Сообщения чата"));
         QVERIFY(history);
         auto *more = findAccessible<QPushButton>(history, QStringLiteral("Действия сообщения"));
-        QVERIFY(more);
+        auto *react = findAccessible<QPushButton>(history, QStringLiteral("Добавить реакцию"));
+        QVERIFY(more && react);
         QTRY_COMPARE(history->count(), 1);
         QCoreApplication::processEvents();
         const auto index = history->model()->index(0, 0);
@@ -8318,8 +8328,34 @@ private slots:
         QTRY_VERIFY(more->isVisible());
         QVERIFY(history->viewport()->rect().contains(more->geometry()));
         QVERIFY(!bubble.intersects(more->geometry()));
+        QVERIFY(react->isVisible());
+        QVERIFY(history->viewport()->rect().contains(react->geometry()));
+        QVERIFY(!bubble.intersects(react->geometry()) && !more->geometry().intersects(react->geometry()));
+#ifdef Q_OS_LINUX
+        const auto offscreen = QGuiApplication::platformName() == QStringLiteral("offscreen");
+#else
+        constexpr bool offscreen = false;
+#endif
+        if (!offscreen)
+            QTest::mouseMove(react, react->rect().center());
+        QTest::mouseClick(react, Qt::LeftButton);
+        auto *palette = history->findChild<QMenu *>(QStringLiteral("reactionPalette"));
+        QTRY_VERIFY(palette && palette->isVisible());
+        auto *choices = findAccessible<QListWidget>(palette, QStringLiteral("Выберите реакцию"));
+        QVERIFY(choices);
+        QCOMPARE(choices->count(), 58);
+        QTRY_COMPARE(choices->verticalScrollBar()->maximum(), 0);
+        QVERIFY(choices->viewport()->rect().contains(choices->visualItemRect(choices->item(57))));
+        choices->setCurrentRow(0);
+        const auto code = choices->currentItem()->data(Qt::UserRole).toString();
+        QTest::keyClick(choices, Qt::Key_Return);
+        QCOMPARE(backend->messageActionId, message.id);
+        QCOMPARE(backend->messageActionDialog, task ? QStringLiteral("chat73") : backend->chats.first().id);
+        QCOMPARE(backend->messageActionValue, code);
+        QCOMPARE(backend->messageAction, MessageAction::React);
         move(QPoint(gutter.x(), bubble.top() - 1));
         QVERIFY(more->isHidden());
+        QVERIFY(react->isHidden());
     }
 
     void messageMenuKeepsTheTargetThroughRefresh()

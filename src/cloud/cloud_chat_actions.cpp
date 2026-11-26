@@ -104,7 +104,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
         const bool pins = action == MessageAction::Pin || action == MessageAction::Unpin;
         if (action != MessageAction::Favorite && action != MessageAction::Unfavorite)
             refreshChangedChat(scope, pins);
-        QString feedback = QStringLiteral("Портал подтвердил действие");
+        QString feedback;
         if (action == MessageAction::Favorite)
             feedback = QStringLiteral("Добавлено в избранное");
         else if (action == MessageAction::Unfavorite)

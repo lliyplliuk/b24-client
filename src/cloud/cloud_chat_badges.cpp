@@ -870,6 +870,7 @@ void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &inc
                 live.chatId = chatId;
                 live.counterRevision = ++m_chatBadgeRevision;
                 live.counter = counter;
+                live.confirmedCounterCursor = qMax(live.confirmedCounterCursor, positiveId(result.value(QStringLiteral("lastId"))));
                 publishUnreadChatCount();
                 republishChatBadges(chatId);
             }

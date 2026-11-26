@@ -1835,7 +1835,8 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
     ajax(QStringLiteral("im.v2.Recent.load"),
          {{QStringLiteral("filter[recentSection]"), task ? QStringLiteral("tasksTask") : QStringLiteral("default")},
           {QStringLiteral("limit"), QString::number(tunables::kPageSizeChats)}},
-         operation, [this, task, badgesOnly, operation, scope = m_accountScopeRevision](QJsonValue data) {
+         operation, [this, task, badgesOnly, operation, scope = m_accountScopeRevision,
+                     counterRevision = m_chatBadgeRevision](QJsonValue data) {
         if (scope != m_accountScopeRevision)
             return;
         const auto rows = list(data, {"recentItems", "items", "recent"});
@@ -1845,6 +1846,7 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
         const auto root = data.toObject();
         const auto userId = numericId(field(root, {"userId", "currentUserId"}));
         rememberCurrentUser(userId);
+        const auto currentUser = numericId(m_userId).toLongLong();
         QHash<qint64, QJsonObject> messages, latestMessagesByChat;
         QHash<QString, QJsonObject> users, chatById, chatByDialog, counters;
         for (const auto value : root.value(QStringLiteral("messages")).toArray()) {
@@ -1905,8 +1907,6 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
                 dialogId = chatDialog(recentChatId);
             if (dialogId.isEmpty())
                 continue;
-            if (!metadata.isEmpty() || !recentChatId.isEmpty())
-                rememberDialog(dialogId, {{QStringLiteral("chat"), metadata}, {QStringLiteral("chatId"), recentChatId}});
             auto user = users.value(dialogId);
             if (user.isEmpty())
                 user = object.value(QStringLiteral("user")).toObject();
@@ -1950,19 +1950,37 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
             const auto previewDate = date(preview.value(QStringLiteral("date")));
             chat.updated = (useChatMessage && previewDate.isValid()) || updated.isUndefined()
                 ? previewDate : date(updated);
-            const auto readId = numericId(field(metadata, {"lastId"})).toLongLong();
+            bool hasReadId = false;
+            const auto readId = field(metadata, {"lastId"}).toLongLong(&hasReadId);
             auto &live = recentOverlay(dialogId);
+            const auto state = m_dialogMessageStates.constFind(dialogId);
+            const auto unreadId = numericId(field(metadata, {"unreadId"})).toLongLong();
+            const bool alreadyRead = chat.unread == 1 && unreadId > 0 && state != m_dialogMessageStates.cend()
+                && (unreadId <= state->confirmedReadThrough || state->exactlyRead.contains(unreadId));
+            const bool olderCursor = hasReadId && readId >= 0 && readId < live.confirmedCounterCursor;
+            // A newer own preview alone does not supersede a confirmed read.
+            const bool staleOwnCounter = live.counter && (alreadyRead || olderCursor) && currentUser > 0
+                && expectedChatId > 0 && explicitMessageChatId(preview) == expectedChatId
+                && explicitMessageAuthorId(preview) == currentUser;
+            const bool counterCurrent = m_chatCounterSnapshotRevision <= counterRevision
+                && live.counterRevision <= counterRevision && !staleOwnCounter;
+            if (!metadata.isEmpty() || !recentChatId.isEmpty())
+                rememberDialog(dialogId, {{QStringLiteral("chat"), metadata}, {QStringLiteral("chatId"), recentChatId}},
+                               counterCurrent);
             auto &rejectedPreviewChatId = chat.taskChat ? live.rejectedTaskPreviewChatId : live.rejectedRecentPreviewChatId;
             rejectedPreviewChatId = foreignPreview && preview.isEmpty() ? expectedChatId : 0;
             const auto lastRead = m_dialogMessageStates.value(dialogId).lastReadId;
             if (messageId > live.messageId && messageId > lastRead) {
                 live.messageId = messageId;
-                live.incomingId = 0;
-                if (!m_haveCounterSnapshot)
-                    live.counter.reset();
+                // A newer preview can arrive in a response carrying an older unread count.
+                if (counterCurrent) {
+                    live.incomingId = 0;
+                    if (!m_haveCounterSnapshot)
+                        live.counter.reset();
+                }
                 live.preview = {};
             }
-            if (!m_haveCounterSnapshot && live.incomingId > 0 && messageId >= live.messageId
+            if (counterCurrent && !m_haveCounterSnapshot && live.incomingId > 0 && messageId >= live.messageId
                 && readId >= live.incomingId && readId >= lastRead
                 && (hasCounterSnapshot || unreadCount(oneOf(object, {"counter", "unreadCount"})))) {
                 live.counter = chat.unread;

@@ -3025,6 +3025,8 @@ void MainWindow::connectWorkspaceActions()
     });
     connect(m_backend, &Backend::chatTypingChanged, this, &MainWindow::handleChatTyping);
     connect(m_backend, &Backend::chatActionSucceeded, this, [this](const QString &dialog, const QString &message) {
+        if (message.isEmpty())
+            return;
         if (m_card && m_card->taskChatDialogId() == dialog)
             m_card->setStatus(message);
         setStatus(message);

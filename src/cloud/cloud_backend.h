@@ -492,6 +492,7 @@ private:
         qint64 messageId = 0;
         qint64 incomingId = 0;
         qint64 eventTime = 0;
+        qint64 confirmedCounterCursor = 0;
         quint64 counterRevision = 0;
         std::optional<int> counter;
         std::optional<bool> markedUnread;

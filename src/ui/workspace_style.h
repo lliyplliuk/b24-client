@@ -352,6 +352,8 @@ class RowPainter final : public QStyledItemDelegate {
 public:
     static constexpr int messageActionSize = 26;
     static constexpr int messageActionGap = 5;
+    static constexpr int messageActionSpacing = 4;
+    static constexpr int messageActionGroupWidth = messageActionSize * 2 + messageActionSpacing;
     RowPainter(QListWidget *view, Row style) : QStyledItemDelegate(view), m_view(view), m_style(style)
     {
         if (m_style == Row::Message || m_style == Row::TaskContent || m_style == Row::Notice) {
@@ -585,6 +587,14 @@ public:
     {
         m_reaction = std::move(action);
         m_reactionAllowed = std::move(allowed);
+    }
+
+    bool canReact(const QModelIndex &index) const { return reactionRow(index) && m_reactionAllowed && m_reactionAllowed(); }
+
+    void openReactionPalette(const QModelIndex &index, const QPoint &anchor) const
+    {
+        if (canReact(index))
+            m_reaction(index, {}, anchor);
     }
 
     enum class TextPick { Position, Extend, Word };
@@ -922,7 +932,8 @@ private:
         if (m_style == Row::TaskContent)
             return qMax(1, outerWidth - 8);
         const int contentWidth = outerWidth - messageAvatarSpace(outerWidth);
-        const int available = qMin(messageWidth(contentWidth), qMax(1, contentWidth - messageActionSize - messageActionGap - 6));
+        const int actionWidth = m_reaction ? messageActionGroupWidth : messageActionSize;
+        const int available = qMin(messageWidth(contentWidth), qMax(1, contentWidth - actionWidth - messageActionGap - 6));
         const QFontMetrics measure(rowFont(ui::secondaryTextPixels, true));
         int headingWidth = measure.horizontalAdvance(index.data(Title).toString());
         for (const auto role : {ForwardByline, ReplyByline}) {
@@ -990,8 +1001,6 @@ private:
         return m_style == Row::Message && m_reaction && index.isValid()
             && !index.data(SystemMessage).toBool() && !index.data(ReceiptMessageId).toString().isEmpty();
     }
-
-    bool canReact(const QModelIndex &index) const { return reactionRow(index) && m_reactionAllowed && m_reactionAllowed(); }
 
     static QString deliveryText(const QModelIndex &index)
     {

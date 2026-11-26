@@ -1208,6 +1208,8 @@ private slots:
     void guardsRecentPreviewMessageScope();
     void loadsAndClearsPersonalAnchorsIndependentlyOfUnreadCounts();
     void marksOnlyTheVisibleDialogAfterConfirmedRead();
+    void delayedRecentReplyDoesNotUndoConfirmedReadAfterSending_data();
+    void delayedRecentReplyDoesNotUndoConfirmedReadAfterSending();
     void acknowledgesVisibleReactionAnchorsWithoutLosingNewPush();
     void exactReadLeavesOlderUnseenMessageEligible();
     void readsExplicitTaskUnreadBeforeNewerSystemCursor();
@@ -1683,6 +1685,89 @@ void TestCloudBackend::marksOnlyTheVisibleDialogAfterConfirmedRead()
     QCOMPARE(readAfterScroll.field(QStringLiteral("ids[0]")), olderOffscreen);
     QCOMPARE(readAfterScroll.field(QStringLiteral("ids[1]")), previousOffscreen);
     QTRY_COMPARE(row().unread, 0);
+}
+
+void TestCloudBackend::delayedRecentReplyDoesNotUndoConfirmedReadAfterSending_data()
+{
+    QTest::addColumn<bool>("requestBeforeRead");
+    QTest::addColumn<bool>("readResultHasCursor");
+    QTest::newRow("in-flight-recent") << true << false;
+    QTest::newRow("stale-cursor-after-read") << false << true;
+    QTest::newRow("stale-unread-id-after-read") << false << false;
+}
+
+void TestCloudBackend::delayedRecentReplyDoesNotUndoConfirmedReadAfterSending()
+{
+    QFETCH(bool, requestBeforeRead);
+    QFETCH(bool, readResultHasCursor);
+    CloudFixture fixture;
+    fixture.chatBadgesFixture = true;
+    fixture.holdNextOnlineResponse = true;
+    fixture.approveVisibleRead = true;
+    fixture.visibleReadResult = readResultHasCursor
+        ? R"({"chatId":91,"counter":0,"lastId":800,"viewedMessages":[800]})"
+        : R"({"chatId":91,"counter":0,"viewedMessages":[800]})";
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,
+        "recentItems":[{"dialogId":"103","chatId":91,"messageId":800,"counter":1}],
+        "chats":[{"id":91,"dialogId":"103","type":"user","lastId":799}],
+        "messages":[{"id":800,"chatId":91,"authorId":103,"text":"Incoming"}]})";
+    fixture.chatResponseOverride = ajaxResult(R"({"chat":{"id":91,"dialogId":"103","lastId":799,"unreadId":800},
+        "messages":[{"id":800,"chatId":91,"authorId":103,"text":"Incoming","unread":true}]})");
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy recent(&backend, &Backend::recentChatsLoaded);
+    QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
+    QSignalSpy sent(&backend, &Backend::messageSent);
+    QSignalSpy confirmed(&backend, &Backend::chatReadConfirmed);
+    const auto row = [&recent] {
+        return recent.isEmpty() ? Chat{} : recent.last().first().value<QVector<Chat>>().value(0);
+    };
+    const auto dialog = QStringLiteral("103");
+    const auto recentRequest = QStringLiteral("im.v2.Recent.load");
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(row().unread, 1);
+    backend.requestChatMessages(dialog);
+    QTRY_VERIFY(!history.isEmpty());
+    const auto acknowledgeRead = [&] {
+        backend.readChatMessages(dialog, {QStringLiteral("800")});
+        QTRY_COMPARE(confirmed.size(), 1);
+        QCOMPARE(row().unread, 0);
+    };
+    if (!requestBeforeRead)
+        acknowledgeRead();
+    backend.sendChatMessage(dialog, QStringLiteral("Reply"));
+    QTRY_COMPARE(sent.size(), 1);
+
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,
+        "recentItems":[{"dialogId":"103","chatId":91,"messageId":801,"counter":1}],
+        "chats":[{"id":91,"dialogId":"103","type":"user","lastId":799)";
+    if (!requestBeforeRead && !readResultHasCursor)
+        fixture.ordinaryRecentBadgeFixture += R"(,"unreadId":800)";
+    fixture.ordinaryRecentBadgeFixture += R"(}],
+        "messages":[{"id":801,"chatId":91,"authorId":11,"text":"Reply"}]})";
+    const auto requests = fixture.requestsFor(recentRequest).size();
+    fixture.holdNextReadResponse = recentRequest;
+    backend.requestRecentChats();
+    QTRY_VERIFY(fixture.requestsFor(recentRequest).size() > requests && fixture.holdNextReadResponse.isEmpty());
+    if (requestBeforeRead)
+        acknowledgeRead();
+
+    fixture.releaseHeldReadResponse();
+    QTRY_COMPARE(row().lastMessage, QStringLiteral("Reply"));
+    QCOMPARE(row().unread, 0);
+    QCOMPARE(backend.unreadChatCount().value_or(-1), 0);
+
+    const auto repeatedRecent = recent.size();
+    backend.requestRecentChats();
+    QTRY_VERIFY(recent.size() > repeatedRecent);
+    QCOMPARE(row().unread, 0);
+
+    fixture.pushIm(QStringLiteral("incoming-after-reply"), QStringLiteral("message"),
+        {{"chatId", 91}, {"dialogId", dialog}, {"counter", 1},
+         {"message", QJsonObject{{"id", 802}, {"chatId", 91}, {"senderId", 103}, {"text", "New incoming"}}}});
+    QTRY_COMPARE(row().unread, 1);
+    QCOMPARE(backend.unreadChatCount().value_or(-1), 1);
 }
 
 void TestCloudBackend::acknowledgesVisibleReactionAnchorsWithoutLosingNewPush()
@@ -2251,6 +2336,7 @@ void TestCloudBackend::performsVerifiedMessageActions()
     const auto reactionCode = QStringLiteral("faceWithStuckOutTongueAndWinkingEye");
     backend.changeMessage(dialog, id, MessageAction::React, reactionCode);
     QTRY_COMPARE(accepted.size(), 1);
+    QVERIFY(accepted.first().at(1).toString().isEmpty());
     const auto reaction = QStringLiteral("im.v2.Chat.Message.Reaction.add");
     const auto reactionData = fixture.requestsFor(reaction).value(0);
     QCOMPARE(reactionData.field(QStringLiteral("messageId")), id);
