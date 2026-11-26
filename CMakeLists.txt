@@ -50,6 +50,8 @@ endif()
 # --- application ----------------------------------------------------------
 add_library(bxwidgets STATIC
     src/ui/main_window.h
+    src/ui/notifications_panel.h
+    src/ui/notifications_panel.cpp
     src/ui/main_window.cpp
     src/ui/composer_send_controller.cpp
     src/ui/chat_action_ui.cpp

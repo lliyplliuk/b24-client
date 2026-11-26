@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/backend.h"
+#include "ui/notifications_panel.h"
 #include "ui/chat_image_previews.h"
 #include "ui/composer_send_controller.h"
 #include "ui/public_link_preview.h"
@@ -41,24 +42,20 @@ class QTemporaryDir;
 namespace bx {
 
 class BoardWidget;
+namespace ui {
+struct ListViewportAnchor {
+    QStringList successors;
+    int offset = 0;
+    int scroll = 0;
+};
+ListViewportAnchor listViewportAnchor(const QListWidget *list);
+void restoreListViewport(QListWidget *list, const ListViewportAnchor &anchor);
+QLabel *emptyState(const QString &text, QWidget *parent);
+}
 namespace ui { class TaskGanttView; }
 namespace ui { class WorktimePanel; class ChatVideoPreviews; }
 namespace ui { class ProjectToolsDialog; }
 namespace ui { class AvatarBadge; class ChatComposer; class HistoryList; class PinnedMessageBar; class TaskCardDialog; class TaskEditForm; class NameDialog; class StageManagerDialog; class GlyphButton; }
-
-class ClientUpdateFeed final : public QObject {
-    Q_OBJECT
-public:
-    void publish(const QString &tag, const QUrl &downloadUrl);
-    const Notification &notice() const { return m_notice; }
-    void markRead();
-
-signals:
-    void changed();
-
-private:
-    Notification m_notice;
-};
 
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -118,7 +115,6 @@ private slots:
 private:
     QWidget *buildChatPanel();
     QWidget *buildProjectsPanel();
-    QWidget *buildNotificationsPanel();
     void refreshCurrentSection(bool reloadProjectDirectory = true);
     void updateComposers();
     bool clearTask();
@@ -164,11 +160,8 @@ private:
     void handleChatTyping(const QString &dialog, const QString &user, int duration);
     void rememberTypingName(const QString &user, const QString &name);
     void setChatTabUnreadCount(int scope, qint64 count);
-    void updateNotificationRailBadge();
     void setRailUnreadCount(int row, qint64 count);
     void setRailStatus(int row, const QString &detail);
-    void requestNotificationHistory();
-    void scheduleOlderNotifications();
     void requestRailWorkday();
     void updateRailWorkday();
     void showProjects();
@@ -205,21 +198,8 @@ private:
     void resetLinkPreviews();
     void loadMessageLinkPreview(const QString &href);
     void updateAvatarRows();
-    void openNotificationTarget(const QListWidgetItem *item, int target);
     void openPortalTarget(NotificationTarget target, QWidget *source = nullptr, const QUrl &messageUrl = {});
-    QListWidgetItem *noticeItem(const QString &id) const;
-    void toggleNoticeDetails(QListWidgetItem *item);
-    void showNoticeMenu(QListWidgetItem *item, const QPoint &position);
-    void runNotificationSearch();
-    void resetNotificationAccount();
-    void showNotifications(bool markVisible = true, bool preserveScroll = true);
-    QVector<int> visibleNoticeRows() const;
-    void scheduleVisibleNoticeRead();
-    void readVisibleNotices();
-    void finishVisibleNoticeRead(bool success);
-    bool canReadVisibleNotices() const;
-    void updateNotificationActions();
-    void openNotificationChat(const NotificationTarget &target);
+    void openLinkedChat(const NotificationTarget &target);
     void openTaskCardForProject(const QString &taskId, const QString &projectId);
     void openPerson(const QString &personId, QWidget *source = nullptr);
     void resetMessageContext();
@@ -426,35 +406,8 @@ private:
     QVector<Task> m_projectSearchResults;
     bool m_projectSearchDisplayed = false;
 
-    QListWidget *m_notifications = nullptr;
-    QLabel *m_notificationsEmpty = nullptr;
-    QPointer<ClientUpdateFeed> m_clientUpdates;
-    QVector<Notification> m_noticeHistory;
-    QVector<Notification> m_noticeSearchResults;
-    QString m_noticeSelectedId;
-    QString m_noticeExpandedId;
-    QString m_noticeQuery;
-    QString m_noticeAction;
-    QTimer *m_noticeSearchTimer = nullptr;
-    QTimer *m_noticeReadTimer = nullptr;
-    QStringList m_pendingNoticeRead;
-    QSet<QString> m_failedNoticeRead;
-    bool m_readNoticesAfterPending = false;
-    QLineEdit *m_noticeSearch = nullptr;
-    QCheckBox *m_noticeUnreadOnly = nullptr;
-    QComboBox *m_noticeSort = nullptr;
-    QAction *m_noticeRead = nullptr;
-    QPushButton *m_noticeReadAll = nullptr;
-    QAction *m_noticeDelete = nullptr;
-    enum class NoticeHistoryState { Ready, Loading, Failed };
-    NoticeHistoryState m_noticeHistoryState = NoticeHistoryState::Ready;
-    bool m_noticeHistoryRequested = false;
-    bool m_noticeHasOlder = false;
-    bool m_noticeOlderLoading = false;
-    bool m_noticeOlderFailed = false;
-    bool m_noticePageCheckQueued = false;
-    bool m_noticeSearchPending = false;
-    QString m_noticeProjectId;
+    NotificationsPanel *m_events = nullptr;
+    QString m_linkedProjectId;
     struct {
         NotificationTarget target;
         QUrl url;
