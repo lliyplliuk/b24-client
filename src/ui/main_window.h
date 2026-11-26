@@ -17,6 +17,7 @@
 #include <memory>
 
 class QLabel;
+class QAction;
 class QCheckBox;
 class QAbstractItemModel;
 class QDialog;
@@ -205,6 +206,10 @@ private:
     void loadMessageLinkPreview(const QString &href);
     void updateAvatarRows();
     void openNotificationTarget(int row, int target);
+    void openNotificationTarget(NotificationTarget target);
+    QListWidgetItem *noticeItem(const QString &id) const;
+    void toggleNoticeDetails(QListWidgetItem *item);
+    void showNoticeMenu(QListWidgetItem *item, const QPoint &position);
     void runNotificationSearch();
     void resetNotificationAccount();
     void showNotifications(bool markVisible = true, bool preserveScroll = true);
@@ -428,6 +433,7 @@ private:
     QVector<Notification> m_noticeHistory;
     QVector<Notification> m_noticeSearchResults;
     QString m_noticeSelectedId;
+    QString m_noticeExpandedId;
     QString m_noticeQuery;
     QString m_noticeAction;
     QTimer *m_noticeSearchTimer = nullptr;
@@ -438,10 +444,10 @@ private:
     QLineEdit *m_noticeSearch = nullptr;
     QCheckBox *m_noticeUnreadOnly = nullptr;
     QComboBox *m_noticeSort = nullptr;
-    QPushButton *m_noticeRead = nullptr;
+    QAction *m_noticeRead = nullptr;
     QPushButton *m_noticeReadAll = nullptr;
     QPushButton *m_noticeOlder = nullptr;
-    QPushButton *m_noticeDelete = nullptr;
+    QAction *m_noticeDelete = nullptr;
     enum class NoticeHistoryState { Ready, Loading, Failed };
     NoticeHistoryState m_noticeHistoryState = NoticeHistoryState::Ready;
     bool m_noticeHistoryRequested = false;

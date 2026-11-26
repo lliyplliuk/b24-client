@@ -493,7 +493,7 @@ void MessageMarkupTest::omitsOnlyTaskPreviewsFromNotices()
     auto *painter = configureRows(&list, Row::Notice);
     const auto makeNotice = [&] {
         auto *item = addMarkupRow(&list, u"Уведомление"_s, text, {}, u"1"_s);
-        item->setData(NoticeActions, QStringList{u"Открыть сообщение"_s, u"Задача #42"_s});
+        item->setData(NoticePresentation, QVariant::fromValue(NoticeRow{{}, {}, u"Открыть сообщение"_s, 0, true}));
         return item;
     };
     auto *mixed = makeNotice();
@@ -508,14 +508,14 @@ void MessageMarkupTest::omitsOnlyTaskPreviewsFromNotices()
     QString openedLink;
     int openedAction = -1;
     painter->setMessageLinkHandler([&](const QString &link) { openedLink = link; });
-    painter->setNoticeActionHandler([&](const QModelIndex &, int action) { openedAction = action; });
+    painter->setNoticeHandlers([&](const QModelIndex &, int action) { openedAction = action; }, {}, {});
     list.show();
     QVERIFY(QTest::qWaitForWindowExposed(&list));
     const auto row = list.visualItemRect(mixed);
     QCOMPARE(row.height(), list.visualItemRect(externalOnly).height());
     const auto index = list.indexFromItem(mixed);
     const auto card = painter->receiptArea(index, row);
-    const auto textLink = card.topLeft() + QPoint(28, 40);
+    const auto textLink = card.topLeft() + QPoint(28, 81);
     QCOMPARE(painter->anchorAt(index, row, textLink), taskLink);
     QTest::mouseClick(list.viewport(), Qt::LeftButton, Qt::NoModifier, textLink);
     QCOMPARE(openedLink, taskLink);
@@ -532,7 +532,7 @@ void MessageMarkupTest::omitsOnlyTaskPreviewsFromNotices()
     QTest::mouseClick(list.viewport(), Qt::LeftButton, Qt::NoModifier, externalPreview);
     QCOMPARE(openedLink, webLink);
     QTest::mouseClick(list.viewport(), Qt::LeftButton, Qt::NoModifier,
-                      QPoint(card.left() + 40, card.bottom() - 10));
+                      QPoint(card.left() + 40, card.top() + 54));
     QCOMPARE(openedAction, 0);
 }
 

@@ -64,7 +64,7 @@ constexpr int MarkedUnread = Qt::UserRole + 15;
 constexpr int ForwardByline = Qt::UserRole + 16;
 constexpr int ReplyByline = Qt::UserRole + 17;
 constexpr int ReplyPreview = Qt::UserRole + 18;
-constexpr int NoticeActions = Qt::UserRole + 19;
+constexpr int NoticePresentation = Qt::UserRole + 19;
 constexpr int MessageFiles = Qt::UserRole + 20;
 constexpr int ReplyFiles = Qt::UserRole + 21;
 constexpr int SystemMessage = Qt::UserRole + 22;
@@ -85,6 +85,19 @@ constexpr int MessageUnread = Qt::UserRole + 41;
 constexpr int MessageCalendarDay = Qt::UserRole + 42;
 constexpr int MessageLinks = Qt::UserRole + 43;
 constexpr int CountPartial = Qt::UserRole + 44;
+
+struct NoticeRow {
+    QString day;
+    QString excerpt;
+    QString primaryLabel;
+    int primaryTarget = -1;
+    bool expanded = false;
+};
+} // namespace bx::workspace
+
+Q_DECLARE_METATYPE(bx::workspace::NoticeRow)
+
+namespace bx::workspace {
 
 inline QString reactionGlyph(const QString &code)
 {
@@ -376,9 +389,13 @@ public:
             m_previewClock->unwatch(m_previewViewport);
     }
 
-    void setNoticeActionHandler(std::function<void(const QModelIndex &, int)> handler)
+    void setNoticeHandlers(std::function<void(const QModelIndex &, int)> open,
+                           std::function<void(const QModelIndex &)> toggle,
+                           std::function<void(const QModelIndex &, const QPoint &)> menu)
     {
-        m_noticeAction = std::move(handler);
+        m_noticeAction = std::move(open);
+        m_noticeToggle = std::move(toggle);
+        m_noticeMenu = std::move(menu);
     }
     void setMessageDownloadHandler(std::function<void(const MessageFile &)> handler)
     {
@@ -528,6 +545,8 @@ public:
     // Hit test of the drawn message body: returns the href under the viewport point.
     QString anchorAt(const QModelIndex &index, const QRect &row, const QPoint &viewportPos) const
     {
+        if (m_style == Row::Notice && !index.data(NoticePresentation).value<NoticeRow>().expanded)
+            return {};
         const auto rect = m_style == Row::Notice ? noticeBodyRect(row, index) : messageContentRect(row, index);
         if (!rect.contains(viewportPos))
             return {};
@@ -553,7 +572,7 @@ public:
 
     QRect receiptArea(const QModelIndex &index, const QRect &row) const
     {
-        return m_style == Row::Notice ? noticeRect(row) : messageBubble(row, index);
+        return m_style == Row::Notice ? noticeRect(row, index) : messageBubble(row, index);
     }
 
     void setReplyNavigation(std::function<void(const QString &)> handler)
@@ -703,12 +722,14 @@ public:
         }
         if (m_style == Row::Notice) {
             const QRect row(0, 0, width, 0);
-            const auto buttons = noticeActionRects(row, index);
-            const int previews = linkPreviewHeight(index);
-            const int bottom = buttons.isEmpty()
-                ? noticeBodyRect(row, index).bottom() + (previews > 0 ? previews + 5 : 0)
-                : buttons.back().bottom();
-            return QSize(0, qMax(35, bottom + 8));
+            const auto notice = index.data(NoticePresentation).value<NoticeRow>();
+            const auto header = noticeHeaderRect(row, index, notice);
+            if (!notice.expanded)
+                return QSize(0, header.bottom() + noticeGap + 1);
+            const auto action = noticePrimaryRect(row, index, notice);
+            const int bodyBottom = noticeBodyRect(row, index).bottom() + linkPreviewHeight(index);
+            const int bottom = qMax(qMax(header.bottom(), bodyBottom), action.bottom());
+            return QSize(0, bottom + noticeGap + 9);
         }
         const int height = wrappedText(title, qMax(75, width - 27), rowFont(ui::bodyTextPixels, true));
         return QSize(0, 25 + qMin(45, height) + (detail.isEmpty() ? 0 : 19));
@@ -823,6 +844,8 @@ private:
     QListWidget *m_view;
     Row m_style;
     std::function<void(const QModelIndex &, int)> m_noticeAction;
+    std::function<void(const QModelIndex &)> m_noticeToggle;
+    std::function<void(const QModelIndex &, const QPoint &)> m_noticeMenu;
     std::function<void(const MessageFile &)> m_messageDownload;
     std::function<void(const QString &)> m_messageLink;
     std::function<const QPixmap *(const QUrl &)> m_messagePreview;
@@ -1088,6 +1111,8 @@ private:
     QVector<LinkCard> linkPreviews(const QModelIndex &index) const
     {
         QVector<LinkCard> cards;
+        if (m_style == Row::Notice && !index.data(NoticePresentation).value<NoticeRow>().expanded)
+            return cards;
         if (m_linkPreview) {
             const auto links = index.data(MessageLinks).toStringList();
             for (const auto &link : links) {
@@ -1159,7 +1184,7 @@ private:
     QRect firstLinkCard(const QRect &row, const QModelIndex &index) const
     {
         if (m_style == Row::Notice) {
-            const auto card = noticeRect(row);
+            const auto card = noticeRect(row, index);
             const auto detail = noticeBodyRect(row, index);
             return QRect(detail.left(), detail.bottom() + 6, qMax(1, card.width() - 40), 1);
         }
@@ -1370,13 +1395,14 @@ private:
     std::function<void()> rowActionAt(const QModelIndex &index, const QRect &row, const QPoint &point) const
     {
         if (m_style == Row::Notice) {
-            if (m_noticeAction) {
-                const auto buttons = noticeActionRects(row, index);
-                for (int i = 0; i < buttons.size(); ++i) {
-                    if (buttons[i].contains(point))
-                        return [this, index, i] { m_noticeAction(index, i); };
-                }
-            }
+            const auto notice = index.data(NoticePresentation).value<NoticeRow>();
+            const auto menu = noticeMenuRect(row, index);
+            if (m_noticeMenu && menu.contains(point))
+                return [this, index, menu] { m_noticeMenu(index, menu.bottomLeft()); };
+            if (m_noticeToggle && noticeHeaderRect(row, index, notice).contains(point))
+                return [this, index] { m_noticeToggle(index); };
+            if (m_noticeAction && notice.expanded && noticePrimaryRect(row, index, notice).contains(point))
+                return [this, index, target = notice.primaryTarget] { m_noticeAction(index, target); };
             return linkActionAt(index, row, point);
         }
         const auto receipt = viewersReceipt(index, row);
@@ -1757,53 +1783,86 @@ private:
                     : QStringLiteral("Файлы · %1").arg(attachments.documents);
                 caption = attachmentsOnly ? description : caption + QStringLiteral(" · ") + description;
             }
-            quotePreview(p, text, caption, Ink);
+            messagePreviewLine(p, text, caption, Ink);
         }
     }
 
-    static QRect noticeRect(const QRect &row)
+    static constexpr int noticeGap = 10;
+    static constexpr int noticeDayHeight = 30;
+
+    static QRect noticeRect(const QRect &row, const QModelIndex &index)
     {
-        auto rect = row.adjusted(0, 2, -6, -2);
-        rect.setWidth(qMin(rect.width(), 660));
+        const auto notice = index.data(NoticePresentation).value<NoticeRow>();
+        auto rect = row.adjusted(0, notice.day.isEmpty() ? 2 : noticeDayHeight, -6, -noticeGap);
+        rect.setWidth(qMin(rect.width(), 760));
         return rect;
     }
 
-    static QVector<QRect> noticeButtons(const QRect &card, const QStringList &labels)
+    static QRect noticeMenuRect(const QRect &row, const QModelIndex &index)
     {
-        QVector<QRect> buttons;
-        const int left = card.left() + 25;
-        const int right = card.right() - 14;
-        int x = left;
-        int y = card.top();
-        const QFontMetrics measure(rowFont(ui::bodyTextPixels, true));
-        for (const auto &label : labels) {
-            const int width = qBound(1, measure.horizontalAdvance(label) + 16, qMax(1, right - left));
-            if (x > left && x + width > right) {
-                x = left;
-                y += 30;
-            }
-            buttons.append(QRect(x, y, width, 24));
-            x += width + 6;
-        }
-        return buttons;
+        const auto r = noticeRect(row, index);
+        return QRect(r.right() - 31, r.top() + 5, 27, 28);
     }
 
-    QVector<QRect> noticeActionRects(const QRect &row, const QModelIndex &index) const
+    static int noticeTextWidth(const QRect &card, bool heading)
     {
-        auto card = noticeRect(row);
-        card.moveTop(noticeBodyRect(row, index).bottom() + 6 + linkPreviewHeight(index));
-        return noticeButtons(card, index.data(NoticeActions).toStringList());
+        return qMax(1, card.width() - (heading ? 135 : 44));
+    }
+
+    static QStringList noticeExcerptLines(const QString &text, int width, bool singleLine)
+    {
+        if (text.isEmpty())
+            return {};
+        if (singleLine)
+            return {text};
+        QTextLayout layout(text, rowFont(ui::secondaryTextPixels));
+        QTextOption option;
+        option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        layout.setTextOption(option);
+        layout.beginLayout();
+        auto first = layout.createLine();
+        first.setLineWidth(width);
+        const int next = first.textLength();
+        layout.endLayout();
+        if (next >= text.size())
+            return {text};
+        return {text.left(next).trimmed(), text.mid(next).trimmed()};
+    }
+
+    static QRect noticeHeaderRect(const QRect &row, const QModelIndex &index, const NoticeRow &notice)
+    {
+        const auto r = noticeRect(row, index);
+        const bool titled = !index.data(Title).toString().isEmpty();
+        int height = 40;
+        if (!notice.expanded) {
+            const auto lines = noticeExcerptLines(notice.excerpt, noticeTextWidth(r, !titled), false);
+            height += 19 * qMax(0, int(lines.size()) - (titled ? 0 : 1));
+        }
+        return QRect(r.topLeft(), QSize(r.width(), height));
     }
 
     QRect noticeBodyRect(const QRect &row, const QModelIndex &index) const
     {
-        const auto card = noticeRect(row);
-        const bool hasTitle = !index.data(Title).toString().isEmpty();
-        const bool sharesTimestamp = !hasTitle && !index.data(Meta).toString().isEmpty();
-        const int width = qMax(1, card.width() - (sharesTimestamp ? 125 : 40));
-        return QRect(card.left() + 25, card.top() + (hasTitle ? 33 : 9), width,
-                     bodyHeight(index, index.data(Detail).toString(), width));
+        const auto notice = index.data(NoticePresentation).value<NoticeRow>();
+        const auto header = noticeHeaderRect(row, index, notice);
+        const int width = noticeTextWidth(header, false);
+        const auto detail = index.data(Detail).toString();
+        const int height = detail.isEmpty() ? 0 : bodyHeight(index, detail, width);
+        const auto action = noticePrimaryRect(row, index, notice);
+        const int top = action.isEmpty() ? header.bottom() + 5 : action.bottom() + 9;
+        return QRect(header.left() + 25, top, width, height);
     }
+
+    QRect noticePrimaryRect(const QRect &row, const QModelIndex &index, const NoticeRow &notice) const
+    {
+        if (notice.primaryTarget < 0)
+            return {};
+        const auto header = noticeHeaderRect(row, index, notice);
+        const QFontMetrics font(rowFont(ui::secondaryTextPixels, true));
+        const int width = qMin(noticeTextWidth(header, false), font.horizontalAdvance(notice.primaryLabel) + 22);
+        return QRect(header.left() + 25, header.bottom() + 5, width, 28);
+    }
+
     QTextDocument *bodyDocument(const QModelIndex &index, int width) const
     {
         const auto html = index.data(MarkupHtml).toString();
@@ -2177,25 +2236,59 @@ private:
     void paintNotice(QPainter &p, const QStyleOptionViewItem &option, const QModelIndex &index,
                      const QString &title, const QString &detail, const QString &meta) const
     {
-        const QRect r = noticeRect(option.rect);
+        const auto notice = index.data(NoticePresentation).value<NoticeRow>();
+        const auto r = noticeRect(option.rect, index);
+        if (!notice.day.isEmpty()) {
+            const QRect day(r.left() + 25, option.rect.top(), r.width() - 25, noticeDayHeight - 3);
+            line(p, day, notice.day, ui::secondaryTextPixels, Ink, true);
+        }
+
         const bool unread = index.data(Count).toBool();
-        fill(p, r, unread ? QColor("#e7f0f0") : Surface, itemOutline(option, Border));
+        const bool selected = option.state & QStyle::State_Selected;
+        fill(p, r, selected ? Selected : unread ? QColor("#e7f0f0") : Surface, itemOutline(option), 6);
+        p.setPen(Border);
+        p.drawLine(r.left() + 8, r.bottom(), r.right() - 8, r.bottom());
         if (unread) {
             p.setPen(Qt::NoPen);
             p.setBrush(Accent);
-            p.drawEllipse(QPoint(r.left() + 13, r.top() + 18), 3, 3);
+            p.drawEllipse(QPoint(r.left() + 13, r.top() + 20), 3, 3);
         }
-        const QRect heading(r.left() + 25, r.top() + 6, qMax(20, r.width() - 129), 23);
-        line(p, heading, title, ui::bodyTextPixels, Ink, true);
-        line(p, QRect(r.right() - 97, r.top() + 6, 85, 23), meta, messageMetaPixels, ConversationMetaInk, false,
-             Qt::AlignRight | Qt::AlignVCenter);
-        const auto labels = index.data(NoticeActions).toStringList();
-        const auto buttons = noticeActionRects(option.rect, index);
+        const int top = r.top() + 9;
+        const int left = r.left() + 25;
+        const QRect time(r.right() - 112, top, 53, 22);
+        line(p, time, meta, messageMetaPixels, ConversationMetaInk, false, Qt::AlignRight | Qt::AlignVCenter);
+        const int chevronX = time.right() + 13;
+        const int chevronY = time.center().y();
+        const int direction = notice.expanded ? -1 : 1;
+        p.setPen(QPen(ConversationMetaInk, 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        const QPoint chevron[]{QPoint(chevronX - 4, chevronY - direction * 2),
+                               QPoint(chevronX, chevronY + direction * 2),
+                               QPoint(chevronX + 4, chevronY - direction * 2)};
+        p.drawPolyline(chevron, 3);
+        const auto menu = noticeMenuRect(option.rect, index);
+        ui::paintGlyph(p, ui::Glyph::More, QRectF(menu.center() - QPoint(8, 8), QSize(16, 16)), ConversationMetaInk);
+
+        const bool titled = !title.isEmpty();
+        if (titled)
+            line(p, QRect(left, top, noticeTextWidth(r, true), 22), title, ui::bodyTextPixels, Ink, true);
+        if (!notice.expanded || !titled) {
+            const int width = noticeTextWidth(r, !titled);
+            int y = top + (titled ? 22 : 0);
+            for (const auto &excerpt : noticeExcerptLines(notice.excerpt, width, notice.expanded)) {
+                line(p, QRect(left, y, width, 20), excerpt, ui::secondaryTextPixels,
+                     titled ? ConversationMetaInk : Ink);
+                y += 19;
+            }
+        }
+        if (!notice.expanded)
+            return;
         body(p, noticeBodyRect(option.rect, index), index, detail, Ink);
         paintLinkCards(p, option.rect, index);
-        for (int i = 0; i < buttons.size(); ++i) {
-            fill(p, buttons[i], QColor("#f5faf7"), QColor("#b4cdc6"), 6);
-            line(p, buttons[i].adjusted(5, 0, -5, 0), labels[i], ui::bodyTextPixels, Accent, true, Qt::AlignCenter);
+        const auto action = noticePrimaryRect(option.rect, index, notice);
+        if (!action.isEmpty()) {
+            fill(p, action, QColor("#f5faf7"), QColor("#b4cdc6"), 6);
+            line(p, action.adjusted(8, 0, -8, 0), notice.primaryLabel, ui::secondaryTextPixels,
+                 Accent, true, Qt::AlignCenter);
         }
     }
 

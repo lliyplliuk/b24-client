@@ -222,11 +222,13 @@ QVector<Notification> listedNotifications(QVector<Notification> notifications)
     return notifications;
 }
 
-QString actionLabel(const NotificationTarget &target)
+QString actionLabel(const NotificationTarget &target, bool preferTargetLabel = true)
 {
-    const auto label = workspace::markupPlainText(target.label.left(256)).simplified();
-    if (!label.isEmpty())
-        return label;
+    if (preferTargetLabel) {
+        const auto label = workspace::markupPlainText(target.label.left(256)).simplified();
+        if (!label.isEmpty())
+            return label;
+    }
     switch (target.kind) {
     case NotificationTargetKind::Chat:
         return target.messageId.isEmpty() ? QStringLiteral("Открыть чат") : QStringLiteral("Открыть сообщение");
@@ -238,6 +240,23 @@ QString actionLabel(const NotificationTarget &target)
         return QStringLiteral("Открыть проект");
     }
     return {};
+}
+
+void presentNoticeRow(QListWidgetItem *item, const workspace::NoticeRow &notice)
+{
+    item->setData(workspace::NoticePresentation, QVariant::fromValue(notice));
+    QStringList text{notice.day, item->data(workspace::Title).toString(), item->data(workspace::Meta).toString(),
+        notice.expanded ? item->data(workspace::Detail).toString() : notice.excerpt};
+    text.removeAll(QString());
+    item->setData(Qt::AccessibleTextRole, text.join(QStringLiteral(". ")));
+    QStringList details;
+    if (item->data(workspace::Count).toBool())
+        details.append(QStringLiteral("Непрочитанное"));
+    details.append(notice.expanded ? QStringLiteral("Подробности раскрыты") : QStringLiteral("Enter — подробности"));
+    if (notice.primaryTarget >= 0)
+        details.append(QStringLiteral("Ctrl+Enter — %1").arg(notice.primaryLabel));
+    details.append(QStringLiteral("Shift+F10 — действия"));
+    item->setData(Qt::AccessibleDescriptionRole, details.join(QStringLiteral(". ")));
 }
 
 QWidget *directory(const QString &title, QListWidget **list, QWidget *parent, QLabel **titleLabel = nullptr)
@@ -1084,6 +1103,10 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     });
     connect(m_backend, &Backend::notificationReadStateChanged, this,
             [this](const QStringList &ids, bool read) {
+        if (read && m_noticeUnreadOnly->isChecked() && ids.contains(m_noticeExpandedId)
+            && (m_noticeAction == QStringLiteral("read-notification") ||
+                m_noticeAction == QStringLiteral("read-all-notifications")))
+            m_noticeExpandedId.clear();
         for (auto *source : {&m_noticeHistory, &m_noticeSearchResults})
             for (auto &notice : *source)
                 if (ids.contains(notice.id))
@@ -1803,7 +1826,10 @@ QWidget *MainWindow::buildNotificationsPanel()
     layout->setContentsMargins(24, 19, 24, 15);
     layout->setSpacing(12);
     auto *header = new QHBoxLayout;
-    header->addWidget(label(QStringLiteral("Уведомления"), "pageTitle", panel), 1);
+    header->addWidget(label(QStringLiteral("События"), "pageTitle", panel), 1);
+    m_noticeReadAll = ui::button(QStringLiteral("Отметить все прочитанными"),
+                                  QStringLiteral("Прочитать все уведомления"), panel);
+    header->addWidget(m_noticeReadAll, 0, Qt::AlignTop);
     auto *refresh = new QPushButton(QStringLiteral("Обновить"), panel);
     refresh->setToolTip(QStringLiteral("Обновить уведомления (F5)"));
     connect(refresh, &QPushButton::clicked, this, &MainWindow::onRefresh);
@@ -1939,18 +1965,12 @@ QWidget *MainWindow::buildNotificationsPanel()
     filters->addWidget(m_noticeSort);
     layout->addLayout(filters);
 
-    auto *actions = new QHBoxLayout;
-    m_noticeRead = ui::button(QStringLiteral("Прочитать"), QStringLiteral("Прочитать уведомление"), panel);
-    m_noticeReadAll = ui::button(QStringLiteral("Прочитать все"), QStringLiteral("Прочитать все уведомления"), panel);
-    m_noticeOlder = ui::button(QStringLiteral("Более ранние уведомления"), QStringLiteral("Более ранние уведомления"), panel);
+    m_noticeRead = new QAction(QStringLiteral("Отметить прочитанным"), panel);
+    m_noticeRead->setObjectName(QStringLiteral("readNotice"));
+    m_noticeOlder = ui::button(QStringLiteral("Загрузить более ранние"), QStringLiteral("Более ранние уведомления"), panel);
     m_noticeOlder->hide();
-    m_noticeDelete = ui::button(QStringLiteral("Удалить"), QStringLiteral("Удалить уведомление"), panel);
-    actions->addWidget(m_noticeRead);
-    actions->addWidget(m_noticeReadAll);
-    actions->addWidget(m_noticeOlder);
-    actions->addStretch(1);
-    actions->addWidget(m_noticeDelete);
-    layout->addLayout(actions);
+    m_noticeDelete = new QAction(QStringLiteral("Удалить уведомление"), panel);
+    m_noticeDelete->setObjectName(QStringLiteral("deleteNotice"));
     m_noticeSearchTimer = new QTimer(panel);
     m_noticeSearchTimer->setSingleShot(true);
     m_noticeSearchTimer->setInterval(280);
@@ -1958,7 +1978,10 @@ QWidget *MainWindow::buildNotificationsPanel()
     connect(m_noticeSearch, &QLineEdit::textChanged, m_noticeSearchTimer, qOverload<>(&QTimer::start));
     connect(m_noticeSearch, &QLineEdit::textChanged, this, &MainWindow::updateNotificationPager);
     connect(m_noticeSearch, &QLineEdit::returnPressed, this, &MainWindow::runNotificationSearch);
-    connect(m_noticeUnreadOnly, &QCheckBox::toggled, this, [this] { showNotifications(true, false); });
+    connect(m_noticeUnreadOnly, &QCheckBox::toggled, this, [this] {
+        m_noticeExpandedId.clear();
+        showNotifications(true, false);
+    });
     connect(m_noticeSort, &QComboBox::currentIndexChanged, this, [this] { showNotifications(true, false); });
 
     m_notifications = new QListWidget(panel);
@@ -1981,7 +2004,7 @@ QWidget *MainWindow::buildNotificationsPanel()
         setStatus(QStringLiteral("Обновляем уведомления…"), true);
         updateNotificationActions();
     };
-    connect(m_noticeRead, &QPushButton::clicked, this, [this, beginAction] {
+    connect(m_noticeRead, &QAction::triggered, this, [this, beginAction] {
         const auto *row = m_notifications->currentItem();
         if (!row || !m_noticeRead->isEnabled())
             return;
@@ -2007,7 +2030,7 @@ QWidget *MainWindow::buildNotificationsPanel()
         if (m_noticeOlder->isVisible() && m_noticeOlder->isEnabled())
             m_backend->requestOlderNotifications();
     });
-    connect(m_noticeDelete, &QPushButton::clicked, this, [this, beginAction] {
+    connect(m_noticeDelete, &QAction::triggered, this, [this, beginAction] {
         const auto *row = m_notifications->currentItem();
         if (!row || !m_noticeDelete->isEnabled())
             return;
@@ -2021,37 +2044,47 @@ QWidget *MainWindow::buildNotificationsPanel()
     });
     auto *delegate = workspace::configureRows(m_notifications, workspace::Row::Notice);
     bindMessageFiles(m_notifications, true);
-    delegate->setNoticeActionHandler([this](const QModelIndex &index, int target) {
-        const int row = index.row();
-        QTimer::singleShot(0, this, [this, index = QPersistentModelIndex(index), row, target] {
+    delegate->setNoticeHandlers([this](const QModelIndex &index, int target) {
+        QTimer::singleShot(0, this, [this, index = QPersistentModelIndex(index), target] {
             if (index.isValid())
-                openNotificationTarget(row, target);
+                openNotificationTarget(index.row(), target);
         });
+    }, [this](const QModelIndex &index) {
+        toggleNoticeDetails(m_notifications->item(index.row()));
+    }, [this](const QModelIndex &index, const QPoint &position) {
+        showNoticeMenu(m_notifications->item(index.row()), position);
     });
-    connect(m_notifications, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
-        const int row = m_notifications->row(item);
-        if (row < 0 || row >= m_noticeTargets.size() || m_noticeTargets[row].isEmpty())
-            return;
-        if (m_noticeTargets[row].size() == 1) {
-            openNotificationTarget(row, 0);
-            return;
+    const auto noticeShortcut = [this](const QList<QKeySequence> &keys) {
+        auto *action = new QAction(m_notifications);
+        action->setShortcuts(keys);
+        action->setShortcutContext(Qt::WidgetShortcut);
+        m_notifications->addAction(action);
+        return action;
+    };
+    connect(noticeShortcut({QKeySequence(Qt::Key_Return), QKeySequence(Qt::Key_Enter), QKeySequence(Qt::Key_Space)}),
+            &QAction::triggered, this, [this] { toggleNoticeDetails(m_notifications->currentItem()); });
+    connect(noticeShortcut({QKeySequence(Qt::CTRL | Qt::Key_Return), QKeySequence(Qt::CTRL | Qt::Key_Enter)}),
+            &QAction::triggered, this, [this] {
+        if (const auto *item = m_notifications->currentItem()) {
+            const auto notice = item->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
+            openNotificationTarget(m_notifications->row(item), notice.primaryTarget);
         }
-        const auto labels = item->data(workspace::NoticeActions).toStringList();
-        const QPersistentModelIndex index(m_notifications->model()->index(row, 0));
-        auto *menu = new QMenu(this);
-        connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
-        for (int target = 0; target < labels.size(); ++target) {
-            connect(menu->addAction(labels[target]), &QAction::triggered, this, [this, index, target] {
-                if (index.isValid())
-                    openNotificationTarget(index.row(), target);
-            });
-        }
-        menu->popup(m_notifications->viewport()->mapToGlobal(m_notifications->visualItemRect(item).center()));
+    });
+    connect(noticeShortcut({QKeySequence(Qt::Key_Menu), QKeySequence(Qt::SHIFT | Qt::Key_F10)}),
+            &QAction::triggered, this, [this] {
+        auto *item = m_notifications->currentItem();
+        if (item)
+            showNoticeMenu(item, m_notifications->visualItemRect(item).topLeft());
+    });
+    m_notifications->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_notifications, &QListWidget::customContextMenuRequested, this, [this](const QPoint &position) {
+        showNoticeMenu(m_notifications->itemAt(position), position);
     });
     layout->addWidget(m_notifications, 1);
     m_notificationsEmpty = emptyState(QStringLiteral("Уведомлений пока нет"), panel);
     m_notificationsEmpty->setAccessibleName(QStringLiteral("Состояние уведомлений"));
     layout->addWidget(m_notificationsEmpty, 1);
+    layout->addWidget(m_noticeOlder, 0, Qt::AlignLeft);
     m_notifications->hide();
     return panel;
 }
@@ -2116,6 +2149,7 @@ void MainWindow::onSectionChanged(int index)
     } else if (m_lastSection == 2) {
         m_noticeReadTimer->stop();
         m_readNoticesAfterPending = false;
+        m_noticeExpandedId.clear();
     }
     if (m_lastSection == 1 && index != 1) {
         m_projectSearchTimer->stop();
@@ -4824,7 +4858,10 @@ void MainWindow::loadVisibleChatPreviews()
         load(m_chatMessages);
     }
     for (const int row : visibleNoticeRows()) {
-        const auto links = m_notifications->item(row)->data(workspace::MessageLinks).toStringList();
+        const auto *item = m_notifications->item(row);
+        if (!item->data(workspace::NoticePresentation).value<workspace::NoticeRow>().expanded)
+            continue;
+        const auto links = item->data(workspace::MessageLinks).toStringList();
         for (const auto &href : links)
             loadMessageLinkPreview(href);
     }
@@ -5052,6 +5089,7 @@ void MainWindow::runNotificationSearch()
     const bool queryChanged = m_noticeQuery != query;
     if (queryChanged) {
         m_noticeQuery = query;
+        m_noticeExpandedId.clear();
         m_noticeSearchResults.clear();
         m_failedNoticeRead.clear();
     }
@@ -5076,6 +5114,7 @@ void MainWindow::resetNotificationAccount()
     m_noticeSearchResults.clear();
     m_noticeSearchPending = false;
     m_noticeSelectedId.clear();
+    m_noticeExpandedId.clear();
     m_noticeQuery.clear();
     {
         const QSignalBlocker blocker(m_noticeSearch);
@@ -5110,7 +5149,7 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
             notices.append(local);
     }
     notices.erase(std::remove_if(notices.begin(), notices.end(), [this, remoteSearch](const Notification &notice) {
-        return (m_noticeUnreadOnly->isChecked() && notice.read) ||
+        return (m_noticeUnreadOnly->isChecked() && notice.read && notice.id != m_noticeExpandedId) ||
             (!remoteSearch && !m_noticeQuery.isEmpty() &&
              !notice.title.contains(m_noticeQuery, Qt::CaseInsensitive) &&
              !notice.text.contains(m_noticeQuery, Qt::CaseInsensitive));
@@ -5142,6 +5181,11 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
     }
     m_notifications->clear();
     QListWidgetItem *selected = nullptr;
+    QDate previousDay;
+    const auto yesterday = QDate::currentDate().addDays(-1);
+    static const QRegularExpression quotedReply(QStringLiteral(R"(-{8,}[^\n]*\[.+?\]\s*#chat\d+/\d+.*?-{8,}\s*(?=\S))"),
+        QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression taskPrefix(QStringLiteral(R"(^Задача #\d+\s+)"));
     for (const auto &notice : notices) {
         const auto &content = notice.markup.isEmpty() ? notice.text : notice.markup;
         auto title = workspace::markupPlainText(notice.title);
@@ -5149,16 +5193,35 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
             (title == QStringLiteral("Уведомление Битрикс24") || title == notice.text.trimmed()))
             title.clear();
         auto *item = workspace::addMarkupRow(m_notifications, title, content,
-                                            clockLabel(notice.createdAt, true), notice.id);
+                                            clockLabel(notice.createdAt), notice.id);
         item->setData(workspace::Count, !notice.read);
         m_noticeTargets.append(notice.targets);
-        QStringList actions;
-        for (const auto &target : notice.targets)
-            actions.append(actionLabel(target));
-        item->setData(workspace::NoticeActions, actions);
-        if (!notice.read)
-            actions.prepend(QStringLiteral("Новое"));
-        item->setData(Qt::AccessibleDescriptionRole, actions.join(QStringLiteral(". ")));
+        workspace::NoticeRow row;
+        const auto day = notice.createdAt.toLocalTime().date();
+        if (day.isValid() && day != previousDay)
+            row.day = day == yesterday ? QStringLiteral("Вчера") : ui::messageDayLabel(day);
+        previousDay = day;
+        row.excerpt = item->data(workspace::Detail).toString();
+        const auto quote = quotedReply.match(row.excerpt);
+        if (quote.hasMatch())
+            row.excerpt.remove(quote.capturedStart(), quote.capturedLength());
+        if (!title.isEmpty() && title != QStringLiteral("Новое сообщение"))
+            row.excerpt.remove(taskPrefix);
+        row.excerpt = row.excerpt.simplified().left(512);
+        const auto message = std::find_if(notice.targets.cbegin(), notice.targets.cend(), [](const auto &target) {
+            return target.kind == NotificationTargetKind::Chat && !target.messageId.isEmpty();
+        });
+        const auto task = std::find_if(notice.targets.cbegin(), notice.targets.cend(), [](const auto &target) {
+            return target.kind == NotificationTargetKind::Task;
+        });
+        if (!notice.targets.isEmpty()) {
+            const auto primary = message != notice.targets.cend() ? message
+                : task != notice.targets.cend() ? task : notice.targets.cbegin();
+            row.primaryLabel = actionLabel(*primary, false);
+            row.primaryTarget = int(std::distance(notice.targets.cbegin(), primary));
+        }
+        row.expanded = !m_noticeExpandedId.isEmpty() && notice.id == m_noticeExpandedId;
+        presentNoticeRow(item, row);
         if (notice.id == m_noticeSelectedId)
             selected = item;
     }
@@ -5263,8 +5326,97 @@ void MainWindow::updateNotificationActions()
     const bool portalRows = !m_noticeHistory.isEmpty() || !m_noticeSearchResults.isEmpty();
     m_noticeReadAll->setEnabled(m_noticeAction.isEmpty() && (localUnread || (canWrite && portalRows)));
     const auto tip = m_readOnly ? QStringLiteral("Недоступно в режиме чтения") : QString();
-    for (auto *button : {m_noticeRead, m_noticeReadAll, m_noticeDelete})
-        button->setToolTip(tip);
+    m_noticeRead->setToolTip(tip);
+    m_noticeDelete->setToolTip(tip);
+    m_noticeReadAll->setToolTip(tip);
+}
+
+void MainWindow::toggleNoticeDetails(QListWidgetItem *item)
+{
+    if (!item)
+        return;
+    const auto id = item->data(workspace::Id).toString();
+    if (id.isEmpty())
+        return;
+    const auto anchor = listViewportAnchor(m_notifications);
+    const auto previous = std::exchange(m_noticeExpandedId, {});
+    auto row = item->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
+    row.expanded = !row.expanded;
+    if (row.expanded)
+        m_noticeExpandedId = id;
+    if (auto *other = noticeItem(previous)) {
+        if (m_noticeUnreadOnly->isChecked() && !other->data(workspace::Count).toBool()) {
+            showNotifications();
+            return;
+        }
+        if (other != item) {
+            auto previousRow = other->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
+            previousRow.expanded = false;
+            presentNoticeRow(other, previousRow);
+        }
+    }
+    presentNoticeRow(item, row);
+    restoreListViewport(m_notifications, anchor);
+    scheduleAvatars();
+}
+
+QListWidgetItem *MainWindow::noticeItem(const QString &id) const
+{
+    if (!id.isEmpty()) {
+        for (int row = 0; row < m_notifications->count(); ++row) {
+            auto *item = m_notifications->item(row);
+            if (item->data(workspace::Id).toString() == id)
+                return item;
+        }
+    }
+    return nullptr;
+}
+
+void MainWindow::showNoticeMenu(QListWidgetItem *item, const QPoint &position)
+{
+    if (!item)
+        return;
+    m_notifications->setCurrentItem(item);
+    const auto id = item->data(workspace::Id).toString();
+    auto *menu = new QMenu(m_notifications);
+    menu->setObjectName(QStringLiteral("noticeMenu"));
+    connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+    connect(menu, &QMenu::aboutToHide, this, [this] {
+        QTimer::singleShot(0, this, &MainWindow::scheduleVisibleNoticeRead);
+    });
+    const auto &targets = m_noticeTargets.at(m_notifications->row(item));
+    const auto notice = item->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
+    const auto addTarget = [this, menu, id](const QString &label, const NotificationTarget &target) {
+        connect(menu->addAction(label), &QAction::triggered, menu, [this, id, target] {
+            if (noticeItem(id))
+                openNotificationTarget(target);
+        });
+    };
+    if (notice.primaryTarget >= 0)
+        addTarget(notice.primaryLabel, targets[notice.primaryTarget]);
+    for (int n = 0; n < targets.size(); ++n)
+        if (n != notice.primaryTarget)
+            addTarget(actionLabel(targets[n]), targets[n]);
+    for (const auto &href : item->data(workspace::MessageLinks).toStringList()) {
+        const auto url = messageLinkDestination(href);
+        if (url.isEmpty())
+            continue;
+        const auto linked = portalLinkTarget(m_backend->portalOrigin(), url);
+        if (linked && std::any_of(targets.cbegin(), targets.cend(), [&linked](const auto &target) {
+            return target.kind == linked->kind && target.id == linked->id && target.messageId == linked->messageId;
+        }))
+            continue;
+        auto *action = menu->addAction(QStringLiteral("Открыть ссылку · %1").arg(url.toDisplayString().left(100)));
+        connect(action, &QAction::triggered, menu, [this, href, id] {
+            if (m_lastSection == 2 && noticeItem(id))
+                openMessageLink(href, m_notifications);
+        });
+    }
+    if (!menu->isEmpty())
+        menu->addSeparator();
+    menu->addAction(m_noticeRead);
+    menu->addAction(m_noticeDelete);
+    menu->popup(m_notifications->viewport()->mapToGlobal(position));
 }
 
 void MainWindow::updateNotificationPager()
@@ -5273,6 +5425,8 @@ void MainWindow::updateNotificationPager()
         && m_noticeQuery.isEmpty() && m_noticeSearch->text().trimmed().isEmpty();
     m_noticeOlder->setVisible(visible);
     m_noticeOlder->setEnabled(visible && !m_noticeOlderLoading && m_noticeHistoryState != NoticeHistoryState::Loading);
+    m_noticeOlder->setText(m_noticeOlderLoading ? QStringLiteral("Загружаем более ранние…")
+                                               : QStringLiteral("Загрузить более ранние"));
 }
 
 void MainWindow::openNotificationTarget(int row, int action)
@@ -5281,8 +5435,12 @@ void MainWindow::openNotificationTarget(int row, int action)
         return;
     if (action < 0 || action >= m_noticeTargets[row].size())
         return;
-    const auto target = m_noticeTargets[row][action];
-    if (target.id.isEmpty())
+    openNotificationTarget(m_noticeTargets[row][action]);
+}
+
+void MainWindow::openNotificationTarget(NotificationTarget target)
+{
+    if (m_lastSection != 2 || target.id.isEmpty())
         return;
     switch (target.kind) {
     case NotificationTargetKind::Chat:

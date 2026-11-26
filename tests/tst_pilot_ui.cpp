@@ -5730,7 +5730,7 @@ private slots:
         auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
         auto *notices = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
         auto *search = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск уведомлений"));
-        auto *read = findAccessible<QPushButton>(&window, QStringLiteral("Прочитать уведомление"));
+        auto *read = window.findChild<QAction *>(QStringLiteral("readNotice"));
         QVERIFY(sections && notices && search && read);
         const QUrl url(QStringLiteral("https://github.com/lliyplliuk/b24-client/releases/download/v1.2.3/bitrix24-client-v1.2.3-windows-x64.zip"));
         feed.publish(QStringLiteral("v1.2.3"), url);
@@ -5747,7 +5747,7 @@ private slots:
         emit backend->notificationsFound(search->text(), {});
         QCOMPARE(notices->count(), 1);
         notices->setCurrentRow(0);
-        read->click();
+        read->trigger();
         QVERIFY(feed.notice().read);
         QVERIFY(backend->noticeReadId.isEmpty());
         QVERIFY(backend->noticeReadBatches.isEmpty());
@@ -5817,17 +5817,26 @@ private slots:
         structured.title = QStringLiteral("Уведомление Битрикс24");
         structured.text = QStringLiteral("Заявка на печать. Задача");
         structured.markup = QStringLiteral("Заявка на печать\n[URL=/workgroups/group/7/tasks/task/view/501/]Задача[/URL]");
-        structured.createdAt = QDateTime(QDate(2026, 11, 23), QTime(7, 12));
+        structured.createdAt = QDateTime(QDate::currentDate(), QTime(15, 15));
+        structured.read = true;
         Notification titled;
         titled.id = QStringLiteral("800");
-        titled.title = QStringLiteral("Регламент работы");
-        titled.text = QStringLiteral("Изменён график");
+        titled.title = QStringLiteral("Возвраты клиентам");
+        titled.text = QStringLiteral("Задача #122889 После закрытия бокса не появляется отметка «Закрыт».\n")
+            + QStringLiteral("При выборе клиента открывается документ «Сбор возврата». Детали собираются в бокс, "
+                             "после чего бокс размещается в ячейке. ").repeated(12);
         titled.createdAt = structured.createdAt.addSecs(-60);
+        titled.targets = {{NotificationTargetKind::Task, QStringLiteral("122889")},
+                          {NotificationTargetKind::Chat, QStringLiteral("chat42"), QStringLiteral("502")}};
         backend->notifications = {structured, titled};
         for (int i = 0; i < 16; ++i) {
             auto archived = titled;
             archived.id = QString::number(799 - i);
-            archived.createdAt = titled.createdAt.addSecs(-i - 1);
+            archived.title = QStringLiteral("Ошибка картриджа с тонером на принтере");
+            archived.text = i % 2 == 0 ? QStringLiteral("Иван Привезенцев стал наблюдателем")
+                : QStringLiteral("Закончились картриджи, информацию передали в ИТ");
+            archived.createdAt = titled.createdAt.addDays(-1).addSecs(-i * 124);
+            archived.read = i > 0;
             if (i == 15)
                 archived.markup = QStringLiteral("[URL=/tasks/task/view/999/]Старая задача[/URL]");
             backend->notifications.append(std::move(archived));
@@ -5835,6 +5844,7 @@ private slots:
         MainWindow window(backend.get(), true);
         window.resize(1000, 750);
         window.show();
+        QApplication::setActiveWindow(&window);
         auto *sections = window.findChild<QListWidget *>(QStringLiteral("sections"));
         QVERIFY(sections);
         sections->setCurrentRow(2);
@@ -5844,6 +5854,39 @@ private slots:
         QVERIFY(list->item(0)->data(workspace::Title).toString().isEmpty());
         QCOMPARE(list->item(1)->data(workspace::Title).toString(), titled.title);
         QVERIFY(list->item(0)->data(workspace::MarkupHtml).toString().contains(QStringLiteral("href=")));
+        QVERIFY(list->sizeHintForRow(1) < 100);
+        const auto presentation = [](const QListWidgetItem *item) {
+            return item->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
+        };
+        QCOMPARE(presentation(list->item(0)).day, QStringLiteral("Сегодня"));
+        QCOMPARE(presentation(list->item(2)).day, QStringLiteral("Вчера"));
+        QCOMPARE(presentation(list->item(1)).primaryTarget, 1);
+        QVERIFY(presentation(list->item(1)).excerpt.startsWith(QStringLiteral("После закрытия")));
+        emit backend->connectionChanged(true);
+        emit backend->notificationHistoryPageStateChanged(true, false);
+        auto *older = findAccessible<QPushButton>(&window, QStringLiteral("Более ранние уведомления"));
+        QVERIFY(older && older->isVisible());
+        QCoreApplication::processEvents();
+        QVERIFY(older->mapToGlobal(QPoint()).y() > list->mapToGlobal(list->rect().bottomLeft()).y());
+        const auto screenshot = qEnvironmentVariable("B24_NOTICE_SCREENSHOT");
+        if (!screenshot.isEmpty())
+            QVERIFY(window.grab().save(screenshot));
+        QVERIFY(backend->linkPreviewRequests.isEmpty());
+        const auto rowGap = list->visualItemRect(list->item(1)).top() -
+            static_cast<workspace::RowPainter *>(list->itemDelegate())
+                ->receiptArea(list->model()->index(0, 0), list->visualItemRect(list->item(0))).bottom();
+        QVERIFY(rowGap >= 10);
+        const auto collapsedHeight = list->sizeHintForRow(1);
+        list->setCurrentRow(1);
+        list->setFocus();
+        QTest::keyClick(list, Qt::Key_Return);
+        QTRY_VERIFY(list->sizeHintForRow(1) > collapsedHeight);
+        const auto expandedScreenshot = qEnvironmentVariable("B24_NOTICE_EXPANDED_SCREENSHOT");
+        if (!expandedScreenshot.isEmpty())
+            QVERIFY(window.grab().save(expandedScreenshot));
+        list->setCurrentRow(0);
+        QTest::keyClick(list, Qt::Key_Return);
+        QCOMPARE(list->sizeHintForRow(1), collapsedHeight);
         QTRY_COMPARE(backend->linkPreviewRequests.size(), 1);
         QCOMPARE(backend->linkPreviewRequests.constFirst().first.path(),
                  QStringLiteral("/workgroups/group/7/tasks/task/view/501/"));
@@ -5856,9 +5899,6 @@ private slots:
         QCOMPARE(list->sizeHintForRow(0), withoutPreviewHint);
         QCOMPARE(list->visualItemRect(list->item(0)).height(), withoutPreview);
         QTRY_VERIFY(list->visualItemRect(list->item(1)).top() > list->visualItemRect(list->item(0)).bottom());
-        const auto screenshot = qEnvironmentVariable("B24_NOTICE_SCREENSHOT");
-        if (!screenshot.isEmpty())
-            QVERIFY(list->viewport()->grab().save(screenshot));
         auto *painter = static_cast<workspace::RowPainter *>(list->itemDelegate());
         const auto index = list->model()->index(0, 0);
         const auto rect = list->visualRect(index);
@@ -5877,6 +5917,22 @@ private slots:
         QTest::mouseClick(list->viewport(), Qt::LeftButton, Qt::NoModifier, link);
         QTRY_VERIFY(window.findChild<QDialog *>(QStringLiteral("taskCardDialog")));
         QVERIFY(backend->noticeReadBatches.isEmpty());
+        window.findChild<QDialog *>(QStringLiteral("taskCardDialog"))->close();
+        auto *unread = findAccessible<QCheckBox>(&window, QStringLiteral("Только непрочитанные уведомления"));
+        QVERIFY(unread);
+        unread->setChecked(true);
+        QCOMPARE(list->item(0)->data(workspace::Id).toString(), titled.id);
+        list->setCurrentRow(0);
+        QApplication::setActiveWindow(&window);
+        list->setFocus();
+        QTest::keyClick(list, Qt::Key_Return);
+        QTRY_VERIFY(presentation(list->item(0)).expanded);
+        emit backend->notificationReadStateChanged({titled.id}, true);
+        QCOMPARE(list->item(0)->data(workspace::Id).toString(), titled.id);
+        QVERIFY(presentation(list->item(0)).expanded);
+        QTest::keyClick(list, Qt::Key_Return);
+        QTRY_COMPARE(list->count(), 1);
+        QVERIFY(list->item(0)->data(workspace::Id).toString() != titled.id);
     }
 
     void marksOnlyVisibleNotificationsAndWaitsForTheNextScroll()
@@ -6175,9 +6231,9 @@ private slots:
         auto *search = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск уведомлений"));
         auto *filter = findAccessible<QCheckBox>(&window, QStringLiteral("Только непрочитанные уведомления"));
         auto *sort = findAccessible<QComboBox>(&window, QStringLiteral("Порядок уведомлений"));
-        auto *read = findAccessible<QPushButton>(&window, QStringLiteral("Прочитать уведомление"));
+        auto *read = window.findChild<QAction *>(QStringLiteral("readNotice"));
         auto *readAll = findAccessible<QPushButton>(&window, QStringLiteral("Прочитать все уведомления"));
-        auto *remove = findAccessible<QPushButton>(&window, QStringLiteral("Удалить уведомление"));
+        auto *remove = window.findChild<QAction *>(QStringLiteral("deleteNotice"));
         QVERIFY(rows && search && filter && sort && read && readAll && remove);
         QCOMPARE(rows->count(), 2);
         rows->setCurrentRow(0);
@@ -6193,13 +6249,20 @@ private slots:
         emit backend->notificationsFound(search->text(), {old, recent});
         QCOMPARE(rows->count(), 1);
         QVERIFY(backend->noticeReadId.isEmpty());
-        read->click();
+        QApplication::setActiveWindow(&window);
+        rows->setFocus();
+        QTest::keyClick(rows, Qt::Key_F10, Qt::ShiftModifier);
+        auto *menu = rows->findChild<QMenu *>(QStringLiteral("noticeMenu"));
+        QTRY_VERIFY(menu && menu->isVisible());
+        QVERIFY(menu->actions().contains(read));
+        menu->setActiveAction(read);
+        QTest::keyClick(menu, Qt::Key_Return);
         QCOMPARE(backend->noticeReadId, recent.id);
         QCOMPARE(rows->count(), 1);
         QVERIFY(!remove->isEnabled());
         emit backend->failed(QStringLiteral("read-notification"), QStringLiteral("Не удалось"));
         QVERIFY(read->isEnabled());
-        read->click();
+        read->trigger();
         emit backend->notificationReadStateChanged({recent.id}, true);
         emit backend->notificationActionFinished(QStringLiteral("read-notification"));
         QCOMPARE(rows->count(), 0);
@@ -6213,7 +6276,7 @@ private slots:
             if (dialog)
                 dialog->button(QMessageBox::Yes)->click();
         });
-        remove->click();
+        remove->trigger();
         QCOMPARE(backend->noticeDeleteId, recent.id);
         QCOMPARE(rows->count(), 2);
         emit backend->notificationRemoved(recent.id);
@@ -6340,7 +6403,11 @@ private slots:
             QVERIFY(window.grab().save(capture));
         const auto first = notices->visualItemRect(notices->item(0));
         QTest::mouseClick(notices->viewport(), Qt::LeftButton, Qt::NoModifier,
-                          QPoint(first.left() + 50, first.bottom() - 20));
+                          QPoint(first.left() + 50, first.top() + 15));
+        QTRY_VERIFY(notices->item(0)->data(workspace::NoticePresentation).value<workspace::NoticeRow>().expanded);
+        const auto expanded = notices->visualItemRect(notices->item(0));
+        QTest::mouseClick(notices->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          QPoint(expanded.left() + 50, expanded.top() + 54));
         QTRY_COMPARE(backend->contextDialog, QStringLiteral("chat42"));
         QCOMPARE(backend->contextMessage, QStringLiteral("42"));
         auto *chats = findAccessible<QListWidget>(&window, QStringLiteral("Чаты задач"));
@@ -6369,7 +6436,7 @@ private slots:
             sections->setCurrentRow(2);
             notices->setCurrentRow(row);
             notices->setFocus();
-            QTest::keyClick(notices, Qt::Key_Return);
+            QTest::keyClick(notices, Qt::Key_Return, Qt::ControlModifier);
         };
         auto *searchToggle = findAccessible<QPushButton>(&window, QStringLiteral("Найти в чате"));
         auto *searchField = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск по сообщениям"));
@@ -9581,7 +9648,9 @@ private slots:
 
             sections->setCurrentRow(2);
             notices->setCurrentRow(0);
-            QTest::keyClick(notices, Qt::Key_Return);
+            QApplication::setActiveWindow(&window);
+            notices->setFocus();
+            QTest::keyClick(notices, Qt::Key_Return, Qt::ControlModifier);
             QCOMPARE(backend->contextDialog, dismissed.id);
             QCOMPARE(backend->contextMessage, QStringLiteral("421"));
             QVERIFY(!contains(chats, dismissed.id));
@@ -10770,7 +10839,9 @@ private slots:
         auto *notices = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
         QVERIFY(notices && notices->count() == 1);
         notices->setCurrentRow(0);
-        QTest::keyClick(notices, Qt::Key_Return);
+        QApplication::setActiveWindow(&window);
+        notices->setFocus();
+        QTest::keyClick(notices, Qt::Key_Return, Qt::ControlModifier);
         QCOMPARE(sections->currentRow(), 1);
         QCOMPARE(backend->projectRequests, 1);
         QVERIFY(search->text().isEmpty());
