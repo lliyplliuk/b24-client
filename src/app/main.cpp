@@ -552,7 +552,9 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
                 });
             }
         }
-        window->showNormal();
+        if (window->isMinimized())
+            window->setWindowState(window->windowState() & ~Qt::WindowMinimized);
+        window->show();
         if (cloud && creating && window->windowHandle())
             QObject::connect(window->windowHandle(), &QWindow::visibilityChanged, &tray, updateWorkspaceActivity);
         window->raise();
