@@ -86,6 +86,7 @@ constexpr int MessageCalendarDay = Qt::UserRole + 42;
 constexpr int MessageLinks = Qt::UserRole + 43;
 constexpr int CountPartial = Qt::UserRole + 44;
 constexpr int ChatMessagePreview = Qt::UserRole + 45;
+constexpr int NoticeTargets = Qt::UserRole + 46;
 
 struct NoticeRow {
     QString day;

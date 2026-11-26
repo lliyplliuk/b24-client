@@ -1320,6 +1320,7 @@ private slots:
             checkFirst(window, heart);
             backend->accountScope = QStringLiteral("reaction-frequency-portal-account-two");
             emit backend->accountScopeChanged();
+            emit backend->recentChatsLoaded(backend->chats);
             checkFirst(window, like);
         }
 
@@ -2566,6 +2567,19 @@ private slots:
         QCOMPARE(history->count(), 0);
     }
 
+    void switchingChatTabsClosesHistoryEvenWithoutASelectedChat()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->chats.clear();
+        MainWindow window(backend.get());
+        auto *tabs = window.findChild<QTabBar *>(QStringLiteral("chatScopeTabs"));
+        QVERIFY(tabs);
+        QSignalSpy closed(&window, &MainWindow::historyClosed);
+        tabs->setCurrentIndex(1);
+        QCOMPARE(closed.count(), 1);
+        QCOMPARE(closed.first().first().toBool(), false);
+    }
+
     void earlierHistoryKeepsViewportAndChatScope()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());
@@ -2660,6 +2674,64 @@ private slots:
         QTRY_COMPARE(taskHistory->count(), 2);
         QCOMPARE(taskHistory->item(0)->data(workspace::Id).toString(), QStringLiteral("600"));
         QVERIFY(!taskPager->isVisible());
+    }
+
+    void accountChangeClosesChatAndCardAndClearsDrafts()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->accountScope = QStringLiteral("fixture/drafts-first");
+        auto other = backend->chats.first();
+        other.id = QStringLiteral("chat42");
+        backend->chats.append(other);
+        MainWindow window(backend.get());
+        window.show();
+        auto *chats = findAccessible<QListWidget>(&window, QStringLiteral("Недавние чаты"));
+        auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
+        auto *input = findAccessible<QPlainTextEdit>(&window, QStringLiteral("Текст сообщения"));
+        QVERIFY(chats && history && input);
+        QTRY_COMPARE(chats->count(), 2);
+        chats->setCurrentRow(0);
+        input->setPlainText(QStringLiteral("Сохранённый черновик A"));
+        chats->setCurrentRow(1);
+        input->setPlainText(QStringLiteral("Открытый черновик A"));
+        auto *search = findAccessible<QLineEdit>(&window, QStringLiteral("Поиск по сообщениям"));
+        QVERIFY(search);
+        search->setText(QStringLiteral("Запрос A"));
+        emit search->returnPressed();
+        QCOMPARE(backend->searchedQuery, search->text());
+        const auto taskId = backend->stages.first().tasks.first().id;
+        window.openTaskCard(taskId);
+        QPointer<QDialog> card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
+        QVERIFY(card && card->isVisible());
+        auto *taskInput = findAccessible<QPlainTextEdit>(card, QStringLiteral("Текст в чате карточки"));
+        QVERIFY(taskInput);
+        taskInput->setPlainText(QStringLiteral("Комментарий A"));
+
+        emit backend->accountScopeChanged();
+        QCOMPARE(input->toPlainText(), QStringLiteral("Открытый черновик A"));
+        QVERIFY(card && card->isVisible());
+        backend->accountScope = QStringLiteral("fixture/drafts-second");
+        emit backend->accountScopeChanged();
+        QVERIFY(input->toPlainText().isEmpty());
+        QVERIFY(!input->isVisible());
+        QCOMPARE(history->count(), 0);
+        QVERIFY(!chats->currentItem());
+        QTRY_VERIFY(card.isNull());
+
+        emit backend->recentChatsLoaded(backend->chats);
+        for (int row = 0; row < 2; ++row) {
+            chats->setCurrentRow(row);
+            QVERIFY(input->isVisible());
+            QVERIFY(input->toPlainText().isEmpty());
+        }
+        search->setText(QStringLiteral("Запрос B"));
+        emit search->returnPressed();
+        QCOMPARE(backend->searchedQuery, search->text());
+        window.openTaskCard(taskId);
+        card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
+        QVERIFY(card && card->isVisible());
+        taskInput = findAccessible<QPlainTextEdit>(card, QStringLiteral("Текст в чате карточки"));
+        QVERIFY(taskInput && taskInput->toPlainText().isEmpty());
     }
 
     void replyDraftsStayScopedAndOpenExactOriginal()
@@ -4522,13 +4594,12 @@ private slots:
         window.openTaskCard(summary.id);
         card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
         QVERIFY(card);
-        title = findAccessible<QLabel>(card, QStringLiteral("Название открытой задачи"));
-        QVERIFY(title);
-        const auto initialTitle = title->text();
+        const QPointer<QDialog> previousCard(card);
         backend->accountScope = QStringLiteral("fixture/task-summary-second");
         emit backend->accountScopeChanged();
         emit backend->taskSummaryLoaded(summary);
-        QCOMPARE(title->text(), initialTitle);
+        QTRY_VERIFY(previousCard.isNull());
+        QVERIFY(!window.findChild<QDialog *>(QStringLiteral("taskCardDialog")));
         QCOMPARE(backend->taskChatReadRequests, QStringList{summary.id});
     }
 
@@ -4747,14 +4818,14 @@ private slots:
             QVERIFY(file.open(QIODevice::WriteOnly));
             QCOMPARE(file.write("content"), 7);
         }
-        const auto choose = [&window, attach](const QString &path) {
+        const auto choose = [&window](QPushButton *button, const QString &path) {
             QTimer::singleShot(0, &window, [path] {
                 if (auto *dialog = qobject_cast<QFileDialog *>(QApplication::activeModalWidget())) {
                     dialog->selectFile(path);
                     QMetaObject::invokeMethod(dialog, "accept", Qt::QueuedConnection);
                 }
             });
-            attach->click();
+            button->click();
         };
         QTRY_VERIFY(attach->isEnabled());
         if (description) {
@@ -4765,20 +4836,28 @@ private slots:
             editor->paste();
             QVERIFY(descriptionStatus->isVisible());
         } else {
-            choose(first);
+            choose(attach, first);
         }
         QCOMPARE(backend->attachedPath, first);
         QVERIFY(!attach->isEnabled());
+        const QPointer<QDialog> previousCard(card);
         backend->accountScope = QStringLiteral("fixture/existing-attachment-second");
         emit backend->accountScopeChanged();
-        emit backend->taskLoaded(task);
+        QTRY_VERIFY(previousCard.isNull());
+        window.openTaskCard(task.id);
+        card = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
+        QVERIFY(card);
+        attach = findAccessible<QPushButton>(card, QStringLiteral("Прикрепить файл к задаче"));
+        editor = findAccessible<QTextEdit>(card, QStringLiteral("Описание задачи"));
+        descriptionStatus = card->findChild<QLabel *>(QStringLiteral("taskDescriptionUploadStatus"));
+        QVERIFY(attach && editor && descriptionStatus);
         QVERIFY(attach->isEnabled());
         QVERIFY(descriptionStatus->isHidden());
         emit backend->taskFileAttached(task.id, QStringLiteral("n123456"));
         emit backend->fileUploaded(task.id, QStringLiteral("task"));
         QCOMPARE(backend->attachmentRequests.size(), 1);
         QVERIFY(!editor->toPlainText().contains(QStringLiteral("target.txt")));
-        choose(second);
+        choose(attach, second);
         QCOMPARE(backend->attachmentRequests.size(), 2);
         QCOMPARE(backend->attachedTask, task.id);
         QCOMPARE(backend->attachedPath, second);
@@ -6137,6 +6216,13 @@ private slots:
         QTRY_COMPARE(backend->noticeReadBatches.size(), 2);
         QCOMPARE(backend->noticeReadBatches.last(), QStringList{newNotice.id});
         QVERIFY(backend->noticeQuery.isEmpty());
+
+        emit list->customContextMenuRequested(list->visualItemRect(list->item(0)).center());
+        QPointer<QMenu> menu = list->findChild<QMenu *>(QStringLiteral("noticeMenu"));
+        QVERIFY(menu && menu->isVisible());
+        backend->accountScope = QStringLiteral("fixture/first-account");
+        emit backend->accountScopeChanged();
+        QVERIFY(!menu || !menu->isVisible());
     }
 
     void returnsToTheTopWhenReenteringNotifications()
@@ -6406,6 +6492,86 @@ private slots:
         QVERIFY(save && save->isVisible() && save->isEnabled());
         QTest::keyClick(dialog, Qt::Key_Escape);
         QTRY_VERIFY(!dialog || !dialog->isVisible());
+    }
+
+    void queuedNoticeClickHonorsActiveSection_data()
+    {
+        QTest::addColumn<bool>("leaveSection");
+        QTest::newRow("stay in notifications") << false;
+        QTest::newRow("leave before delivery") << true;
+    }
+
+    void queuedNoticeClickHonorsActiveSection()
+    {
+        QFETCH(bool, leaveSection);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        Notification notice;
+        notice.id = QStringLiteral("1");
+        notice.title = QStringLiteral("Сотрудник");
+        notice.read = true;
+        notice.targets = {{NotificationTargetKind::Person, QStringLiteral("19")}};
+        backend->notifications = {notice};
+        MainWindow window(backend.get());
+        window.show();
+        auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
+        auto *rows = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
+        QVERIFY(sections && rows);
+        sections->setCurrentRow(2);
+        QTRY_COMPARE(rows->count(), 1);
+        const auto clickRow = [&](const QPoint &offset) {
+            QTest::mouseClick(rows->viewport(), Qt::LeftButton, Qt::NoModifier,
+                              rows->visualItemRect(rows->item(0)).topLeft() + offset);
+        };
+        clickRow(QPoint(50, 15));
+        QTRY_VERIFY(rows->item(0)->data(workspace::NoticePresentation).value<workspace::NoticeRow>().expanded);
+        clickRow(QPoint(50, 54));
+        QVERIFY(backend->requestedPerson.isEmpty());
+        if (leaveSection)
+            sections->setCurrentRow(1);
+        QCoreApplication::processEvents();
+        QCOMPARE(backend->requestedPerson, leaveSection ? QString() : QStringLiteral("19"));
+        QCOMPARE(sections->currentRow(), leaveSection ? 1 : 2);
+    }
+
+    void reorderedNoticeOpensOwnTarget_data()
+    {
+        QTest::addColumn<bool>("useMenu");
+        QTest::newRow("shortcut") << false;
+        QTest::newRow("context menu") << true;
+    }
+
+    void reorderedNoticeOpensOwnTarget()
+    {
+        QFETCH(bool, useMenu);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        Notification first, second;
+        first.id = QStringLiteral("2");
+        first.targets = {{NotificationTargetKind::Person, QStringLiteral("18")}};
+        second.id = QStringLiteral("1");
+        second.targets = {{NotificationTargetKind::Person, QStringLiteral("19")}};
+        backend->notifications = {first, second};
+        MainWindow window(backend.get());
+        window.show();
+        QApplication::setActiveWindow(&window);
+        auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
+        auto *rows = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
+        QVERIFY(sections && rows);
+        sections->setCurrentRow(2);
+        QTRY_COMPARE(rows->count(), 2);
+        auto *moved = rows->takeItem(1);
+        rows->insertItem(0, moved);
+        QCOMPARE(moved->data(workspace::Id).toString(), second.id);
+        rows->setCurrentItem(moved);
+        rows->setFocus();
+        if (useMenu) {
+            emit rows->customContextMenuRequested(rows->visualItemRect(moved).center());
+            auto *menu = rows->findChild<QMenu *>(QStringLiteral("noticeMenu"));
+            QVERIFY(menu && !menu->actions().isEmpty());
+            menu->actions().first()->trigger();
+        } else {
+            QTest::keyClick(rows, Qt::Key_Return, Qt::ControlModifier);
+        }
+        QCOMPARE(backend->requestedPerson, QStringLiteral("19"));
     }
 
     void noticesOpenTypedObjectsAndContext()
@@ -7791,6 +7957,7 @@ private slots:
         // Account changes cancel raster requests without delivering a completion.
         backend->accountScope = QStringLiteral("fixture/preview-account-two");
         emit backend->accountScopeChanged();
+        emit backend->recentChatsLoaded(backend->chats);
         QTRY_COMPARE_WITH_TIMEOUT(backend->imageRequests.count(file.previewUrl), 2, 800);
         QCOMPARE(backend->imageRequests.count(other.previewUrl), 2);
     }
@@ -9637,9 +9804,18 @@ private slots:
                              QStringLiteral("101"), QStringLiteral("501")).isEmpty());
     }
 
+    void uploadsKeepDraftAndCorrelateReplies_data()
+    {
+        QTest::addColumn<bool>("changeAccount");
+        QTest::newRow("same account") << false;
+        QTest::newRow("late reply after account switch") << true;
+    }
+
     void uploadsKeepDraftAndCorrelateReplies()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());
+        QFETCH(bool, changeAccount);
+        backend->accountScope = QStringLiteral("fixture/upload-A");
         backend->holdUpload = true;
         MainWindow window(backend.get());
         window.show();
@@ -9667,6 +9843,25 @@ private slots:
         fileButton->click();
         QCOMPARE(backend->uploadedPath, path);
         QVERIFY(!fileButton->isEnabled());
+        if (changeAccount) {
+            backend->accountScope = QStringLiteral("fixture/upload-B");
+            emit backend->accountScopeChanged();
+            emit backend->recentChatsLoaded(backend->chats);
+            QVERIFY(fileButton->isEnabled());
+            composer->setPlainText(QStringLiteral("Черновик B"));
+            auto *status = findAccessible<QLabel>(&window, QStringLiteral("Состояние"));
+            QVERIFY(status);
+            const auto previousStatus = status->text();
+            const auto requests = backend->chatRefreshCalls;
+            emit backend->fileUploaded(backend->uploadedScope, QStringLiteral("chat"));
+            QCOMPARE(status->text(), previousStatus);
+            QCOMPARE(backend->chatRefreshCalls, requests);
+            emit backend->failed(QStringLiteral("upload-chat:") + backend->uploadedScope, QStringLiteral("Ошибка A"));
+            QCOMPARE(status->text(), previousStatus);
+            QCOMPARE(composer->toPlainText(), QStringLiteral("Черновик B"));
+            QVERIFY(fileButton->isEnabled());
+            return;
+        }
         emit backend->fileUploaded(QStringLiteral("c-1"), QStringLiteral("task"));
         emit backend->failed(QStringLiteral("upload-chat:c-9"), QStringLiteral("Другой запрос"));
         QVERIFY(!fileButton->isEnabled());
@@ -9826,6 +10021,7 @@ private slots:
         QVERIFY(check && check->isChecked());
         backend->accountScope = QStringLiteral("example.bitrix24.ru/second-user");
         emit backend->accountScopeChanged();
+        emit backend->recentChatsLoaded(backend->chats);
         QVERIFY(check->isEnabled());
         QVERIFY(!check->isChecked());
         QVERIFY(!contains(chats, dismissed.id));
@@ -9841,6 +10037,7 @@ private slots:
         QVERIFY(!contains(unscopedChats, dismissed.id));
         backend->accountScope = QStringLiteral("example.bitrix24.ru/first-user");
         emit backend->accountScopeChanged();
+        emit backend->recentChatsLoaded(backend->chats);
         QVERIFY(check->isEnabled());
         QVERIFY(check->isChecked());
         QVERIFY(contains(chats, dismissed.id));

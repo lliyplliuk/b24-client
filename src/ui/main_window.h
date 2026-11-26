@@ -132,6 +132,7 @@ private:
     void clearChatSearch();
     void clearMessageSearch();
     void showChatResults(const QVector<Chat> &chats, bool useSearchMode = true, bool backgroundRefresh = false);
+    void closeCurrentChat(bool scopeChanged = false);
     void openChatRow(const QListWidgetItem &item);
     void addMessageActions(QMenu &menu, const QPersistentModelIndex &message, const QString &dialog, bool taskChat,
                            const QString &href);
@@ -205,7 +206,7 @@ private:
     void resetLinkPreviews();
     void loadMessageLinkPreview(const QString &href);
     void updateAvatarRows();
-    void openNotificationTarget(int row, int target);
+    void openNotificationTarget(const QListWidgetItem *item, int target);
     void openNotificationTarget(NotificationTarget target);
     QListWidgetItem *noticeItem(const QString &id) const;
     void toggleNoticeDetails(QListWidgetItem *item);
@@ -247,7 +248,6 @@ private:
     void pickFile(const QString &scope, const QString &kind);
     void uploadPastedChatImage(ui::ChatComposer *composer, const QString &scope, bool task, const QString &caption);
     bool pastedChatImagePending(const QString &scope, bool task) const;
-    void clearPastedChatImages();
     void queueDescriptionFiles(const QString &taskId, const QStringList &paths);
     bool uploadNextDescriptionFile();
     void clearDescriptionUpload();
@@ -428,7 +428,6 @@ private:
 
     QListWidget *m_notifications = nullptr;
     QLabel *m_notificationsEmpty = nullptr;
-    QVector<QVector<NotificationTarget>> m_noticeTargets;
     QPointer<ClientUpdateFeed> m_clientUpdates;
     QVector<Notification> m_noticeHistory;
     QVector<Notification> m_noticeSearchResults;

@@ -550,25 +550,21 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
         if (scope != m_reactionAccountScope) {
             if (!m_reactionAccountScope.isEmpty()) {
                 m_chatImagePreviews.clear();
-                refreshChatMediaRows();
-                scheduleAvatars();
-                clearPastedChatImages();
+                m_pendingPastedChatImage = {};
                 resetNotificationAccount();
                 m_pendingCreateTask.clear();
                 m_pendingCreateSubtask.clear();
-                if (m_pendingUpload.startsWith(QStringLiteral("attach-task:"))) {
-                    if (m_card && m_pendingUpload == QStringLiteral("attach-task:") + m_card->taskId())
-                        m_card->setStatus({});
-                    m_pendingUpload.clear();
-                    m_uploadName.clear();
-                }
+                m_pendingUpload.clear();
+                m_uploadName.clear();
+                m_pendingChatId.clear();
+                m_pendingChatDraft = {};
+                m_pendingTaskId.clear();
+                m_pendingTaskDraft = {};
                 if (m_descriptionUploadCard)
                     m_descriptionUploadCard->descriptionEditor()->setUploadStatus({});
                 clearDescriptionUpload();
                 if (m_taskForm)
                     m_taskForm->done(QDialog::Rejected);
-                if (m_card && (m_card == m_pendingTaskEditCard || m_card == m_pendingTaskDeleteCard))
-                    m_card->setStatus({});
                 m_pendingTaskEdit.clear();
                 m_pendingTaskEditCard.clear();
                 m_pendingTaskEditProject.clear();
@@ -576,52 +572,30 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
                 m_pendingTaskDelete.clear();
                 m_pendingTaskDeleteCard.clear();
                 m_pendingTaskDeleteProject.clear();
-                m_cardSummaryPending = false;
-                if (m_card) {
-                    m_cardDetailsReady = false;
-                    m_card->cancelFooterDelegation();
+                if (m_card)
+                    m_card->done(QDialog::Rejected);
+                for (auto &directory : m_chatDirectories)
+                    directory = {};
+                m_chatSearchTimer->stop();
+                {
+                    const QSignalBlocker input(m_chatSearch);
+                    m_chatSearch->clear();
                 }
-                updateComposers();
-                updateWriteAvailability();
+                m_chats->clear();
+                ui::setStatusLabel(m_chatSearchProgress, {});
+                closeCurrentChat();
+                m_messageSearchToggle->setChecked(false);
+                // Closing either view saves its draft for ordinary navigation.
+                m_messageSearches.clear();
+                m_chatDrafts.clear();
+                m_taskDrafts.clear();
                 m_typingNames.clear();
                 m_typingNamesPending.clear();
-                m_chatComposer->cancelTyping();
-                m_chatComposer->clearTypingIndicator();
-                m_chatComposer->dismissMentionSearch();
-                if (m_card) {
-                    m_card->composer()->cancelTyping();
-                    m_card->composer()->clearTypingIndicator();
-                    m_card->composer()->dismissMentionSearch();
-                }
-                for (auto &directory : m_chatDirectories) {
-                    directory.recent.clear();
-                    directory.loaded = false;
-                }
-                auto &taskSearch = m_chatDirectories[1];
-                if (m_chatScope == 1 && (!taskSearch.query.isEmpty() || !m_chatSearch->text().isEmpty())) {
-                    m_chatSearchTimer->stop();
-                    const QSignalBlocker input(m_chatSearch);
-                    const QSignalBlocker results(m_chats);
-                    m_chatSearch->clear();
-                    m_chats->clear();
-                    ui::setStatusLabel(m_chatSearchProgress, {});
-                }
-                taskSearch.input.clear();
-                taskSearch.query.clear();
-                taskSearch.found.clear();
+                setStatus({});
+                updateWriteAvailability();
                 m_chatSource.clear();
                 m_taskChatPressActive = false;
                 m_taskChatRefreshDeferred = false;
-                if (!m_retainedTaskChat.id.isEmpty()) {
-                    const QSignalBlocker blocker(m_chats);
-                    for (int row = 0; row < m_chats->count(); ++row) {
-                        if (m_chats->item(row)->data(workspace::Id).toString() == m_retainedTaskChat.id) {
-                            delete m_chats->takeItem(row);
-                            m_chats->setCurrentItem(nullptr);
-                            break;
-                        }
-                    }
-                }
                 m_retainedTaskChat = {};
                 m_retainedTaskChatRow = -1;
                 closeProjectTaskChats();
@@ -2045,7 +2019,7 @@ QWidget *MainWindow::buildNotificationsPanel()
     delegate->setNoticeHandlers([this](const QModelIndex &index, int target) {
         QTimer::singleShot(0, this, [this, index = QPersistentModelIndex(index), target] {
             if (index.isValid())
-                openNotificationTarget(index.row(), target);
+                openNotificationTarget(m_notifications->item(index.row()), target);
         });
     }, [this](const QModelIndex &index) {
         toggleNoticeDetails(m_notifications->item(index.row()));
@@ -2065,7 +2039,7 @@ QWidget *MainWindow::buildNotificationsPanel()
             &QAction::triggered, this, [this] {
         if (const auto *item = m_notifications->currentItem()) {
             const auto notice = item->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
-            openNotificationTarget(m_notifications->row(item), notice.primaryTarget);
+            openNotificationTarget(item, notice.primaryTarget);
         }
     });
     connect(noticeShortcut({QKeySequence(Qt::Key_Menu), QKeySequence(Qt::SHIFT | Qt::Key_F10)}),
@@ -3902,6 +3876,30 @@ void MainWindow::requestCurrentChatList()
         m_backend->requestTaskChats();
 }
 
+void MainWindow::closeCurrentChat(bool scopeChanged)
+{
+    m_chatComposer->dismissEmoji();
+    switchDraft(m_chatComposer, m_chatDrafts, m_currentChatId, {});
+    if (scopeChanged || !m_currentChatId.isEmpty())
+        emit historyClosed(false);
+    m_currentChatId.clear();
+    static_cast<ui::HistoryList *>(m_chatMessages)->resetHistory();
+    resetMessageContext();
+    clearMessageSearch();
+    m_chatTitle->setText(m_chatTabs->tabText(m_chatScope));
+    m_chatTitle->setToolTip({});
+    m_chatAvatar->setTitle({});
+    m_chatContactIsPerson = false;
+    updateChatContactPresentation();
+    m_chatPinned->setMessages({});
+    m_chatAvatarUrl.clear();
+    m_openChatTaskId.clear();
+    m_openChatTask->hide();
+    m_chatComposer->hide();
+    showEmpty(m_chatMessages, m_chatEmpty, QStringLiteral("Выберите чат"));
+    updateComposers();
+}
+
 void MainWindow::onChatScopeChanged(int scope)
 {
     if (scope < 0 || scope > 1 || scope == m_chatScope)
@@ -3909,13 +3907,8 @@ void MainWindow::onChatScopeChanged(int scope)
     m_chatSearchTimer->stop();
     ui::setStatusLabel(m_chatSearchProgress, {});
     m_chatDirectories[m_chatScope].input = m_chatSearch->text();
-    m_chatComposer->dismissEmoji();
-    switchDraft(m_chatComposer, m_chatDrafts, m_currentChatId, {});
-    m_currentChatId.clear();
-    emit historyClosed(false);
-    static_cast<ui::HistoryList *>(m_chatMessages)->resetHistory();
     m_chatScope = scope;
-    resetMessageContext();
+    closeCurrentChat(true);
     auto &directory = m_chatDirectories[scope];
     {
         const QSignalBlocker blocker(m_chatSearch);
@@ -3926,26 +3919,7 @@ void MainWindow::onChatScopeChanged(int scope)
     m_chatSearch->setPlaceholderText(scope == 0 ? searchLabel : QStringLiteral("Название или номер задачи"));
     m_createGroupChat->setVisible(scope == 0 && !m_readOnly && !m_backend->isDemo());
     m_chats->setAccessibleName(scope == 0 ? QStringLiteral("Недавние чаты") : QStringLiteral("Чаты задач"));
-    m_messageSearchTimer->stop();
-    {
-        const QSignalBlocker blocker(m_messageSearch);
-        m_messageSearch->clear();
-    }
-    m_messageSearchActive = false;
-    m_messageSearchQuery.clear();
-    m_messageSearchScope.clear();
-    m_chatTitle->setText(m_chatTabs->tabText(scope));
-    m_chatAvatar->setTitle({});
-    m_chatContactIsPerson = false;
-    updateChatContactPresentation();
-    m_chatPinned->setMessages({});
-    m_chatAvatarUrl.clear();
-    m_openChatTaskId.clear();
-    m_openChatTask->hide();
-    m_chatComposer->hide();
-    showEmpty(m_chatMessages, m_chatEmpty, QStringLiteral("Выберите чат"));
-    setStatus(QString());
-    updateComposers();
+    setStatus({});
     if (!directory.query.isEmpty()) {
         const auto &initial = std::any_of(directory.found.cbegin(), directory.found.cend(), [&directory](const Chat &chat) {
             return chat.id == directory.selected;
@@ -4316,22 +4290,7 @@ void MainWindow::showChatResults(const QVector<Chat> &chats, bool useSearchMode,
         const std::unique_ptr<QListWidgetItem> item(ui::addChatRow(nullptr, hiddenLinked));
         openChatRow(*item);
     } else if (!searching && !(m_unreadOnlyChats && !m_currentChatId.isEmpty())) {
-        switchDraft(m_chatComposer, m_chatDrafts, m_currentChatId, {});
-        if (!m_currentChatId.isEmpty())
-            emit historyClosed(false);
-        m_currentChatId.clear();
-        static_cast<ui::HistoryList *>(m_chatMessages)->resetHistory();
-        m_chatTitle->setText(m_chatTabs->tabText(m_chatScope));
-        m_chatAvatar->setTitle({});
-        m_chatContactIsPerson = false;
-        updateChatContactPresentation();
-        m_chatPinned->setMessages({});
-        m_chatAvatarUrl.clear();
-        m_openChatTaskId.clear();
-        m_openChatTask->hide();
-        m_chatComposer->hide();
-        showEmpty(m_chatMessages, m_chatEmpty, QStringLiteral("Выберите чат"));
-        updateComposers();
+        closeCurrentChat();
     }
     updateAvatarRows();
     scheduleAvatars();
@@ -5133,7 +5092,6 @@ void MainWindow::resetNotificationAccount()
         m_noticeAction.clear();
         setStatus(QString());
     }
-    m_noticeTargets.clear();
     if (m_lastSection == 2) {
         showNotifications(false, false);
     } else {
@@ -5172,7 +5130,6 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
     const auto anchor = preserveScroll ? listViewportAnchor(m_notifications) : ListViewportAnchor{};
     const QSignalBlocker blocker(m_notifications);
     const QSignalBlocker scrollBlocker(m_notifications->verticalScrollBar());
-    m_noticeTargets.clear();
     if (notices.isEmpty()) {
         const bool loading = remoteSearch ? m_noticeSearchPending : m_noticeHistoryState == NoticeHistoryState::Loading;
         auto message = QStringLiteral("Уведомлений пока нет");
@@ -5204,7 +5161,7 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
         auto *item = workspace::addMarkupRow(m_notifications, title, content,
                                             clockLabel(notice.createdAt), notice.id);
         item->setData(workspace::Count, !notice.read);
-        m_noticeTargets.append(notice.targets);
+        item->setData(workspace::NoticeTargets, QVariant::fromValue(notice.targets));
         workspace::NoticeRow row;
         const auto day = notice.createdAt.toLocalTime().date();
         if (day.isValid() && day != previousDay)
@@ -5393,11 +5350,15 @@ void MainWindow::showNoticeMenu(QListWidgetItem *item, const QPoint &position)
     const auto id = item->data(workspace::Id).toString();
     auto *menu = new QMenu(m_notifications);
     menu->setObjectName(QStringLiteral("noticeMenu"));
+    connect(m_backend, &Backend::accountScopeChanged, menu, [this, menu, scope = m_backend->settingsScope()] {
+        if (m_backend->settingsScope() != scope)
+            menu->close();
+    });
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
     connect(menu, &QMenu::aboutToHide, this, [this] {
         QTimer::singleShot(0, this, &MainWindow::scheduleVisibleNoticeRead);
     });
-    const auto &targets = m_noticeTargets.at(m_notifications->row(item));
+    const auto targets = item->data(workspace::NoticeTargets).value<QVector<NotificationTarget>>();
     const auto notice = item->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
     const auto addTarget = [this, menu, id](const QString &label, const NotificationTarget &target) {
         connect(menu->addAction(label), &QAction::triggered, menu, [this, id, target] {
@@ -5405,7 +5366,7 @@ void MainWindow::showNoticeMenu(QListWidgetItem *item, const QPoint &position)
                 openNotificationTarget(target);
         });
     };
-    if (notice.primaryTarget >= 0)
+    if (notice.primaryTarget >= 0 && notice.primaryTarget < targets.size())
         addTarget(notice.primaryLabel, targets[notice.primaryTarget]);
     for (int n = 0; n < targets.size(); ++n)
         if (n != notice.primaryTarget)
@@ -5452,13 +5413,13 @@ void MainWindow::scheduleOlderNotifications()
     });
 }
 
-void MainWindow::openNotificationTarget(int row, int action)
+void MainWindow::openNotificationTarget(const QListWidgetItem *item, int action)
 {
-    if (m_lastSection != 2 || row < 0 || row >= m_noticeTargets.size())
+    if (m_lastSection != 2 || !item)
         return;
-    if (action < 0 || action >= m_noticeTargets[row].size())
-        return;
-    openNotificationTarget(m_noticeTargets[row][action]);
+    const auto targets = item->data(workspace::NoticeTargets).value<QVector<NotificationTarget>>();
+    if (action >= 0 && action < targets.size())
+        openNotificationTarget(targets[action]);
 }
 
 void MainWindow::openNotificationTarget(NotificationTarget target)
@@ -6223,27 +6184,6 @@ bool MainWindow::pastedChatImagePending(const QString &scope, bool task) const
 {
     return m_pendingPastedChatImage.image && m_pendingUpload ==
         (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scope;
-}
-
-void MainWindow::clearPastedChatImages()
-{
-    if (m_pendingPastedChatImage.image) {
-        m_pendingPastedChatImage = {};
-        m_pendingUpload.clear();
-        m_uploadName.clear();
-    }
-    for (auto *drafts : {&m_chatDrafts, &m_taskDrafts}) {
-        for (auto entry = drafts->begin(); entry != drafts->end();) {
-            entry->image.reset();
-            if (entry->isEmpty())
-                entry = drafts->erase(entry);
-            else
-                ++entry;
-        }
-    }
-    m_chatComposer->forgetDraftImages();
-    if (m_card)
-        m_card->composer()->forgetDraftImages();
 }
 
 void MainWindow::pickFile(const QString &scope, const QString &kind)
