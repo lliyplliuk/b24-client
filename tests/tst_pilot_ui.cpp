@@ -6048,6 +6048,40 @@ private slots:
         QVERIFY(backend->noticeQuery.isEmpty());
     }
 
+    void returnsToTheTopWhenReenteringNotifications()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        const auto newest = QDateTime::currentDateTimeUtc();
+        for (int row = 0; row < 30; ++row) {
+            Notification notice;
+            notice.id = QString::number(1000 - row);
+            notice.text = QStringLiteral("Уведомление %1").arg(row);
+            notice.createdAt = newest.addSecs(-row);
+            notice.read = true;
+            backend->notifications.append(notice);
+        }
+        MainWindow window(backend.get(), true);
+        window.resize(780, 500);
+        window.show();
+        auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
+        auto *list = findAccessible<QListWidget>(&window, QStringLiteral("Уведомления"));
+        QVERIFY(sections && list);
+        sections->setCurrentRow(2);
+        QTRY_COMPARE(list->count(), 30);
+
+        auto *scroll = list->verticalScrollBar();
+        list->scrollToBottom();
+        QVERIFY(scroll->value() > scroll->minimum());
+        const auto position = scroll->value();
+        emit backend->notificationsLoaded(backend->notifications);
+        QCOMPARE(scroll->value(), position);
+
+        sections->setCurrentRow(0);
+        sections->setCurrentRow(2);
+        QCOMPARE(scroll->value(), scroll->minimum());
+        QCOMPARE(list->indexAt(QPoint(4, 0)).row(), 0);
+    }
+
     void loadsEarlierNotificationsOnlyOnExplicitRequest()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());

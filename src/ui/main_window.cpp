@@ -2133,6 +2133,8 @@ void MainWindow::onSectionChanged(int index)
     emit activeSectionChanged(index);
     setStatus(QString());
     refreshCurrentSection(false);
+    if (index == 2)
+        m_notifications->scrollToTop();
     if (index == 1 && !m_projectSearchDisplayed)
         runProjectTaskSearch();
 }
