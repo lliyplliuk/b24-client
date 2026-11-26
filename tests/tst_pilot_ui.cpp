@@ -6785,6 +6785,31 @@ private slots:
         QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), QStringLiteral("101"));
     }
 
+    void destroyingPopulatedHistoryCancelsPendingAlignment()
+    {
+        auto history = std::make_unique<ui::HistoryList>(nullptr);
+        int viewportChanges = 0;
+        history->setOnViewportChanged([&] { ++viewportChanges; });
+        history->addItem(QStringLiteral("message"));
+        history.reset();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+        QCOMPARE(viewportChanges, 0);
+    }
+
+    void previewWindowHideDoesNotCommitAnEditor()
+    {
+        QWidget window;
+        QListWidget list(&window);
+        auto *delegate = workspace::configureRows(&list, workspace::Row::Message);
+        QSignalSpy commits(delegate, &QAbstractItemDelegate::commitData);
+        QSignalSpy closes(delegate, &QAbstractItemDelegate::closeEditor);
+        window.show();
+        delegate->setPreviewAnimation(true);
+        window.hide();
+        QCOMPARE(commits.count(), 0);
+        QCOMPARE(closes.count(), 0);
+    }
+
     void forwardedVideoShowsPosterAndOpensLocalOriginal_data()
     {
         QTest::addColumn<bool>("clickWhileDownloading");

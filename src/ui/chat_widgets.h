@@ -385,6 +385,17 @@ public:
         });
     }
 
+    ~HistoryList() override
+    {
+        // m_wheelAnimation dies before QWidget deletes children (model, scrollbar);
+        // their signals must not reach lambdas that touch the animation.
+        m_wheelAnimation.stop();
+        if (model())
+            QObject::disconnect(model(), nullptr, this, nullptr);
+        QObject::disconnect(verticalScrollBar(), nullptr, this, nullptr);
+        QObject::disconnect(verticalScrollBar(), nullptr, &m_wheelAnimation, nullptr);
+    }
+
     void setOnViewportChanged(std::function<void()> handler) { m_onViewportChanged = std::move(handler); }
     bool showingLiveHistory() const { return m_liveReadHistory && !m_browsingOlder; }
     void setLiveReadHistory(bool live)

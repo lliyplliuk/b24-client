@@ -1361,8 +1361,13 @@ private:
 
     bool eventFilter(QObject *object, QEvent *event) override
     {
-        if (object == m_previewWindow && event->type() == QEvent::WindowStateChange)
-            updatePreviewClock();
+        if (object == m_previewWindow) {
+            // The base editor filter would treat the window's Hide/FocusOut as an editor
+            // closing and commit data for an editor that is not in this view.
+            if (event->type() == QEvent::WindowStateChange)
+                updatePreviewClock();
+            return false;
+        }
         if (object == m_previewViewport && (event->type() == QEvent::Show || event->type() == QEvent::Hide
                                             || event->type() == QEvent::StyleChange))
             updatePreviewClock();
