@@ -1,3 +1,4 @@
+#include "core/operations.h"
 #include "core/demo_backend.h"
 #include "core/stage_color.h"
 #include "core/tunables.h"
@@ -203,7 +204,7 @@ void DemoBackend::requestProjectBoard(const QString &projectId)
 {
     emitLater([this, projectId] {
         if (projectId.isEmpty() || !m_boards.contains(projectId)) {
-            emit failed(QStringLiteral("board:") + projectId, QStringLiteral("Проект не найден"));
+            emit failed(operationKey(OperationKind::Board, projectId), QStringLiteral("Проект не найден"));
             return;
         }
         auto stages = m_boards.value(projectId);
@@ -218,7 +219,7 @@ void DemoBackend::requestProjectTimeline(const QString &projectId)
     emitLater([this, projectId] {
         const auto board = m_boards.constFind(projectId);
         if (projectId.isEmpty() || board == m_boards.cend()) {
-            emit failed(QStringLiteral("timeline:") + projectId, QStringLiteral("Проект не найден"));
+            emit failed(operationKey(OperationKind::Timeline, projectId), QStringLiteral("Проект не найден"));
             return;
         }
         QVector<Task> tasks;
@@ -235,7 +236,7 @@ void DemoBackend::requestTask(const QString &taskId)
             emit taskLoaded(*task);
             return;
         }
-        emit failed(QStringLiteral("task:") + taskId, QStringLiteral("Задача не найдена"));
+        emit failed(operationKey(OperationKind::Task, taskId), QStringLiteral("Задача не найдена"));
     });
 }
 
@@ -267,7 +268,7 @@ void DemoBackend::requestTaskMessages(const QString &taskId)
 {
     emitLater([this, taskId] {
         if (!m_taskMessages.contains(taskId)) {
-            emit failed(QStringLiteral("task-messages:") + taskId, QStringLiteral("Чат задачи не найден"));
+            emit failed(operationKey(OperationKind::TaskMessages, taskId), QStringLiteral("Чат задачи не найден"));
             return;
         }
         emit taskMessagesLoaded(taskId, latest(m_taskMessages.value(taskId), tunables::kPageSizeMessages));
@@ -308,9 +309,9 @@ void DemoBackend::sendMessage(const QString &scopeId, const QString &text, bool 
     emitLater([this, scopeId, text, task] {
         const bool taskChat = task || m_taskMessages.contains(scopeId);
         auto &history = taskChat ? m_taskMessages : m_chatMessages;
-        const auto scope = (task ? QStringLiteral("task:") : QStringLiteral("chat:")) + scopeId;
+        const auto scope = operationKey(task ? OperationKind::Task : OperationKind::Chat, scopeId);
         if (text.trimmed().isEmpty() || !history.contains(scopeId)) {
-            emit failed(QStringLiteral("send:") + scope, QStringLiteral("Сообщение не отправлено"));
+            emit failed(operationKey(task ? OperationKind::SendTask : OperationKind::SendChat, scopeId), QStringLiteral("Сообщение не отправлено"));
             return;
         }
         const auto id = QStringLiteral("demo-%1").arg(++m_nextMessageId);
@@ -352,10 +353,10 @@ void DemoBackend::updateTask(const QString &taskId, const TaskEdit &edit)
     emitLater([this, taskId, edit] {
         auto *task = findTask(taskId);
         if (!task || (edit.title && edit.title->trimmed().isEmpty())) {
-            emit failed(QStringLiteral("update-task:") + taskId, QStringLiteral("Проверьте задачу и её название"));
+            emit failed(operationKey(OperationKind::UpdateTask, taskId), QStringLiteral("Проверьте задачу и её название"));
             return;
         }
-        const auto operation = QStringLiteral("update-task:") + taskId;
+        const auto operation = operationKey(OperationKind::UpdateTask, taskId);
         const auto creator = edit.creatorId ? demoPersonName(*edit.creatorId) : QString();
         const auto assignee = edit.assigneeId ? demoPersonName(*edit.assigneeId) : QString();
         if ((edit.creatorId && creator.isEmpty()) || (edit.assigneeId && assignee.isEmpty())
@@ -468,7 +469,7 @@ void DemoBackend::createTask(const QString &projectId, const TaskEdit &edit)
 void DemoBackend::createSubtask(const QString &parentId, const QString &projectId, const TaskEdit &edit)
 {
     if (parentId.isEmpty()) {
-        emitLater([this] { emit failed(QStringLiteral("create-subtask:"), QStringLiteral("Родительская задача не найдена")); });
+        emitLater([this] { emit failed(operationKey(OperationKind::CreateSubtask, QString{}), QStringLiteral("Родительская задача не найдена")); });
         return;
     }
     createTaskInBoard(projectId, parentId, edit);
@@ -478,7 +479,7 @@ void DemoBackend::createTaskInBoard(const QString &projectId, const QString &par
 {
     emitLater([this, projectId, parentId, edit] {
         const bool child = !parentId.isEmpty();
-        const auto operation = child ? QStringLiteral("create-subtask:") + parentId : QStringLiteral("create-task:") + projectId;
+        const auto operation = child ? operationKey(OperationKind::CreateSubtask, parentId) : operationKey(OperationKind::CreateTask, projectId);
         if (child && !findTask(parentId)) {
             emit failed(operation, QStringLiteral("Родительская задача не найдена"));
             return;
@@ -536,7 +537,7 @@ void DemoBackend::createProject(const QString &name)
 {
     emitLater([this, name] {
         if (name.trimmed().isEmpty()) {
-            emit failed(QStringLiteral("create-project"), QStringLiteral("Введите название проекта"));
+            emit failed(operationKey(OperationKind::CreateProject), QStringLiteral("Введите название проекта"));
             return;
         }
         const auto id = QStringLiteral("p-%1").arg(++m_nextProjectId);
@@ -569,7 +570,7 @@ void DemoBackend::moveTask(const QString &projectId, const QString &taskId, cons
                 }
             }
         }
-        emit failed(QStringLiteral("board-edit:") + projectId, QStringLiteral("Задача или стадия не найдена"));
+        emit failed(operationKey(OperationKind::BoardEdit, projectId), QStringLiteral("Задача или стадия не найдена"));
     });
 }
 
@@ -578,7 +579,7 @@ void DemoBackend::saveStage(const QString &projectId, const QString &stageId, co
 {
     emitLater([this, projectId, stageId, title, afterStageId, color] {
         auto board = m_boards.find(projectId);
-        const auto op = QStringLiteral("board-edit:") + projectId;
+        const auto op = operationKey(OperationKind::BoardEdit, projectId);
         const auto requestedColor = normalizedStageColor(color);
         if (!color.isEmpty() && requestedColor.isEmpty()) {
             emit failed(op, QStringLiteral("Укажите цвет стадии в формате RRGGBB"));
@@ -634,7 +635,7 @@ void DemoBackend::deleteStage(const QString &projectId, const QString &stageId)
                 return;
             }
         }
-        emit failed(QStringLiteral("board-edit:") + projectId, QStringLiteral("Стадию нельзя удалить"));
+        emit failed(operationKey(OperationKind::BoardEdit, projectId), QStringLiteral("Стадию нельзя удалить"));
     });
 }
 
@@ -674,7 +675,7 @@ void DemoBackend::setChatPinned(const QString &dialogId, bool pinned)
                 }
             }
         }
-        emit failed(QStringLiteral("chat-pin:") + dialogId, QStringLiteral("Чат не найден"));
+        emit failed(operationKey(OperationKind::ChatPin, dialogId), QStringLiteral("Чат не найден"));
     });
 }
 
@@ -688,7 +689,7 @@ void DemoBackend::setProjectPinned(const QString &projectId, bool pinned)
                 return;
             }
         }
-        emit failed(QStringLiteral("project-pin:") + projectId, QStringLiteral("Проект не найден"));
+        emit failed(operationKey(OperationKind::ProjectPin, projectId), QStringLiteral("Проект не найден"));
     });
 }
 
@@ -697,7 +698,7 @@ void DemoBackend::searchProjectTasks(const QString &projectId, const QString &qu
     emitLater([this, projectId, query] {
         const auto board = m_boards.constFind(projectId);
         if (board == m_boards.cend()) {
-            emit failed(QStringLiteral("search-project-tasks:") + projectId, QStringLiteral("Проект не найден"));
+            emit failed(operationKey(OperationKind::SearchProjectTasks, projectId), QStringLiteral("Проект не найден"));
             return;
         }
         const auto needle = query.trimmed();
@@ -725,7 +726,7 @@ void DemoBackend::searchMessages(const QString &scopeId, const QString &query, b
         const auto &history = task ? m_taskMessages : m_chatMessages;
         const auto items = history.constFind(scopeId);
         if (items == history.cend()) {
-            emit failed((task ? QStringLiteral("search-task-chat:") : QStringLiteral("search-chat:")) + scopeId,
+            emit failed(operationKey(task ? OperationKind::SearchTaskChat : OperationKind::SearchChat, scopeId),
                         QStringLiteral("Чат не найден"));
             return;
         }
@@ -749,7 +750,7 @@ void DemoBackend::uploadChatFile(const QString &scopeId, const QString &localPat
 void DemoBackend::uploadChatImage(const QString &scopeId, const QString &localPath, bool task, const QString &caption,
                                   std::shared_ptr<QTemporaryDir> temporaryDirectory)
 {
-    const auto operation = (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scopeId;
+    const auto operation = operationKey(task ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scopeId);
     if (caption.size() > tunables::kChatImageCaptionCharacters) {
         emit failed(operation, QStringLiteral("Подпись к изображению может содержать не больше 20 000 символов"));
         return;
@@ -769,7 +770,7 @@ void DemoBackend::uploadChatAttachment(const QString &scopeId, const QString &lo
         auto &history = task ? m_taskMessages : m_chatMessages;
         const QFileInfo file(localPath);
         if (!file.isFile() || !file.isReadable() || !history.contains(scopeId)) {
-            emit failed((task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scopeId,
+            emit failed(operationKey(task ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scopeId),
                         QStringLiteral("Файл или чат недоступен"));
             return;
         }
@@ -785,7 +786,7 @@ void DemoBackend::attachTaskFile(const QString &taskId, const QString &localPath
         const QFileInfo file(localPath);
         auto *task = findTask(taskId);
         if (!file.isFile() || !file.isReadable() || !task) {
-            emit failed(QStringLiteral("attach-task:") + taskId, QStringLiteral("Файл или задача недоступны"));
+            emit failed(operationKey(OperationKind::AttachTask, taskId), QStringLiteral("Файл или задача недоступны"));
             return;
         }
         task->attachments.append(file.fileName());

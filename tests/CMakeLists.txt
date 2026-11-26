@@ -5,6 +5,7 @@ function(bx_add_test name)
     set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endfunction()
 
+bx_add_test(tst_operations)
 bx_add_test(tst_demo_backend)
 bx_add_test(tst_origin_guard)
 bx_add_test(tst_cloud_backend)

@@ -15,6 +15,7 @@
 #include "core/download_target.h"
 #include "core/notification_targets.h"
 #include "core/origin_guard.h"
+#include "core/operations.h"
 
 #include <QAction>
 #include <QTabBar>
@@ -701,7 +702,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
         scheduleAvatars();
     });
     connect(m_backend, &Backend::chatPinChanged, this, [this](const QString &id, bool pinned) {
-        m_pendingPins.remove(QStringLiteral("chat-pin:") + id);
+        m_pendingPins.remove(operationKey(OperationKind::ChatPin, id));
         for (auto &directory : m_chatDirectories) {
             for (auto *chats : {&directory.recent, &directory.found})
                 for (auto &chat : *chats)
@@ -750,7 +751,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
             m_card->setPinnedMessages(messages);
     });
     connect(m_backend, &Backend::projectPinChanged, this, [this](const QString &id, bool pinned) {
-        m_pendingPins.remove(QStringLiteral("project-pin:") + id);
+        m_pendingPins.remove(operationKey(OperationKind::ProjectPin, id));
         for (auto &project : m_projectDirectory)
             if (project.id == id)
                 project.pinned = pinned;
@@ -1081,8 +1082,8 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     connect(m_backend, &Backend::notificationReadStateChanged, this,
             [this](const QStringList &ids, bool read) {
         if (read && m_noticeUnreadOnly->isChecked() && ids.contains(m_noticeExpandedId)
-            && (m_noticeAction == QStringLiteral("read-notification") ||
-                m_noticeAction == QStringLiteral("read-all-notifications")))
+            && (m_noticeAction == operationKey(OperationKind::ReadNotification) ||
+                m_noticeAction == operationKey(OperationKind::ReadAllNotifications)))
             m_noticeExpandedId.clear();
         for (auto *source : {&m_noticeHistory, &m_noticeSearchResults})
             for (auto &notice : *source)
@@ -1104,7 +1105,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
             showNotifications(false);
     });
     connect(m_backend, &Backend::notificationActionFinished, this, [this](const QString &action) {
-        if (action == QLatin1String("read-notifications"))
+        if (parseOperation(action).kind == OperationKind::ReadNotifications)
             finishVisibleNoticeRead(true);
         if (m_noticeAction == action) {
             m_noticeAction.clear();
@@ -1114,12 +1115,12 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     });
 
     connect(m_backend, &Backend::messageSent, this, [this](const QString &scope, const QString &) {
-        if (!m_pendingChatId.isEmpty() && scope == QStringLiteral("chat:") + m_pendingChatId) {
+        if (!m_pendingChatId.isEmpty() && scope == operationKey(OperationKind::Chat, m_pendingChatId)) {
             clearSentDraft(m_chatComposer, m_chatDrafts, m_currentChatId, m_pendingChatId, m_pendingChatDraft);
             m_pendingChatId.clear();
             m_pendingChatDraft = {};
             setStatus(QString());
-        } else if (!m_pendingTaskId.isEmpty() && scope == QStringLiteral("task:") + m_pendingTaskId) {
+        } else if (!m_pendingTaskId.isEmpty() && scope == operationKey(OperationKind::Task, m_pendingTaskId)) {
             if (m_card && m_card->taskId() == m_pendingTaskId) {
                 clearSentDraft(m_card->composer(), m_taskDrafts, m_card->taskId(),
                                m_pendingTaskId, m_pendingTaskDraft);
@@ -1906,12 +1907,13 @@ QWidget *MainWindow::buildNotificationsPanel()
             ui::setLoadingIndicator(status, false);
         });
         connect(m_backend, &Backend::failed, dialog, [dialog, status, retry](const QString &action, const QString &reason) {
-            if (action == QStringLiteral("notification-settings-update") ||
-                (action == QStringLiteral("notification-settings") && dialog->property("pendingSetting").toString().isEmpty())) {
+            const auto kind = parseOperation(action).kind;
+            if (kind == OperationKind::NotificationSettingsUpdate ||
+                (kind == OperationKind::NotificationSettings && dialog->property("pendingSetting").toString().isEmpty())) {
                 dialog->setProperty("pendingSetting", QString());
                 status->setText(reason);
                 ui::setLoadingIndicator(status, false);
-                if (action == QStringLiteral("notification-settings"))
+                if (kind == OperationKind::NotificationSettings)
                     retry->show();
             }
         });
@@ -1991,7 +1993,7 @@ QWidget *MainWindow::buildNotificationsPanel()
             m_clientUpdates->markRead();
             return;
         }
-        beginAction(QStringLiteral("read-notification"));
+        beginAction(operationKey(OperationKind::ReadNotification));
         m_backend->markNotificationRead(id);
     });
     connect(m_noticeReadAll, &QPushButton::clicked, this, [this, beginAction] {
@@ -2001,7 +2003,7 @@ QWidget *MainWindow::buildNotificationsPanel()
             m_clientUpdates->markRead();
         if (!writable() || (m_noticeHistory.isEmpty() && m_noticeSearchResults.isEmpty()))
             return;
-        beginAction(QStringLiteral("read-all-notifications"));
+        beginAction(operationKey(OperationKind::ReadAllNotifications));
         m_backend->markAllNotificationsRead();
     });
     connect(m_noticeDelete, &QAction::triggered, this, [this, beginAction] {
@@ -2013,7 +2015,7 @@ QWidget *MainWindow::buildNotificationsPanel()
                 QStringLiteral("Удалить выбранное уведомление?"), QMessageBox::Yes | QMessageBox::Cancel,
                 QMessageBox::Cancel) != QMessageBox::Yes || !writable() || !m_noticeAction.isEmpty())
             return;
-        beginAction(QStringLiteral("delete-notification"));
+        beginAction(operationKey(OperationKind::DeleteNotification));
         m_backend->deleteNotification(id);
     });
     auto *delegate = workspace::configureRows(m_notifications, workspace::Row::Notice);
@@ -2521,34 +2523,43 @@ void MainWindow::onPeopleFound(const QString &requestId, const QVector<Person> &
 
 void MainWindow::onFailed(const QString &operation, const QString &reason)
 {
+    const auto [kind, ids] = parseOperation(operation);
     const bool networkFailure = reason.startsWith(QStringLiteral("Ошибка сети или истекло время ожидания"));
     const bool activeChatHistory = m_lastSection == 0 && !m_currentChatId.isEmpty() && !m_messageSearchActive
-        && operation == QStringLiteral("chat:") + m_currentChatId;
+        && kind == OperationKind::Chat && ids.value(0) == m_currentChatId;
     const bool activeTaskHistory = m_card && m_cardSearchQuery.isEmpty()
-        && operation == QStringLiteral("task-messages:") + m_card->taskId();
+        && kind == OperationKind::TaskMessages && ids.value(0) == m_card->taskId();
     // These reads are ancillary, or belong to history the user has already left.
     // Access failures and other diagnostics still use the normal failure path.
-    if (networkFailure && (operation == QLatin1String("push")
-        || operation == QLatin1String("task-chat-titles")
-        || operation == QLatin1String("chat-history-identity")
-        || operation.startsWith(QLatin1String("pins:"))
-        || (operation.startsWith(QLatin1String("chat:")) && !activeChatHistory)
-        || (operation.startsWith(QLatin1String("task-messages:")) && !activeTaskHistory)
-        || (operation == QLatin1String("chats") && (m_lastSection != 0 || m_chatScope != 0))))
+    if (networkFailure && (kind == OperationKind::Push
+        || kind == OperationKind::TaskChatTitles
+        || kind == OperationKind::ChatHistoryIdentity
+        || kind == OperationKind::Pins
+        || (kind == OperationKind::Chat && !activeChatHistory)
+        || (kind == OperationKind::TaskMessages && !activeTaskHistory)
+        || (kind == OperationKind::Chats && (m_lastSection != 0 || m_chatScope != 0))))
         return;
 
-    if (operation.startsWith(QLatin1String("project-task-chats:"))) {
+    if (!m_noticeAction.isEmpty() && operation == m_noticeAction) {
+        m_noticeAction.clear();
+        updateNotificationActions();
+        setStatus(reason);
+        return;
+    }
+
+    bool presentedInCard = false;
+    QString footer = reason;
+    switch (kind) {
+    case OperationKind::ProjectTaskChats:
         if (!m_projectTaskChatScope.isEmpty() && m_projectTaskChatPending >= 0
-            && operation == QStringLiteral("project-task-chats:") + m_projectTaskChatScope) {
+            && ids.value(0) == m_projectTaskChatScope) {
             m_projectTaskChatPending = -1;
             m_projectTaskChatError = reason.isEmpty() ? QStringLiteral("Не удалось загрузить чаты задач") : reason;
             updateProjectTaskChatControls();
         }
         return;
-    }
-    constexpr auto peopleSearch = QLatin1String("search-people:");
-    if (operation.startsWith(peopleSearch)) {
-        const auto request = operation.mid(peopleSearch.size());
+    case OperationKind::SearchPeople: {
+        const auto request = ids.value(0);
         m_chatComposer->setMentionSearchError(request);
         if (m_taskForm)
             m_taskForm->setPeopleSearchError(request);
@@ -2558,101 +2569,81 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         }
         return;
     }
-    if (operation == QLatin1String("workday") || operation == QLatin1String("workday-change")
-        || operation.startsWith(QLatin1String("worktime-")))
+    case OperationKind::Workday:
+    case OperationKind::WorkdayChange:
+    case OperationKind::WorktimeSheet:
+    case OperationKind::WorktimeExport:
         return; // The worktime panel presents its own request-scoped errors.
-    if (operation == QLatin1String("notification-settings") || operation == QLatin1String("notification-settings-update")) {
+    case OperationKind::NotificationSettings:
+    case OperationKind::NotificationSettingsUpdate: {
         const auto *settings = findChild<QDialog *>(QStringLiteral("notificationSettingsDialog"));
         if (settings && settings->isVisible())
             return; // The dialog owns recovery while it is open.
+        break;
     }
-    m_pendingReactionAdds.remove(operation);
-    if (operation.startsWith(QLatin1String("board-column:"))) {
-        const auto stage = operation.section(QLatin1Char(':'), 2);
-        if (operation.section(QLatin1Char(':'), 1, 1) == m_currentProjectId &&
+    case OperationKind::BoardColumn: {
+        const auto stage = ids.value(1);
+        if (ids.value(0) == m_currentProjectId &&
             m_board->stagePageLoading(stage)) {
             m_board->failStagePage(stage);
             setStatus(QStringLiteral("%1 · F5 — обновить доску").arg(reason));
         }
         return;
     }
-    if (operation.startsWith(QLatin1String("older-chat:"))) {
-        const auto task = operation.section(QLatin1Char(':'), 1, 1) == QLatin1String("task");
+    case OperationKind::OlderChat: {
+        const auto task = ids.value(0) == QLatin1String("task");
         if (!task || m_card) {
             auto *history = static_cast<ui::HistoryList *>(task ? m_card->messageList() : m_chatMessages);
-            history->olderFailed(operation.section(QLatin1Char(':'), 2, 2),
-                                 operation.section(QLatin1Char(':'), 3, 3), reason);
+            history->olderFailed(ids.value(1), ids.value(2), reason);
         }
         return;
     }
-    if (operation == QLatin1String("projects") || operation == QLatin1String("project-page-fallback")) {
-        m_cardRequestedProjectDirectory = false;
-        if (m_projectsPagePending) {
-            m_projectsPagePending = false;
-            m_projectsPageFailed = true;
-            updateProjectsRailPagination();
-        }
-    }
-    if (operation.startsWith(QLatin1String("project-stages:"))) {
-        if (m_taskForm && operation == QStringLiteral("project-stages:") + m_taskForm->projectId())
+    case OperationKind::ProjectStages:
+        if (m_taskForm && ids.value(0) == m_taskForm->projectId())
             m_taskForm->setStagesError(reason);
-        if (m_card && operation == QStringLiteral("project-stages:") + m_cardRequestedStages) {
+        if (m_card && ids.value(0) == m_cardRequestedStages) {
             m_cardRequestedStages.clear();
             m_card->setStatus(reason);
         }
         return;
-    }
-    if (operation.startsWith(QLatin1String("task-history:"))) {
-        if (m_card && operation.section(QLatin1Char(':'), 1) == m_card->taskId())
+    case OperationKind::TaskHistory:
+        if (m_card && ids.value(0) == m_card->taskId())
             m_card->relations()->historyFailed();
         return;
-    }
-    if (operation.startsWith(QLatin1String("project-members:"))) {
-        if (m_projectTools && operation.section(QLatin1Char(':'), 1) == m_projectTools->projectId())
+    case OperationKind::ProjectMembers:
+        if (m_projectTools && ids.value(0) == m_projectTools->projectId())
             m_projectTools->membersFailed(reason);
         return;
-    }
-    if (operation.startsWith(QLatin1String("project-files:"))) {
-        if (m_projectTools && operation.section(QLatin1Char(':'), 1, 1) == m_projectTools->projectId())
-            m_projectTools->filesFailed(operation.section(QLatin1Char(':'), 2), reason);
+    case OperationKind::ProjectFiles:
+        if (m_projectTools && ids.value(0) == m_projectTools->projectId())
+            m_projectTools->filesFailed(ids.value(1), reason);
         return;
-    }
-    if (!m_noticeAction.isEmpty() && operation == m_noticeAction) {
-        m_noticeAction.clear();
-        updateNotificationActions();
-        setStatus(reason);
-        return;
-    }
-    if (operation == QLatin1String("read-notifications")) {
+    case OperationKind::ReadNotifications:
         finishVisibleNoticeRead(false);
         return;
-    }
-    if (operation == QLatin1String("notifications")) {
+    case OperationKind::Notifications:
         m_noticeHistoryState = NoticeHistoryState::Failed;
         if (m_lastSection == 2) {
             showNotifications();
             setStatus(reason);
         }
         return;
-    }
-    if (operation == QLatin1String("notifications-older")) {
+    case OperationKind::NotificationsOlder:
         m_noticeOlderFailed = true;
         if (m_lastSection == 2 && m_noticeQuery.isEmpty())
             setStatus(reason);
         return;
-    }
-    if (operation.startsWith(QStringLiteral("search-notifications:"))) {
-        if (operation == QStringLiteral("search-notifications:") + m_noticeQuery &&
+    case OperationKind::SearchNotifications:
+        if (ids.value(0) == m_noticeQuery &&
             m_noticeQuery == m_noticeSearch->text().trimmed()) {
             m_noticeSearchPending = false;
             showNotifications();
             setStatus(reason);
         }
         return;
-    }
-    if (operation.startsWith(QLatin1String("message-edit:"))) {
-        const auto dialog = operation.section(QLatin1Char(':'), 1, 1);
-        const auto id = operation.section(QLatin1Char(':'), 2, 2);
+    case OperationKind::MessageEdit: {
+        const auto dialog = ids.value(0);
+        const auto id = ids.value(1);
         if (m_card && m_card->composer()->matchesEdit(dialog, id)) {
             m_card->composer()->failMessageEdit();
             m_card->setStatus(reason);
@@ -2663,52 +2654,66 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         }
         return;
     }
-    if (operation.startsWith(QLatin1String("message-action:")) || operation.startsWith(QLatin1String("message-reaction:"))
-        || operation.startsWith(QLatin1String("forward-message:"))
-        || operation.startsWith(QLatin1String("create-task-from-message:"))
-        || operation.startsWith(QLatin1String("chat-member:"))) {
-        const auto dialog = operation.section(QLatin1Char(':'), 1, 1);
+    case OperationKind::MessageReaction:
+        m_pendingReactionAdds.remove(operation);
+        [[fallthrough]];
+    case OperationKind::MessageAction:
+    case OperationKind::ForwardMessage:
+    case OperationKind::CreateTaskFromMessage:
+    case OperationKind::ChatMember: {
+        const auto dialog = ids.value(0);
         if (m_card && m_card->taskChatDialogId() == dialog)
             m_card->setStatus(reason);
         setStatus(reason);
         return;
     }
-    if (m_ganttMode && !m_currentProjectId.isEmpty() && operation == QStringLiteral("timeline:") + m_currentProjectId) {
+    case OperationKind::Timeline:
+        if (!m_ganttMode || m_currentProjectId.isEmpty() || ids.value(0) != m_currentProjectId)
+            break;
         m_projectTimeline->clear(reason);
         return;
-    }
-    if (m_card && (operation == QStringLiteral("checklist:") + m_card->taskId()
-                  || operation == QStringLiteral("checklist-write:") + m_card->taskId()
-                  || operation == QStringLiteral("subtasks:") + m_card->taskId()
-                  || operation == QStringLiteral("gantt-links:") + m_card->taskId())) {
-        if (operation.startsWith(QLatin1String("checklist:")))
+    case OperationKind::Checklist:
+    case OperationKind::ChecklistWrite:
+    case OperationKind::Subtasks:
+    case OperationKind::GanttLinks:
+        if (!m_card || ids.value(0) != m_card->taskId())
+            break;
+        if (kind == OperationKind::Checklist)
             m_card->relations()->checklistReadFailed();
-        else if (operation.startsWith(QLatin1String("checklist-write:")))
+        else if (kind == OperationKind::ChecklistWrite)
             m_card->relations()->setChecklistPending(false);
-        else if (operation.startsWith(QLatin1String("subtasks:")))
+        else if (kind == OperationKind::Subtasks)
             m_card->relations()->subtasksReadFailed();
         else
             m_card->relations()->dependenciesReadFailed();
         m_card->setStatus(reason);
         return;
-    }
-    if (!m_pendingCreateSubtask.isEmpty()
-        && operation == QStringLiteral("create-subtask:") + m_pendingCreateSubtask) {
+    case OperationKind::CreateSubtask:
+        if (m_pendingCreateSubtask.isEmpty() || ids.value(0) != m_pendingCreateSubtask)
+            break;
         m_pendingCreateSubtask.clear();
         if (m_taskForm)
             m_taskForm->setStatus(reason);
         updateWriteAvailability();
         return;
-    }
-    if (m_card && !m_cardContextMessageId.isEmpty() &&
-        operation == QStringLiteral("message-context:%1:%2").arg(m_card->taskChatDialogId(), m_cardContextMessageId)) {
-        m_cardContextMessageId.clear();
-        m_card->setContextMode(false);
-        m_card->setStatus(reason);
-        m_backend->requestTaskMessages(m_card->taskId());
-        return;
-    }
-    if (operation == QStringLiteral("message-file-download")) {
+    case OperationKind::MessageContext:
+        if (m_card && !m_cardContextMessageId.isEmpty() && ids.value(0) == m_card->taskChatDialogId()
+            && ids.value(1) == m_cardContextMessageId) {
+            m_cardContextMessageId.clear();
+            m_card->setContextMode(false);
+            m_card->setStatus(reason);
+            m_backend->requestTaskMessages(m_card->taskId());
+            return;
+        }
+        if (ids.value(0) == m_contextDialogId && ids.value(1) == m_contextMessageId) {
+            const auto dialogId = m_contextDialogId;
+            resetMessageContext();
+            m_backend->requestChatMessages(dialogId);
+            setStatus(reason);
+            return;
+        }
+        break;
+    case OperationKind::MessageFileDownload:
         if (!m_messageDownloadUrl.isEmpty()) {
             m_messageDownloadUrl.clear();
             m_messageDownloadPath.clear();
@@ -2718,25 +2723,15 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
             setStatus(reason);
         }
         return;
-    }
-    if (operation.startsWith(QStringLiteral("message-context:")) &&
-        operation == QStringLiteral("message-context:%1:%2").arg(m_contextDialogId, m_contextMessageId)) {
-        const auto dialogId = m_contextDialogId;
-        resetMessageContext();
-        m_backend->requestChatMessages(dialogId);
-        setStatus(reason);
-        return;
-    }
-    if (operation.startsWith(QStringLiteral("person:"))) {
-        rememberTypingName(operation.sliced(7), {});
-        if (m_personDialog && operation == QStringLiteral("person:") + m_personId) {
+    case OperationKind::Person:
+        rememberTypingName(ids.value(0), {});
+        if (m_personDialog && ids.value(0) == m_personId) {
             m_personName->setText(reason);
             ui::setLoadingIndicator(m_personName, false);
         }
         return;
-    }
-    if (operation.startsWith(QStringLiteral("search-project-tasks:"))) {
-        const auto projectId = operation.section(QLatin1Char(':'), 1);
+    case OperationKind::SearchProjectTasks: {
+        const auto projectId = ids.value(0);
         const auto query = m_pendingProjectSearches.take(projectId);
         if (m_lastSection == 1 && !m_ganttMode && projectId == m_currentProjectId && !query.isEmpty()) {
             if (query == m_filter->text().trimmed())
@@ -2746,37 +2741,35 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         }
         return;
     }
-    if (operation.startsWith(QStringLiteral("chat-pin:")) ||
-        operation.startsWith(QStringLiteral("project-pin:"))) {
+    case OperationKind::ChatPin:
+    case OperationKind::ProjectPin:
         if (m_pendingPins.remove(operation))
             setStatus(reason);
         return;
-    }
-    if (operation.startsWith(QStringLiteral("search-chats:")) ||
-        operation.startsWith(QStringLiteral("search-task-chats:"))) {
-        const auto prefix = m_chatScope == 0 ? QStringLiteral("search-chats:")
-                                             : QStringLiteral("search-task-chats:");
+    case OperationKind::SearchChats:
+    case OperationKind::SearchTaskChats: {
+        const auto expectedKind = m_chatScope == 0 ? OperationKind::SearchChats : OperationKind::SearchTaskChats;
         if (m_lastSection == 0 && !m_chatDirectories[m_chatScope].query.isEmpty() &&
-            operation == prefix + m_chatSearch->text().trimmed()) {
+            kind == expectedKind && ids.value(0) == m_chatSearch->text().trimmed()) {
             ui::setStatusLabel(m_chatSearchProgress, {});
             showChatResults({});
             setStatus(reason);
         }
         return;
     }
-    if (operation.startsWith(QStringLiteral("search-chat:")) ||
-        operation.startsWith(QStringLiteral("search-task-chat:"))) {
+    case OperationKind::SearchChat:
+    case OperationKind::SearchTaskChat: {
         const auto query = m_messageSearches.take(operation);
         if (query.isEmpty())
             return;
-        if (m_card && operation == QStringLiteral("search-task-chat:") + m_card->taskId() &&
+        if (m_card && kind == OperationKind::SearchTaskChat && ids.value(0) == m_card->taskId() &&
             !m_cardSearchQuery.isEmpty()) {
             if (query != m_cardSearchQuery)
                 requestMessageSearch(m_card->taskId(), m_cardSearchQuery, true);
             else if (query == m_card->searchQuery())
                 m_card->setChatStatus(reason);
         } else if (m_lastSection == 0 && m_messageSearchActive &&
-                   operation == QStringLiteral("search-chat:") + m_messageSearchScope) {
+                   kind == OperationKind::SearchChat && ids.value(0) == m_messageSearchScope) {
             if (query != m_messageSearchQuery)
                 requestMessageSearch(m_messageSearchScope, m_messageSearchQuery, false);
             else if (query == m_messageSearch->text().trimmed())
@@ -2784,17 +2777,18 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         }
         return;
     }
-
-    if (operation.startsWith(QStringLiteral("upload-")) || operation.startsWith(QStringLiteral("attach-task:"))) {
+    case OperationKind::UploadChat:
+    case OperationKind::UploadTaskChat:
+    case OperationKind::AttachTask: {
         if (operation != m_pendingUpload)
             return;
-        const auto scope = m_pendingUpload.section(QLatin1Char(':'), 1);
-        const bool task = !m_pendingUpload.startsWith(QStringLiteral("upload-chat:"));
+        const auto scope = ids.value(0);
+        const bool task = kind != OperationKind::UploadChat;
         m_pendingUpload.clear();
         m_pendingPastedChatImage = {};
         const auto name = m_uploadName;
         m_uploadName.clear();
-        if (m_taskForm && m_taskForm->createdTask() == scope && operation.startsWith(QStringLiteral("attach-task:"))) {
+        if (m_taskForm && m_taskForm->createdTask() == scope && kind == OperationKind::AttachTask) {
             m_taskForm->setStatus(QStringLiteral("Задача №%1 создана. Не удалось загрузить файл «%2». %3")
                                   .arg(scope, name, reason));
             updateComposers();
@@ -2802,7 +2796,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
             return;
         }
         bool reconcileTask = false;
-        if (m_descriptionUploadTask == scope && operation.startsWith(QStringLiteral("attach-task:"))) {
+        if (m_descriptionUploadTask == scope && kind == OperationKind::AttachTask) {
             reconcileTask = m_descriptionUploadConfirmed;
             if (m_card && m_descriptionUploadCard == m_card)
                 m_card->descriptionEditor()->setUploadStatus(reason);
@@ -2813,20 +2807,25 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
             if (reconcileTask)
                 m_backend->requestTask(scope);
         }
+        break;
     }
-    if (!m_pendingCreateTask.isEmpty() && operation == QStringLiteral("create-task:") + m_pendingCreateTask) {
+    case OperationKind::CreateTask:
+        if (m_pendingCreateTask.isEmpty() || ids.value(0) != m_pendingCreateTask)
+            break;
         m_pendingCreateTask.clear();
         if (m_taskForm)
             m_taskForm->setStatus(reason);
-    }
-    if (m_pendingCreateProject && operation == QStringLiteral("create-project")) {
+        break;
+    case OperationKind::CreateProject:
+        if (!m_pendingCreateProject)
+            break;
         m_pendingCreateProject = false;
         if (m_projectForm)
             m_projectForm->setStatus(reason);
-    }
-    bool presentedInCard = false;
-    QString footer = reason;
-    if (!m_pendingTaskEdit.isEmpty() && operation == QStringLiteral("update-task:") + m_pendingTaskEdit) {
+        break;
+    case OperationKind::UpdateTask:
+        if (m_pendingTaskEdit.isEmpty() || ids.value(0) != m_pendingTaskEdit)
+            break;
         if (m_card && m_card->taskId() == m_pendingTaskEdit) {
             m_card->setStatus(networkFailure
                 ? QStringLiteral("Не удалось подтвердить сохранение задачи. Проверьте изменения на портале перед повтором")
@@ -2837,8 +2836,10 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         m_pendingTaskEditCard.clear();
         m_pendingTaskEditProject.clear();
         m_pendingTaskEditTargetProject.clear();
-    }
-    if (!m_pendingTaskDelete.isEmpty() && operation == QStringLiteral("delete-task:") + m_pendingTaskDelete) {
+        break;
+    case OperationKind::DeleteTask:
+        if (m_pendingTaskDelete.isEmpty() || ids.value(0) != m_pendingTaskDelete)
+            break;
         if (m_card && m_card == m_pendingTaskDeleteCard)
             m_card->setStatus(networkFailure
                 ? QStringLiteral("Не удалось подтвердить удаление задачи. Проверьте её на портале перед повтором")
@@ -2848,48 +2849,63 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         m_pendingTaskDeleteProject.clear();
         updateWriteAvailability();
         return;
-    }
-    if (!m_pendingBoardEdit.isEmpty() && operation == QStringLiteral("board-edit:") + m_pendingBoardEdit) {
+    case OperationKind::BoardEdit:
+        if (m_pendingBoardEdit.isEmpty() || ids.value(0) != m_pendingBoardEdit)
+            break;
         if (m_stageManager && m_stageManager->projectId() == m_pendingBoardEdit)
             m_stageManager->setStatus(reason);
         if (m_card && m_card->taskId() == m_pendingMoveTask)
             m_card->setStatus(reason);
         m_pendingBoardEdit.clear();
         m_pendingMoveTask.clear();
-    }
-    const auto unconfirmedSend = QStringLiteral("Не удалось подтвердить отправку. Проверьте историю перед повторной отправкой");
-    if (!m_pendingChatId.isEmpty() && operation == QStringLiteral("send:chat:") + m_pendingChatId) {
-        m_pendingChatId.clear();
-        m_pendingChatDraft = {};
-        if (networkFailure)
-            footer = unconfirmedSend;
-    }
-    if (!m_pendingTaskId.isEmpty() && operation == QStringLiteral("send:task:") + m_pendingTaskId) {
-        if (m_card && m_card->taskId() == m_pendingTaskId) {
-            m_card->setStatus(networkFailure ? unconfirmedSend : reason);
-            presentedInCard = networkFailure;
-        } else if (networkFailure) {
-            footer = unconfirmedSend;
+        break;
+    case OperationKind::SendChat:
+    case OperationKind::SendTask: {
+        const auto unconfirmedSend = QStringLiteral("Не удалось подтвердить отправку. Проверьте историю перед повторной отправкой");
+        if (!m_pendingChatId.isEmpty() && kind == OperationKind::SendChat && ids.value(0) == m_pendingChatId) {
+            m_pendingChatId.clear();
+            m_pendingChatDraft = {};
+            if (networkFailure)
+                footer = unconfirmedSend;
         }
-        m_pendingTaskId.clear();
-        m_pendingTaskDraft = {};
+        if (!m_pendingTaskId.isEmpty() && kind == OperationKind::SendTask && ids.value(0) == m_pendingTaskId) {
+            if (m_card && m_card->taskId() == m_pendingTaskId) {
+                m_card->setStatus(networkFailure ? unconfirmedSend : reason);
+                presentedInCard = networkFailure;
+            } else if (networkFailure) {
+                footer = unconfirmedSend;
+            }
+            m_pendingTaskId.clear();
+            m_pendingTaskDraft = {};
+        }
+        break;
     }
-
-    if (activeChatHistory) {
+    case OperationKind::Chat: {
+        if (!activeChatHistory)
+            break;
         const auto recovery = QStringLiteral("Не удалось загрузить сообщения. Нажмите «Обновить» или F5");
         if (m_chatMessages->count() == 0)
             showEmpty(m_chatMessages, m_chatEmpty, recovery);
         if (networkFailure)
             footer = recovery;
-    } else if (!m_currentProjectId.isEmpty() && operation == QStringLiteral("board:") + m_currentProjectId) {
+        break;
+    }
+    case OperationKind::Board:
+        if (m_currentProjectId.isEmpty() || ids.value(0) != m_currentProjectId)
+            break;
         m_board->resetStagePageLoads(false);
         if (m_stages.isEmpty())
             m_board->clearBoard(QStringLiteral("Не удалось загрузить доску. Нажмите «Обновить»"));
         else if (!m_projectSearchDisplayed)
             m_board->setStages(m_stages);
-    } else if (m_card && (operation == QStringLiteral("task:") + m_card->taskId() ||
-               operation == QStringLiteral("task-messages:") + m_card->taskId())) {
-        const bool detailsFailed = operation == QStringLiteral("task:") + m_card->taskId();
+        if (m_currentProjectId == m_boardMoveRefreshProject)
+            footer = QStringLiteral("Не удалось обновить доску после переноса. Нажмите F5");
+        break;
+    case OperationKind::Task:
+    case OperationKind::TaskMessages: {
+        if (!m_card || ids.value(0) != m_card->taskId())
+            break;
+        const bool detailsFailed = kind == OperationKind::Task;
         if (detailsFailed)
             m_cardSummaryPending = false;
         const auto retryCard = detailsFailed
@@ -2900,23 +2916,39 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         if (m_cardSearchQuery.isEmpty() && (!detailsFailed || m_loadCardChat)
             && (!networkFailure || m_card->messageList()->count() == 0))
             m_card->setChatStatus(QStringLiteral("Не удалось загрузить чат задачи"));
-    } else if (operation == QLatin1String("task-chats") && (m_lastSection != 0 || m_chatScope != 1)) {
-        return;
-    } else if (m_lastSection == 0 && operation == (m_chatScope == 0 ? QLatin1String("chats") : QLatin1String("task-chats"))
-               && !m_chatDirectories[m_chatScope].loaded) {
+        break;
+    }
+    case OperationKind::TaskChats:
+        if (m_lastSection != 0 || m_chatScope != 1)
+            return;
+        [[fallthrough]];
+    case OperationKind::Chats:
+        if (m_lastSection != 0 || (kind == OperationKind::Chats && m_chatScope != 0)
+            || m_chatDirectories[m_chatScope].loaded)
+            break;
         m_chats->clear();
         workspace::emptyRow(m_chats, QStringLiteral("Не удалось загрузить чаты"));
         if (m_currentChatId.isEmpty())
             showEmpty(m_chatMessages, m_chatEmpty, QStringLiteral("Выберите чат"));
-    } else if (m_lastSection == 1 && operation == QStringLiteral("projects") && !m_projectDirectoryLoaded) {
-        m_projects->clear();
-        workspace::emptyRow(m_projects, QStringLiteral("Не удалось загрузить проекты"));
+        break;
+    case OperationKind::Projects:
+    case OperationKind::ProjectPageFallback:
+        m_cardRequestedProjectDirectory = false;
+        if (m_projectsPagePending) {
+            m_projectsPagePending = false;
+            m_projectsPageFailed = true;
+            updateProjectsRailPagination();
+        }
+        if (kind == OperationKind::Projects && m_lastSection == 1 && !m_projectDirectoryLoaded) {
+            m_projects->clear();
+            workspace::emptyRow(m_projects, QStringLiteral("Не удалось загрузить проекты"));
+        }
+        break;
+    default:
+        break;
     }
-    const bool moveRefreshFailed = !m_boardMoveRefreshProject.isEmpty()
-        && m_currentProjectId == m_boardMoveRefreshProject
-        && operation == QStringLiteral("board:") + m_currentProjectId;
     if (!presentedInCard)
-        setStatus(moveRefreshFailed ? QStringLiteral("Не удалось обновить доску после переноса. Нажмите F5") : footer);
+        setStatus(footer);
     updateComposers();
     updateWriteAvailability();
 }
@@ -3097,7 +3129,7 @@ void MainWindow::connectWorkspaceActions()
     connect(m_backend, &Backend::projectTasksFound, this, &MainWindow::onProjectTasksFound);
     connect(m_backend, &Backend::fileUploaded, this, &MainWindow::onFileUploaded);
     connect(m_backend, &Backend::taskFileAttached, this, [this](const QString &taskId, const QString &fileId) {
-        if (taskId != m_descriptionUploadTask || m_pendingUpload != QStringLiteral("attach-task:") + taskId)
+        if (taskId != m_descriptionUploadTask || m_pendingUpload != operationKey(OperationKind::AttachTask, taskId))
             return;
         if (m_card && m_descriptionUploadCard == m_card) {
             m_card->descriptionEditor()->insertAttachment(fileId, m_uploadName, m_descriptionUploadSize);
@@ -3127,7 +3159,8 @@ void MainWindow::updateWriteAvailability()
         const auto task = m_taskForm->createdTask();
         const bool canWrite = writable() && m_pendingCreateTask.isEmpty() && m_pendingCreateSubtask.isEmpty()
             && (task.isEmpty() || m_pendingUpload.isEmpty());
-        m_taskForm->setEnabledForWrite(canWrite, !task.isEmpty() && m_pendingUpload == QStringLiteral("attach-task:") + task);
+        m_taskForm->setEnabledForWrite(canWrite, !task.isEmpty()
+            && m_pendingUpload == operationKey(OperationKind::AttachTask, task));
     }
     if (m_projectForm)
         m_projectForm->setWritable(writable() && !m_pendingCreateProject);
@@ -3987,7 +4020,7 @@ void MainWindow::displayProjectTaskResults()
 
 void MainWindow::requestMessageSearch(const QString &scope, const QString &query, bool task)
 {
-    const auto operation = (task ? QStringLiteral("search-task-chat:") : QStringLiteral("search-chat:")) + scope;
+    const auto operation = operationKey(task ? OperationKind::SearchTaskChat : OperationKind::SearchChat, scope);
     if (m_messageSearches.contains(operation))
         return;
     m_messageSearches.insert(operation, query);
@@ -3997,7 +4030,7 @@ void MainWindow::requestMessageSearch(const QString &scope, const QString &query
 void MainWindow::onMessagesFound(const QString &scopeId, const QString &query, bool task,
                                  const QVector<Message> &messages)
 {
-    const auto operation = (task ? QStringLiteral("search-task-chat:") : QStringLiteral("search-chat:")) + scopeId;
+    const auto operation = operationKey(task ? OperationKind::SearchTaskChat : OperationKind::SearchChat, scopeId);
     if (m_messageSearches.value(operation) != query)
         return;
     m_messageSearches.remove(operation);
@@ -4023,9 +4056,8 @@ void MainWindow::onMessagesFound(const QString &scopeId, const QString &query, b
 
 void MainWindow::onFileUploaded(const QString &scope, const QString &kind)
 {
-    const auto operation = (kind == QStringLiteral("task") ? QStringLiteral("attach-task:")
-        : (kind == QStringLiteral("task-chat") ? QStringLiteral("upload-task-chat:")
-          : QStringLiteral("upload-chat:"))) + scope;
+    const auto operation = operationKey(kind == QStringLiteral("task") ? OperationKind::AttachTask
+        : kind == QStringLiteral("task-chat") ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scope);
     if (m_pendingUpload != operation)
         return;
     if (m_pendingPastedChatImage.image) {
@@ -4588,7 +4620,7 @@ void MainWindow::showPinMenu(QListWidget *list, const QPoint &point, bool projec
     const auto id = item->data(workspace::Id).toString();
     if (id.isEmpty())
         return;
-    const auto op = (project ? QStringLiteral("project-pin:") : QStringLiteral("chat-pin:")) + id;
+    const auto op = operationKey(project ? OperationKind::ProjectPin : OperationKind::ChatPin, id);
     const auto pinned = item->data(workspace::Pinned).toBool();
     auto *menu = new QMenu(this);
     connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
@@ -6173,7 +6205,7 @@ void MainWindow::uploadPastedChatImage(ui::ChatComposer *composer, const QString
         return;
     }
     composer->cancelTyping();
-    m_pendingUpload = (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scope;
+    m_pendingUpload = operationKey(task ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scope);
     m_pendingPastedChatImage = draft;
     m_uploadName = QFileInfo(draft.image->path).fileName();
     feedback(QStringLiteral("Отправляем изображение…"), true);
@@ -6185,7 +6217,7 @@ void MainWindow::uploadPastedChatImage(ui::ChatComposer *composer, const QString
 bool MainWindow::pastedChatImagePending(const QString &scope, bool task) const
 {
     return m_pendingPastedChatImage.image && m_pendingUpload ==
-        (task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scope;
+        operationKey(task ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scope);
 }
 
 void MainWindow::pickFile(const QString &scope, const QString &kind)
@@ -6200,8 +6232,8 @@ void MainWindow::pickFile(const QString &scope, const QString &kind)
     const auto path = QFileDialog::getOpenFileName(parent, QStringLiteral("Выберите файл"));
     if (path.isEmpty() || !writable())
         return;
-    m_pendingUpload = (attachment ? QStringLiteral("attach-task:") : (taskChat ? QStringLiteral("upload-task-chat:")
-        : QStringLiteral("upload-chat:"))) + scope;
+    m_pendingUpload = operationKey(attachment ? OperationKind::AttachTask
+        : taskChat ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scope);
     m_uploadName = QFileInfo(path).fileName();
     const auto status = QStringLiteral("Загружаем %1…").arg(m_uploadName);
     if (m_card && (attachment || taskChat) && m_card->taskId() == scope)
@@ -6237,7 +6269,7 @@ bool MainWindow::uploadNextDescriptionFile()
     }
     const auto taskId = m_descriptionUploadTask;
     const auto path = m_descriptionUploadPaths.takeFirst();
-    m_pendingUpload = QStringLiteral("attach-task:") + taskId;
+    m_pendingUpload = operationKey(OperationKind::AttachTask, taskId);
     m_uploadName = QFileInfo(path).fileName();
     m_descriptionUploadLinked = false;
     m_descriptionUploadSize = QImageReader(path).size();
@@ -6375,7 +6407,7 @@ bool MainWindow::uploadNextTaskFormFile()
         return false;
     const auto task = m_taskForm->createdTask();
     const auto path = m_taskForm->queuedFiles().first();
-    m_pendingUpload = QStringLiteral("attach-task:") + task;
+    m_pendingUpload = operationKey(OperationKind::AttachTask, task);
     m_uploadName = QFileInfo(path).fileName();
     m_taskForm->setStatus(QStringLiteral("Загружаем «%1»…").arg(m_uploadName), true);
     updateComposers();

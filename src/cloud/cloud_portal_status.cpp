@@ -5,8 +5,8 @@
 namespace bx {
 namespace {
 
-const QString statusLoad = QStringLiteral("portal-status");
-const QString statusChange = QStringLiteral("portal-status-update");
+const QString statusLoad = operationKey(OperationKind::PortalStatus);
+const QString statusChange = operationKey(OperationKind::PortalStatusUpdate);
 
 bool supportedStatus(const QString &status)
 {
@@ -80,8 +80,8 @@ void CloudBackend::loadInitialPortalStatus()
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.status.get.json"));
     const auto revision = m_portalStatusRevision;
     const auto user = m_userId;
-    const auto operation = QStringLiteral("portal-status-bootstrap");
-    webRequest(url, {}, operation, QStringLiteral("result"),
+    const auto operation = operationKey(OperationKind::PortalStatusBootstrap);
+    webRequest(url, {}, operation, RequestPolicy::Optional, QStringLiteral("result"),
                [this, revision, user, operation](const QJsonValue &data) {
         if (!user.isEmpty() && user != m_userId) {
             loadInitialPortalStatus();
@@ -94,7 +94,7 @@ void CloudBackend::loadInitialPortalStatus()
             settleInitialPortalStatus();
         };
         if (m_initialPortalStatusPending && m_userId.isEmpty() && !m_unboundPortalStatuses.isEmpty())
-            withCurrentUser(operation, finish);
+            withCurrentUser(operation, RequestPolicy::Optional, finish);
         else
             finish(0);
     });
@@ -104,7 +104,7 @@ void CloudBackend::readPortalStatus(const QString &operation, std::function<void
 {
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.status.get.json"));
     const auto revision = m_portalStatusRevision;
-    webRequest(url, {}, operation, QStringLiteral("result"),
+    webRequest(url, {}, operation, RequestPolicy::Required, QStringLiteral("result"),
                [this, operation, revision, onStatus = std::move(onStatus)](const QJsonValue &data) {
         const auto status = data.toString();
         if (!supportedStatus(status)) {
@@ -141,7 +141,7 @@ void CloudBackend::updatePortalStatus(const QString &expected, const QString &st
             return;
         }
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.status.set.json"));
-        webRequest(url, {{QStringLiteral("STATUS"), status}}, statusChange, QStringLiteral("result"),
+        webRequest(url, {{QStringLiteral("STATUS"), status}}, statusChange, RequestPolicy::Required, QStringLiteral("result"),
                    [this, status](const QJsonValue &data) {
             if (data != QJsonValue(true)) {
                 emit failed(statusChange, QStringLiteral("Портал отклонил смену статуса"));

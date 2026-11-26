@@ -1,4 +1,5 @@
 #include "ui/main_window.h"
+#include "core/operations.h"
 #include "ui/task_dialogs.h"
 #include "ui/reaction_palette.h"
 #include "ui/message_menu_window.h"
@@ -490,9 +491,12 @@ void MainWindow::showChatAssets(const QString &scope, QWidget *parent)
         page.more->setEnabled(true);
     });
     connect(m_backend, &Backend::failed, dialog, [pages, scope](const QString &op, const QString &reason) {
+        const auto [kind, ids] = parseOperation(op);
+        if (kind != OperationKind::ChatAssets || ids.value(0) != scope)
+            return;
         for (int i = 0; i < int(pages->size()); ++i) {
             auto &page = pages->at(size_t(i));
-            if (!page.pending || op != QStringLiteral("chat-assets:%1:%2:%3").arg(scope).arg(i).arg(page.cursor))
+            if (!page.pending || ids.value(1) != QString::number(i) || ids.value(2) != page.cursor)
                 continue;
             page.pending = false;
             page.status->setText(reason);

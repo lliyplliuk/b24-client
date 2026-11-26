@@ -77,7 +77,7 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
         emit peopleFound(requestId, {});
         return;
     }
-    const auto operation = u"search-people:"_s + requestId;
+    const auto operation = operationKey(OperationKind::SearchPeople, requestId);
     const bool mention = !dialogId.isEmpty();
     const auto deliver = [this, requestId, scope = m_accountScopeRevision]
         (const QJsonArray &rows, bool selector, bool mention) {
@@ -127,7 +127,7 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
         const auto dialog = groupId.isEmpty() ? userId : u"chat"_s + groupId;
         ajax(u"im.v2.Chat.Mention.list"_s,
              {{u"dialogId"_s, dialog}, {u"order[lastSendMessageId]"_s, u"desc"_s}, {u"limit"_s, u"50"_s}},
-             operation, [deliver](QJsonValue data) {
+             operation, RequestPolicy::Optional, [deliver](QJsonValue data) {
             deliver(data.toObject().value(u"users"_s).toArray(), false, true);
         });
         return;
@@ -157,7 +157,7 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
     }
     if (trimmed.isEmpty()) {
         dialog.insert(u"recentItemsLimit"_s, peopleLimit);
-        ajaxJson(url, {{u"dialog"_s, dialog}}, operation,
+        ajaxJson(url, {{u"dialog"_s, dialog}}, operation, RequestPolicy::Optional,
                 Handler::checked(u"Не удалось загрузить недавних сотрудников."_s,
                 [](const QJsonValue &data) { return data.toObject().value(u"dialog"_s).isObject(); },
                 [deliver](QJsonValue data) {
@@ -173,7 +173,7 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
     QJsonObject search{{u"queryWords"_s, words}, {u"query"_s, trimmed}};
     if (!mention)
         search.insert(u"dynamicSearchEntities"_s, QJsonArray{});
-    ajaxJson(url, {{u"dialog"_s, dialog}, {u"searchQuery"_s, search}}, operation,
+    ajaxJson(url, {{u"dialog"_s, dialog}, {u"searchQuery"_s, search}}, operation, RequestPolicy::Optional,
              [deliver, mention](QJsonValue data) {
         const auto items = data.toObject().value(u"dialog"_s).toObject().value(u"items"_s).toArray();
         deliver(items, true, mention);

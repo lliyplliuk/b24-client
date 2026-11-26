@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/operations.h"
 #include "core/models.h"
 #include "core/worktime.h"
 
@@ -33,7 +34,7 @@ public:
     virtual QString settingsScope() const { return {}; }
     static QString reactionOperationKey(const QString &dialogId, const QString &messageId, const QString &code)
     {
-        return QStringLiteral("message-reaction:") + dialogId + QLatin1Char(':') + messageId + QLatin1Char(':') + code;
+        return operationKey(OperationKind::MessageReaction, dialogId, messageId, code);
     }
     virtual void start() = 0;
     virtual void stop() = 0;
@@ -61,7 +62,7 @@ public:
     virtual void requestChatLinkPreviews(const QString &, bool, ChatLinkPreviewHandler complete) { complete({}); }
     virtual void downloadMessageFile(const QUrl &, const QString &)
     {
-        emit failed(QStringLiteral("message-file-download"), QStringLiteral("Скачивание файла недоступно"));
+        emit failed(operationKey(OperationKind::MessageFileDownload), QStringLiteral("Скачивание файла недоступно"));
     }
     virtual void downloadMessagePhoto(const QUrl &, const QString &targetPath)
     {
@@ -111,35 +112,35 @@ public:
     virtual void requestOlderNotifications() {}
     virtual void searchNotifications(const QString &query)
     {
-        emit failed(QStringLiteral("search-notifications:") + query, QStringLiteral("Поиск уведомлений недоступен"));
+        emit failed(operationKey(OperationKind::SearchNotifications, query), QStringLiteral("Поиск уведомлений недоступен"));
     }
     virtual void markNotificationRead(const QString &)
     {
-        emit failed(QStringLiteral("read-notification"), QStringLiteral("Изменение уведомлений недоступно"));
+        emit failed(operationKey(OperationKind::ReadNotification), QStringLiteral("Изменение уведомлений недоступно"));
     }
     virtual void markNotificationsRead(const QStringList &)
     {
-        emit failed(QStringLiteral("read-notifications"), QStringLiteral("Изменение уведомлений недоступно"));
+        emit failed(operationKey(OperationKind::ReadNotifications), QStringLiteral("Изменение уведомлений недоступно"));
     }
     virtual void markAllNotificationsRead()
     {
-        emit failed(QStringLiteral("read-all-notifications"), QStringLiteral("Изменение уведомлений недоступно"));
+        emit failed(operationKey(OperationKind::ReadAllNotifications), QStringLiteral("Изменение уведомлений недоступно"));
     }
     virtual void deleteNotification(const QString &)
     {
-        emit failed(QStringLiteral("delete-notification"), QStringLiteral("Удаление уведомлений недоступно"));
+        emit failed(operationKey(OperationKind::DeleteNotification), QStringLiteral("Удаление уведомлений недоступно"));
     }
     virtual void requestPortalStatus() {}
     virtual void updatePortalStatus(const QString &, const QString &) {}
     virtual void requestWorkday() { emit workdayLoaded({}); }
     virtual void changeWorkday(WorkdayAction, const QString & = {})
     {
-        emit failed(QStringLiteral("workday-change"), QStringLiteral("Рабочий день недоступен"));
+        emit failed(operationKey(OperationKind::WorkdayChange), QStringLiteral("Рабочий день недоступен"));
     }
     virtual void changeWorkdayAt(WorkdayAction, const QDate &, const QTime &, const QString &,
                                  const QString & = {})
     {
-        emit failed(QStringLiteral("workday-change"), QStringLiteral("Изменение времени рабочего дня недоступно"));
+        emit failed(operationKey(OperationKind::WorkdayChange), QStringLiteral("Изменение времени рабочего дня недоступно"));
     }
     virtual void requestWorktimeSheet(const QDate &month)
     {
@@ -147,25 +148,25 @@ public:
     }
     virtual void exportWorktimeSheet(const QDate &month, const QString &)
     {
-        emit failed(QStringLiteral("worktime-export:") + month.toString(QStringLiteral("yyyy-MM")),
+        emit failed(operationKey(OperationKind::WorktimeExport, month.toString(QStringLiteral("yyyy-MM"))),
                     QStringLiteral("Экспорт табеля недоступен"));
     }
     virtual void requestNotificationSettings()
     {
-        emit failed(QStringLiteral("notification-settings"), QStringLiteral("Настройки уведомлений недоступны"));
+        emit failed(operationKey(OperationKind::NotificationSettings), QStringLiteral("Настройки уведомлений недоступны"));
     }
     virtual void updateNotificationSetting(const QString &, int)
     {
-        emit failed(QStringLiteral("notification-settings-update"), QStringLiteral("Настройки уведомлений недоступны"));
+        emit failed(operationKey(OperationKind::NotificationSettingsUpdate), QStringLiteral("Настройки уведомлений недоступны"));
     }
     virtual void requestMessageContext(const QString &dialogId, const QString &messageId)
     {
-        emit failed(QStringLiteral("message-context:") + dialogId + QLatin1Char(':') + messageId,
+        emit failed(operationKey(OperationKind::MessageContext, dialogId, messageId),
                     QStringLiteral("История сообщения недоступна"));
     }
     virtual void requestPerson(const QString &id)
     {
-        emit failed(QStringLiteral("person:") + id, QStringLiteral("Профиль недоступен"));
+        emit failed(operationKey(OperationKind::Person, id), QStringLiteral("Профиль недоступен"));
     }
     using PersonHandler = std::function<void(Person)>;
     virtual void requestCurrentPerson(PersonHandler complete) { complete({}); }
@@ -179,16 +180,16 @@ public:
     virtual void sendTaskMessage(const QString &taskId, const QString &text) = 0;
     virtual void sendChatReply(const QString &dialogId, const QString &, const QString &)
     {
-        emit failed(QStringLiteral("send:chat:") + dialogId, QStringLiteral("Ответ с цитатой недоступен"));
+        emit failed(operationKey(OperationKind::SendChat, dialogId), QStringLiteral("Ответ с цитатой недоступен"));
     }
     virtual void sendTaskReply(const QString &taskId, const QString &, const QString &)
     {
-        emit failed(QStringLiteral("send:task:") + taskId, QStringLiteral("Ответ с цитатой недоступен"));
+        emit failed(operationKey(OperationKind::SendTask, taskId), QStringLiteral("Ответ с цитатой недоступен"));
     }
     virtual void updateTask(const QString &taskId, const TaskEdit &edit) = 0;
     virtual void deleteTask(const QString &taskId)
     {
-        emit failed(QStringLiteral("delete-task:") + taskId, QStringLiteral("Удаление задачи недоступно"));
+        emit failed(operationKey(OperationKind::DeleteTask, taskId), QStringLiteral("Удаление задачи недоступно"));
     }
     virtual void createTask(const QString &projectId, const TaskEdit &edit) = 0;
     virtual void createProject(const QString &name) = 0;
@@ -201,17 +202,17 @@ public:
     virtual void setChatPinned(const QString &dialogId, bool pinned)
     {
         Q_UNUSED(pinned);
-        emit failed(QStringLiteral("chat-pin:") + dialogId, QStringLiteral("Закрепление чатов недоступно"));
+        emit failed(operationKey(OperationKind::ChatPin, dialogId), QStringLiteral("Закрепление чатов недоступно"));
     }
     virtual void setProjectPinned(const QString &projectId, bool pinned)
     {
         Q_UNUSED(pinned);
-        emit failed(QStringLiteral("project-pin:") + projectId, QStringLiteral("Закрепление проектов недоступно"));
+        emit failed(operationKey(OperationKind::ProjectPin, projectId), QStringLiteral("Закрепление проектов недоступно"));
     }
     virtual void searchProjectTasks(const QString &projectId, const QString &query)
     {
         Q_UNUSED(query);
-        emit failed(QStringLiteral("search-project-tasks:") + projectId, QStringLiteral("Поиск задач недоступен"));
+        emit failed(operationKey(OperationKind::SearchProjectTasks, projectId), QStringLiteral("Поиск задач недоступен"));
     }
     virtual void searchMessages(const QString &scopeId, const QString &query, bool task) = 0;
     virtual void uploadChatFile(const QString &scopeId, const QString &localPath, bool task) = 0;
@@ -223,7 +224,7 @@ public:
             uploadChatFile(scopeId, localPath, task);
             return;
         }
-        emit failed((task ? QStringLiteral("upload-task-chat:") : QStringLiteral("upload-chat:")) + scopeId,
+        emit failed(operationKey(task ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scopeId),
                     QStringLiteral("Отправка изображения с подписью недоступна"));
     }
 

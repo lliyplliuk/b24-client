@@ -3,6 +3,7 @@
 #include "ui/loading_indicator.h"
 
 #include "core/backend.h"
+#include "core/operations.h"
 
 #include <QComboBox>
 #include <QHBoxLayout>
@@ -96,7 +97,8 @@ inline void addPortalDndControl(QVBoxLayout *content, Backend *backend, std::fun
         enable();
     });
     QObject::connect(backend, &Backend::failed, panel, [panel, current, hint, enable](const QString &operation, const QString &reason) {
-        if (operation != QLatin1String("portal-status") && operation != QLatin1String("portal-status-update"))
+        const auto kind = parseOperation(operation).kind;
+        if (kind != OperationKind::PortalStatus && kind != OperationKind::PortalStatusUpdate)
             return;
         panel->setProperty("pending", false);
         hint->setText(reason);

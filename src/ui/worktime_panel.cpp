@@ -1,5 +1,7 @@
 #include "ui/worktime_panel.h"
 
+#include "core/operations.h"
+
 #include "ui/workspace_style.h"
 #include "ui/saved_file_offer.h"
 #include "ui/task_dialogs.h"
@@ -276,22 +278,35 @@ WorktimePanel::WorktimePanel(Backend *backend, QWidget *parent, bool readOnly)
         offerToOpenSavedFile(this, path);
     });
     connect(m_backend, &Backend::failed, this, [this](const QString &operation, const QString &reason) {
-        if (operation == QLatin1String("workday") && m_loadingWorkday) {
+        const auto [kind, ids] = parseOperation(operation);
+        switch (kind) {
+        case OperationKind::Workday:
+            if (!m_loadingWorkday)
+                return;
             m_loadingWorkday = false;
             setStatusLabel(m_workdayError, reason);
-        } else if (operation == QLatin1String("workday-change") && m_changing) {
+            break;
+        case OperationKind::WorkdayChange:
+            if (!m_changing)
+                return;
             m_changing = false;
             setStatusLabel(m_workdayError, reason);
-        } else if (operation.startsWith(QLatin1String("worktime-sheet:"))) {
-            const auto month = QDate::fromString(operation.mid(15) + QStringLiteral("-01"), Qt::ISODate);
+            break;
+        case OperationKind::WorktimeSheet: {
+            const auto month = QDate::fromString(ids.value(0) + QStringLiteral("-01"), Qt::ISODate);
             if (!m_loadingMonths.remove(month) || month != m_month)
                 return;
             setStatusLabel(m_sheetNotice, reason);
-        } else if (m_exportMonth.isValid() && operation == QStringLiteral("worktime-export:") + monthKey(m_exportMonth)) {
+            break;
+        }
+        case OperationKind::WorktimeExport:
+            if (!m_exportMonth.isValid() || ids.value(0) != monthKey(m_exportMonth))
+                return;
             m_exportMonth = {};
             m_exportPath.clear();
             setStatusLabel(m_exportStatus, reason);
-        } else {
+            break;
+        default:
             return;
         }
         updateControls();

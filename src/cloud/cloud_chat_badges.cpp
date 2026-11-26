@@ -21,7 +21,7 @@ constexpr qsizetype maxPendingAnchorEvents = 64;
 constexpr qsizetype maxVisibleReadIds = 25;
 constexpr qsizetype projectUnreadBatchSize = 50;
 constexpr qsizetype projectUnreadAttemptLimit = 100;
-const QString snapshotOperation = QStringLiteral("chat-badges-snapshot");
+const QString snapshotOperation = operationKey(OperationKind::ChatBadgesSnapshot);
 
 int visibleUnreadCount(int unread, bool marked)
 {
@@ -161,7 +161,7 @@ void CloudBackend::loadChatBadges()
         if (counters.isArray()) {
             applyChatCounterSnapshot(counters.toArray(), revision);
         } else {
-            ajax(QStringLiteral("im.v2.Counter.get"), {}, snapshotOperation, [this, revision, scope](const QJsonValue &data) {
+            ajax(QStringLiteral("im.v2.Counter.get"), {}, snapshotOperation, RequestPolicy::Optional, [this, revision, scope](const QJsonValue &data) {
                 if (scope != m_accountScopeRevision)
                     return;
                 const auto rows = data.toObject().value(QStringLiteral("userCounters"));
@@ -414,10 +414,10 @@ void CloudBackend::resolveProjectUnreadChats(const QHash<qint64, int> &candidate
                        QStringLiteral("im.dialog.get?DIALOG_ID=chat%1").arg(chat)});
     }
     const auto scope = m_accountScopeRevision;
-    const auto operation = QStringLiteral("project-unread:dialogs");
+    const auto operation = operationKey(OperationKind::ProjectUnreadDialogs);
     m_projectUnreadPending = true;
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
-    webRequest(url, std::move(fields), operation, QStringLiteral("result"),
+    webRequest(url, std::move(fields), operation, RequestPolicy::Optional, QStringLiteral("result"),
         [this, scope, parents, directChats, tasks = std::move(tasks), commandKey](QJsonValue response) mutable {
         if (scope != m_accountScopeRevision)
             return;
@@ -474,10 +474,10 @@ void CloudBackend::resolveProjectUnreadTasks(const QHash<qint64, qint64> &tasks)
     for (const auto *name : {"ID", "GROUP_ID", "CHAT_ID"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
     const auto scope = m_accountScopeRevision;
-    const auto operation = QStringLiteral("project-unread:tasks");
+    const auto operation = operationKey(OperationKind::ProjectUnreadTasks);
     m_projectUnreadPending = true;
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.list.json"));
-    webRequest(url, std::move(fields), operation, QStringLiteral("result"), [this, scope, tasks](QJsonValue response) {
+    webRequest(url, std::move(fields), operation, RequestPolicy::Optional, QStringLiteral("result"), [this, scope, tasks](QJsonValue response) {
         if (scope != m_accountScopeRevision)
             return;
         m_projectUnreadPending = false;
@@ -829,7 +829,7 @@ void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &inc
         return;
     readVisibleAnchors(chatId, visible.isEmpty() ? incoming : visible);
 
-    const auto operation = QStringLiteral("read-visible:messages:") + dialog;
+    const auto operation = operationKey(OperationKind::ReadVisibleMessages, dialog);
     auto &state = dialogMessageState(dialog);
     if (m_inflightOperations.contains(operation)) {
         state.pendingReadIds = incoming.mid(0, maxVisibleReadIds);
@@ -855,7 +855,7 @@ void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &inc
                   {QStringLiteral("actionUuid"), QUuid::createUuid().toString(QUuid::WithoutBraces)}};
     for (qsizetype index = 0; index < ids.size(); ++index)
         fields.append({QStringLiteral("ids[%1]").arg(index), ids.at(index)});
-    ajax(QStringLiteral("im.v2.Chat.Message.read"), fields, operation,
+    ajax(QStringLiteral("im.v2.Chat.Message.read"), fields, operation, RequestPolicy::Optional,
          [this, dialog, chatId, revision, scope, ids](const QJsonValue &value) {
         if (scope != m_accountScopeRevision)
             return;
@@ -903,7 +903,7 @@ void CloudBackend::readVisibleAnchors(qint64 chatId, const QStringList &visible)
     for (qsizetype index = 0; index < ordered.size(); ++index)
         fields.append({QStringLiteral("messageIds[%1]").arg(index), QString::number(ordered.at(index))});
     const auto revision = m_anchorRevision;
-    ajax(QStringLiteral("im.v2.Anchor.read"), fields, QStringLiteral("read-visible:anchors:") + QString::number(chatId),
+    ajax(QStringLiteral("im.v2.Anchor.read"), fields, operationKey(OperationKind::ReadVisibleAnchors, QString::number(chatId)), RequestPolicy::Optional,
          [this, chatId, ids, revision](const QJsonValue &data) {
         if (!data.toBool())
             return;

@@ -18,8 +18,8 @@ namespace {
 constexpr qsizetype statusLimit = 128 * 1024;
 constexpr qsizetype exportLimit = 16 * 1024 * 1024;
 constexpr int exportPollLimit = 40;
-const auto workdayRead = u"workday"_s;
-const auto workdayWrite = u"workday-change"_s;
+const auto workdayRead = operationKey(OperationKind::Workday);
+const auto workdayWrite = operationKey(OperationKind::WorkdayChange);
 const auto sheetPath = u"/timeman/timeman.php"_s;
 
 bool actionConfirmed(QStringView action, WorkdayState state)
@@ -596,7 +596,7 @@ void CloudBackend::changeWorkdayAt(WorkdayAction action, const QDate &date, cons
 void CloudBackend::requestWorktimeSheet(const QDate &selected)
 {
     if (!selected.isValid() || selected.year() < 2000 || selected.year() > 2200) {
-        emit failed(u"worktime-sheet:"_s + selected.toString(u"yyyy-MM"_s), u"Укажите корректный месяц."_s);
+        emit failed(operationKey(OperationKind::WorktimeSheet, selected.toString(u"yyyy-MM"_s)), u"Укажите корректный месяц."_s);
         return;
     }
     const QDate month(selected.year(), selected.month(), 1);
@@ -608,7 +608,7 @@ void CloudBackend::requestWorktimeSheet(const QDate &selected)
 void CloudBackend::loadWorktimeSheet(const QDate &month)
 {
     m_loadingWorktimeSheet = true;
-    const auto operation = u"worktime-sheet:"_s + month.toString(u"yyyy-MM"_s);
+    const auto operation = operationKey(OperationKind::WorktimeSheet, month.toString(u"yyyy-MM"_s));
     auto url = OriginGuard(m_session.origin).resolve(sheetPath);
     QUrlQuery query;
     query.addQueryItem(u"ncc"_s, u"1"_s);
@@ -662,7 +662,7 @@ void CloudBackend::loadWorktimeSheet(const QDate &month)
 void CloudBackend::exportWorktimeSheet(const QDate &selected, const QString &targetPath)
 {
     const QDate month(selected.year(), selected.month(), 1);
-    const auto operation = u"worktime-export:"_s + month.toString(u"yyyy-MM"_s);
+    const auto operation = operationKey(OperationKind::WorktimeExport, month.toString(u"yyyy-MM"_s));
     if (!m_started || !month.isValid() || month != m_worktimeSheetMonth || month != m_worktimeExportMonth
         || m_worktimeExportFields.isEmpty()
         || !QDir::isAbsolutePath(targetPath) || targetPath.size() > 4096 || targetPath.contains(QChar::Null)) {
@@ -695,7 +695,7 @@ void CloudBackend::pollWorktimeExport(const std::shared_ptr<WorktimeExport> &job
         emit failed(job->operation, u"Портал не завершил формирование файла вовремя."_s);
         return;
     }
-    ajax(u"timeman.api.export.dispatcher"_s, job->fields, job->operation, [this, job](const QJsonValue &result) {
+    ajax(u"timeman.api.export.dispatcher"_s, job->fields, job->operation, RequestPolicy::Required, [this, job](const QJsonValue &result) {
         if (!m_started || job->revision != m_worktimeRevision)
             return;
         const auto data = result.toObject();

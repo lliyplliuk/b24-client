@@ -502,20 +502,20 @@ std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &param
 
 void CloudBackend::requestMessageContext(const QString &dialogId, const QString &messageId)
 {
-    const auto operation = QStringLiteral("message-context:") + dialogId + QLatin1Char(':') + messageId;
+    const auto operation = operationKey(OperationKind::MessageContext, dialogId, messageId);
     const auto expectedMessage = integerId(messageId);
     if (expectedMessage.isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный идентификатор сообщения"));
         return;
     }
-    resolveDialog(dialogId, false, operation, operation,
+    resolveDialog(dialogId, false, operation, RequestPolicy::Required, operation,
                   [this, dialogId, messageId, expectedMessage, operation](const QString &canonicalDialog, qint64 chatId) {
         // The browser uses this batch for context and marks the message read in a separate command.
         // Loading a context here only needs the read-only command in that batch.
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
         const auto method = QStringLiteral("im.v2.Chat.Message.getContext?id=%1&range=25").arg(expectedMessage);
         webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")}, {QStringLiteral("cmd[context]"), method}},
-                   operation, QStringLiteral("result"),
+                   operation, RequestPolicy::Required, QStringLiteral("result"),
                    [this, dialogId, messageId, canonicalDialog, expectedMessage, chatId, operation](QJsonValue batch) {
             const auto result = batch.toObject().value(QStringLiteral("result")).toObject();
             const auto context = result.value(QStringLiteral("context")).toObject();
@@ -556,23 +556,23 @@ void CloudBackend::requestMessageContext(const QString &dialogId, const QString 
 
 void CloudBackend::requestPerson(const QString &id)
 {
-    const auto operation = QStringLiteral("person:") + id;
+    const auto operation = operationKey(OperationKind::Person, id);
     if (integerId(id).isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный идентификатор пользователя"));
         return;
     }
-    loadPerson(id, operation, [this, operation](const Person &person) {
+    loadPerson(id, operation, RequestPolicy::AccountScoped, [this, operation](const Person &person) {
         if (person.id.isEmpty())
             return failShape(operation);
         emit personLoaded(person);
     });
 }
 
-void CloudBackend::loadPerson(const QString &id, const QString &operation, PersonHandler onPerson, bool requireName)
+void CloudBackend::loadPerson(const QString &id, const QString &operation, RequestPolicy policy, PersonHandler onPerson, bool requireName)
 {
     const auto expected = integerId(id);
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.get.json"));
-    webRequest(url, {{QStringLiteral("ID"), expected}}, operation, QStringLiteral("result"),
+    webRequest(url, {{QStringLiteral("ID"), expected}}, operation, policy, QStringLiteral("result"),
                [this, expected, requireName, onPerson = std::move(onPerson)](QJsonValue response) {
         const auto profile = response.toObject();
         if (valueId(profile.value(QStringLiteral("id"))) != expected)

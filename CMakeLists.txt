@@ -12,6 +12,8 @@ find_package(Qt6 QUIET COMPONENTS Test)
 
 # --- core library: models, backends, transport, push/pull -------------------
 add_library(bxcore STATIC
+    src/core/operations.h
+    src/core/operations.cpp
     src/core/models.h
     src/core/worktime.h
     src/core/backend.h

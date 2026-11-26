@@ -31,30 +31,22 @@ namespace {
 
 Q_LOGGING_CATEGORY(sessionLog, "bitrix24.session")
 
-const QString recentOp = QStringLiteral("chats");
-const QString taskRecentOp = QStringLiteral("task-chats");
-const QString projectTaskChatsPrefix = QStringLiteral("project-task-chats:");
+const QString recentOp = operationKey(OperationKind::Chats);
+const QString taskRecentOp = operationKey(OperationKind::TaskChats);
 constexpr int projectTaskChatsPageSize = 50;
-const QString projectsOp = QStringLiteral("projects");
-const QString projectFallbackOp = QStringLiteral("project-page-fallback");
-const QString projectPinIdentityOp = QStringLiteral("project-pin-identity");
-const QString settingsIdentityOp = QStringLiteral("settings-identity");
-const QString recentUserStatusOp = QStringLiteral("recent-user-status");
-const QString pushOp = QStringLiteral("push");
-const QString notificationsOp = QStringLiteral("notifications");
-const QString olderNotificationsOp = QStringLiteral("notifications-older");
-const QString notificationBatchPrefix = QStringLiteral("notification-batch:");
-const QString taskActionRequestPrefix = QStringLiteral("task-card-action:");
-const QString taskCardReadPrefix = QStringLiteral("task-card-read:");
-const QString taskReadOperationPrefix = QStringLiteral("task:");
-const QString soundsOp = QStringLiteral("chat-sound-settings");
-const QString chatIdentityOp = QStringLiteral("chat-history-identity");
-const QString currentPersonPrefix = QStringLiteral("current-person:");
-const QString historySnapshotPrefix = QStringLiteral("chat-history-snapshot:");
-const QString historyReadPrefix = QStringLiteral("chat-history-read:");
-const QString sessionRecoveryOp = QStringLiteral("session-recovery");
-const QString sessionKeepaliveOp = QStringLiteral("session-keepalive");
-const QString csrfRefreshOp = QStringLiteral("csrf-refresh");
+const QString projectsOp = operationKey(OperationKind::Projects);
+const QString projectFallbackOp = operationKey(OperationKind::ProjectPageFallback);
+const QString projectPinIdentityOp = operationKey(OperationKind::ProjectPinIdentity);
+const QString settingsIdentityOp = operationKey(OperationKind::SettingsIdentity);
+const QString recentUserStatusOp = operationKey(OperationKind::RecentUserStatus);
+const QString pushOp = operationKey(OperationKind::Push);
+const QString notificationsOp = operationKey(OperationKind::Notifications);
+const QString olderNotificationsOp = operationKey(OperationKind::NotificationsOlder);
+const QString soundsOp = operationKey(OperationKind::ChatSoundSettings);
+const QString chatIdentityOp = operationKey(OperationKind::ChatHistoryIdentity);
+const QString sessionRecoveryOp = operationKey(OperationKind::SessionRecovery);
+const QString sessionKeepaliveOp = operationKey(OperationKind::SessionKeepalive);
+const QString csrfRefreshOp = operationKey(OperationKind::CsrfRefresh);
 const QString soundMuted = QStringLiteral("soundMuted");
 const QString volumeGeneral = QStringLiteral("soundVolumeGeneral");
 const QString volumeMessages = QStringLiteral("soundVolumeMessages");
@@ -94,12 +86,12 @@ void trimNotificationHistory(QVector<Notification> &notices, int olderPages)
 
 QString notificationRequestKey(quint64 scopeRevision, const QString &key)
 {
-    return notificationBatchPrefix + QString::number(scopeRevision) + QLatin1Char(':') + key;
+    return operationKey(OperationKind::NotificationBatch, QString::number(scopeRevision), key);
 }
 
 QString taskActionRequestKey(quint64 scopeRevision, const QString &taskId)
 {
-    return taskActionRequestPrefix + QString::number(scopeRevision) + QLatin1Char(':') + taskId;
+    return operationKey(OperationKind::TaskCardAction, QString::number(scopeRevision), taskId);
 }
 
 QString string(const QJsonValue &value)
@@ -241,45 +233,67 @@ bool mutedListContains(const QJsonValue &list, const QString &user)
     return list.toObject().value(user).toBool();
 }
 
-bool shareableRead(const QString &operation)
+bool shareableRead(OperationKind kind)
 {
-    // Classify the whole operation: even a GET-like step of a mutation may start a write.
-    // Unknown operations keep the single-flight behavior of mutations and uploads.
-    static const QSet<QString> reads{
-        recentOp, taskRecentOp, projectFallbackOp, projectPinIdentityOp, settingsIdentityOp,
-        recentUserStatusOp, soundsOp, chatIdentityOp, sessionKeepaliveOp, notificationsOp, olderNotificationsOp,
-        QStringLiteral("chat-history-read"), QStringLiteral("chat-history-snapshot"), QStringLiteral("task-messages"),
-        QStringLiteral("task-chat-titles"), QStringLiteral("project-task-chats"), QStringLiteral("chat-badges-snapshot"),
-        QStringLiteral("project-unread"), QStringLiteral("portal-status"), QStringLiteral("portal-status-bootstrap"),
-        QStringLiteral("person"), QStringLiteral("current-person"), QStringLiteral("search-people"),
-        QStringLiteral("project-files"), QStringLiteral("project-members"), QStringLiteral("project-stages"),
-        QStringLiteral("board"), QStringLiteral("board-column"), QStringLiteral("search-project-tasks"),
-        QStringLiteral("task"), QStringLiteral("task-details"), QStringLiteral("task-files"), QStringLiteral("checklist"),
-        QStringLiteral("subtasks"), QStringLiteral("gantt-links"), QStringLiteral("task-history"), QStringLiteral("timeline"),
-        QStringLiteral("link-preview"), QStringLiteral("message-context"), QStringLiteral("message-viewers"),
-        QStringLiteral("pins"), QStringLiteral("chat-assets"), QStringLiteral("older-chat"), QStringLiteral("search-chat"),
-        QStringLiteral("search-task-chat"), QStringLiteral("search-chats"), QStringLiteral("search-task-chats"),
-        QStringLiteral("search-notifications"), QStringLiteral("notification-settings")
-    };
-    return reads.contains(operation.section(QLatin1Char(':'), 0, 0));
-}
-
-bool optionalLookup(const QString &operation)
-{
-    return operation == projectPinIdentityOp || operation == settingsIdentityOp || operation == recentUserStatusOp
-        || operation == projectFallbackOp || operation == sessionKeepaliveOp
-        || operation.startsWith(currentPersonPrefix)
-        || operation.startsWith(QLatin1String("project-files:")) || operation.startsWith(QLatin1String("project-members:"))
-        || operation.startsWith(QLatin1String("project-unread:"))
-        || operation.startsWith(QLatin1String("task-history:"))
-        || operation.startsWith(QLatin1String("task-details:"))
-        || operation.startsWith(QLatin1String("link-preview:"))
-        || operation.startsWith(QLatin1String("message-viewers:"))
-        || operation == QLatin1String("chat-badges-snapshot")
-        || operation == QLatin1String("portal-status-bootstrap")
-        || operation.startsWith(QLatin1String("read-visible:"))
-        || operation.startsWith(QLatin1String("chat-typing:"))
-        || operation.startsWith(QLatin1String("search-people:"));
+    // A read step inside a mutation still belongs to that mutation.
+    switch (kind) {
+    case OperationKind::Chats:
+    case OperationKind::TaskChats:
+    case OperationKind::ProjectPageFallback:
+    case OperationKind::ProjectPinIdentity:
+    case OperationKind::SettingsIdentity:
+    case OperationKind::RecentUserStatus:
+    case OperationKind::ChatSoundSettings:
+    case OperationKind::ChatHistoryIdentity:
+    case OperationKind::SessionKeepalive:
+    case OperationKind::Notifications:
+    case OperationKind::NotificationsOlder:
+    case OperationKind::ChatHistoryRead:
+    case OperationKind::ChatHistorySnapshot:
+    case OperationKind::TaskMessages:
+    case OperationKind::TaskChatTitles:
+    case OperationKind::TaskChatTitlesRequest:
+    case OperationKind::ProjectTaskChats:
+    case OperationKind::ChatBadgesSnapshot:
+    case OperationKind::ProjectUnreadDialogs:
+    case OperationKind::ProjectUnreadTasks:
+    case OperationKind::PortalStatus:
+    case OperationKind::PortalStatusBootstrap:
+    case OperationKind::Person:
+    case OperationKind::CurrentPerson:
+    case OperationKind::SearchPeople:
+    case OperationKind::ProjectFiles:
+    case OperationKind::ProjectMembers:
+    case OperationKind::ProjectStages:
+    case OperationKind::Board:
+    case OperationKind::BoardColumn:
+    case OperationKind::SearchProjectTasks:
+    case OperationKind::Task:
+    case OperationKind::TaskDetails:
+    case OperationKind::TaskFiles:
+    case OperationKind::Checklist:
+    case OperationKind::Subtasks:
+    case OperationKind::GanttLinks:
+    case OperationKind::TaskHistory:
+    case OperationKind::Timeline:
+    case OperationKind::LinkPreview:
+    case OperationKind::LinkPreviewStage:
+    case OperationKind::LinkPreviewChatAssets:
+    case OperationKind::MessageContext:
+    case OperationKind::MessageViewers:
+    case OperationKind::Pins:
+    case OperationKind::ChatAssets:
+    case OperationKind::OlderChat:
+    case OperationKind::SearchChat:
+    case OperationKind::SearchTaskChat:
+    case OperationKind::SearchChats:
+    case OperationKind::SearchTaskChats:
+    case OperationKind::SearchNotifications:
+    case OperationKind::NotificationSettings:
+        return true;
+    default:
+        return false;
+    }
 }
 
 std::optional<bool> dismissedPersonalUser(const QString &dialog, const QJsonObject &row, const QJsonObject &user)
@@ -847,7 +861,7 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
         ajax(QStringLiteral("im.v2.Recent.load"),
              {{QStringLiteral("filter[recentSection]"), QStringLiteral("default")},
               {QStringLiteral("limit"), QStringLiteral("1")}},
-             sessionKeepaliveOp, [](const QJsonValue &) {});
+             sessionKeepaliveOp, RequestPolicy::Optional, [](const QJsonValue &) {});
     });
     connect(this, &Backend::failed, this, [this](const QString &operation, const QString &) {
         if (operation == chatIdentityOp)
@@ -856,8 +870,9 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
             m_loadingOlderNotifications = false;
             publishNotificationHistoryPageState();
         }
-        if (operation.startsWith(taskReadOperationPrefix)) {
-            const auto id = operation.mid(taskReadOperationPrefix.size());
+        const auto parsed = parseOperation(operation);
+        if (parsed.kind == OperationKind::Task) {
+            const auto id = parsed.ids.value(0);
             const auto current = m_taskCardReads.find(id);
             if (current != m_taskCardReads.end()) {
                 current->baseFinished = true;
@@ -1029,7 +1044,7 @@ void CloudBackend::resetAccountScopedState()
     for (const auto &[reply, key] : pending.asKeyValueRange()) {
         // The pending clipboard upload owns the staged file, which a new upload may still open.
         // Its account-specific key allows the new request, and its stale response cannot advance the upload.
-        if (m_started && key.startsWith(QLatin1String(chatImageUploadRequestPrefix)))
+        if (m_started && parseOperation(key).kind == OperationKind::ChatImageUpload)
             continue;
         if (m_requests.contains(reply))
             reply->abort();
@@ -1224,7 +1239,7 @@ bool CloudBackend::refreshCsrf(Session candidate, quint64 revision)
     webRequest(actionUrl(QStringLiteral("im.v2.Recent.load")),
                {{QStringLiteral("filter[recentSection]"), QStringLiteral("default")},
                 {QStringLiteral("limit"), QStringLiteral("1")}},
-               csrfRefreshOp, QStringLiteral("data"), [this, verified, revision](const QJsonValue &data) {
+               csrfRefreshOp, RequestPolicy::Required, QStringLiteral("data"), [this, verified, revision](const QJsonValue &data) {
         if (revision != m_sessionRevision || m_authExpired)
             return;
         const auto response = data.toObject();
@@ -1285,17 +1300,17 @@ void CloudBackend::refreshDirtyViews()
     if (m_activeSection == 0) {
         if (takeDirty(m_recentDirty, m_showTaskChats ? taskRecentOp : recentOp))
             loadRecentChats(m_showTaskChats);
-        if (!m_openDialog.isEmpty() && takeDirty(m_chatDirty, QStringLiteral("chat:") + m_openDialog))
+        if (!m_openDialog.isEmpty() && takeDirty(m_chatDirty, operationKey(OperationKind::Chat, m_openDialog)))
             requestChatMessages(m_openDialog);
     } else if (m_foreground && m_activeSection == 1) {
         if (!m_openBoard.isEmpty() && takeDirty(m_boardDirty,
-            boardReadKey(QStringLiteral("board:") + m_openBoard, m_boardPageGeneration)))
+            boardReadKey(operationKey(OperationKind::Board, m_openBoard), m_boardPageGeneration)))
             requestProjectBoard(m_openBoard);
     } else if (m_foreground && m_activeSection == 2 && takeDirty(m_notificationsDirty,
                                                 notificationRequestKey(m_accountScopeRevision, notificationsOp))) {
         requestNotifications();
     }
-    if (!m_openTask.isEmpty() && takeDirty(m_taskMessagesDirty, QStringLiteral("task-messages:") + m_openTask))
+    if (!m_openTask.isEmpty() && takeDirty(m_taskMessagesDirty, operationKey(OperationKind::TaskMessages, m_openTask)))
         requestTaskMessages(m_openTask);
 }
 
@@ -1315,7 +1330,7 @@ void CloudBackend::invalidateTaskChat(const QString &taskId)
     scheduleRefresh();
 }
 
-void CloudBackend::webRequest(QUrl url, const Fields &fields, const QString &operation,
+void CloudBackend::webRequest(QUrl url, const Fields &fields, const QString &operation, RequestPolicy policy,
                               const QString &envelope, Handler onData, const QString &requestKey,
                               const std::shared_ptr<Session> &candidate, bool includeResponseMeta)
 {
@@ -1335,15 +1350,14 @@ void CloudBackend::webRequest(QUrl url, const Fields &fields, const QString &ope
     buffer->open(QIODevice::ReadOnly);
     webRequestRaw(std::move(url), buffer,
                   {{"Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"}},
-                  operation, envelope, std::move(onData), requestKey, candidate, includeResponseMeta);
+                  operation, policy, envelope, std::move(onData), requestKey, candidate, includeResponseMeta);
 }
 
-QString CloudBackend::taskFormMutationKey(const QString &operation) const
+QString CloudBackend::scopedRequestKey(const QString &operation, RequestPolicy policy, const QString &requestKey) const
 {
-    if (operation.startsWith(QLatin1String("create-task:")) || operation.startsWith(QLatin1String("create-subtask:"))
-        || operation.startsWith(QLatin1String("attach-task:")))
+    if (policy == RequestPolicy::AccountScoped)
         return operation + QLatin1Char(':') + QString::number(m_accountScopeRevision);
-    return {};
+    return requestKey.isEmpty() ? operation : requestKey;
 }
 
 struct CloudBackend::InflightRequest {
@@ -1351,6 +1365,7 @@ struct CloudBackend::InflightRequest {
     Headers headers;
     std::optional<QByteArray> bufferedBody;
     QString operation;
+    RequestPolicy policy;
     QString envelope;
     quint64 scope;
     quint64 revision;
@@ -1368,29 +1383,27 @@ struct CloudBackend::InflightRequest {
             if (error.isEmpty())
                 handler.onData(value);
             else
-                handler.reject(error, optionalLookup(operation));
+                handler.reject(error, policy == RequestPolicy::Optional);
         }
     }
 };
 
 void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers,
-                                 const QString &operation, const QString &envelope, Handler onData,
+                                 const QString &operation, RequestPolicy policy, const QString &envelope, Handler onData,
                                  const QString &requestKey, const std::shared_ptr<Session> &candidate,
                                  bool includeResponseMeta)
 {
     std::unique_ptr<QIODevice> ownedBody(body);
     const auto accountScope = m_accountScopeRevision;
-    const bool personLookup = operation.startsWith(QLatin1String("person:"));
-    const auto mutationKey = taskFormMutationKey(operation);
-    const auto key = personLookup ? operation + QLatin1Char(':') + QString::number(accountScope)
-        : !mutationKey.isEmpty() ? mutationKey : requestKey.isEmpty() ? operation : requestKey;
-    const bool historySnapshot = operation.startsWith(historySnapshotPrefix);
-    const bool latestHistory = historySnapshot || operation.startsWith(historyReadPrefix);
-    const auto historyRevision = (key.startsWith(QLatin1String("task-messages:"))
+    const auto kind = parseOperation(operation).kind;
+    const auto key = scopedRequestKey(operation, policy, requestKey);
+    const bool historySnapshot = policy == RequestPolicy::HistorySnapshot;
+    const bool latestHistory = historySnapshot || policy == RequestPolicy::HistoryRead;
+    const auto historyRevision = (latestHistory && parseOperation(key).kind == OperationKind::TaskMessages
         ? m_taskHistoryRetry : m_chatHistoryRetry).revision;
     const auto failedOperation = latestHistory ? key : operation;
     const auto rejectRequest = [&](const QString &reason) {
-        const bool optional = optionalLookup(operation);
+        const bool optional = policy == RequestPolicy::Optional;
         QPointer<CloudBackend> alive(this);
         const auto detail = optional && onData.accepts ? onData.invalidMessage : reason;
         if (!optional || onData.accepts)
@@ -1402,9 +1415,9 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
     const auto revision = m_sessionRevision;
     if (m_inflightOperations.contains(key)) {
         const auto pending = m_inflightOperations.value(key);
-        if (buffer && pending && shareableRead(operation) && pending->scope == accountScope
-            && pending->revision == revision && pending->candidate == candidate && pending->operation == operation
-            && pending->url == url && pending->headers == headers && pending->bufferedBody
+        if (buffer && pending && shareableRead(kind) && pending->scope == accountScope
+            && pending->revision == revision && pending->policy == policy && pending->candidate == candidate
+            && pending->operation == operation && pending->url == url && pending->headers == headers && pending->bufferedBody
             && *pending->bufferedBody == buffer->data() && pending->envelope == envelope
             && pending->includeResponseMeta == includeResponseMeta)
             pending->handlers.append(std::move(onData));
@@ -1459,7 +1472,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
     ownedBody.release()->setParent(reply);
     m_requests.insert(reply, key);
     auto pending = std::make_shared<InflightRequest>(InflightRequest{
-        url, headers, buffer ? std::optional<QByteArray>(buffer->data()) : std::nullopt, operation, envelope,
+        url, headers, buffer ? std::optional<QByteArray>(buffer->data()) : std::nullopt, operation, policy, envelope,
         accountScope, revision, candidate, includeResponseMeta, {std::move(onData)}});
     m_inflightOperations.insert(key, pending);
     if (operation == sessionRecoveryOp)
@@ -1474,7 +1487,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
             reply->abort();
     });
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, operation, key, envelope, revision, candidate, historySnapshot, latestHistory, historyRevision, failedOperation,
+            [this, reply, operation, kind, policy, key, envelope, revision, candidate, historySnapshot, latestHistory, historyRevision, failedOperation,
              accountScope, includeResponseMeta, pending] {
         m_requests.remove(reply);
         reply->deleteLater();
@@ -1488,19 +1501,16 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
             return;
         if (accountScope != m_accountScopeRevision) {
             // These operations leave controls busy until they receive a terminal signal.
-            if (key == operation && (key.startsWith(QLatin1String("send:")) || key.startsWith(QLatin1String("upload-"))
-                || key.startsWith(QLatin1String("board-edit:")) || key == QLatin1String("create-project")
-                || key.startsWith(QLatin1String("chat-pin:")) || key.startsWith(QLatin1String("project-pin:"))
-                || key.startsWith(QLatin1String("search-project-tasks:"))))
+            if (key == operation && policy == RequestPolicy::NotifyAccountChange)
                 emit failed(operation, QStringLiteral("Аккаунт изменился. Результат запроса не подтверждён."));
             return;
         }
         scheduleRefresh();
-        if (operation.startsWith(projectTaskChatsPrefix)
+        if (kind == OperationKind::ProjectTaskChats
             && key != m_projectTaskChatsRequest)
             return;
         if (key != operation
-            && (operation.startsWith(QLatin1String("board:")) || operation.startsWith(QLatin1String("board-column:")))
+            && (kind == OperationKind::Board || kind == OperationKind::BoardColumn)
             && key != boardReadKey(operation, m_boardPageGeneration))
             return;
 
@@ -1541,7 +1551,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
                 return;
             }
             // Some optional endpoints may deny access while the main routes are still usable.
-            const bool lookup = optionalLookup(operation);
+            const bool lookup = policy == RequestPolicy::Optional;
             bool refreshing = false;
             if (denied && (!lookup || operation == sessionKeepaliveOp)
                 && !candidate && revision == m_sessionRevision) {
@@ -1563,14 +1573,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
                 : status == 403 ? QStringLiteral("Портал запретил действие")
                 : status > 0 ? QStringLiteral("Портал отклонил действие или вернул другой формат (HTTP %1)").arg(status)
                 : QStringLiteral("Ошибка сети или истекло время ожидания");
-            if (operation.startsWith(QLatin1String("send"))
-                || operation.startsWith(QLatin1String("upload-")))
-                detail += QStringLiteral(". Проверьте историю перед повторной отправкой");
-            if (operation.startsWith(QLatin1String("attach-task:")))
-                detail += QStringLiteral(". Проверьте файлы задачи перед повторным прикреплением");
-            if (operation.startsWith(QLatin1String("update-task:"))
-                || operation.startsWith(QLatin1String("board-edit:")))
-                detail += QStringLiteral(". Проверьте сохранённые изменения перед повтором");
+            detail += operationErrorHint(kind);
             const auto &first = pending->handlers.first();
             if (lookup && first.accepts)
                 detail = first.invalidMessage;
@@ -1608,10 +1611,10 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
     });
 }
 
-void CloudBackend::ajax(const QString &action, Fields fields, const QString &operation, Handler handler,
+void CloudBackend::ajax(const QString &action, Fields fields, const QString &operation, RequestPolicy policy, Handler handler,
                         const QString &requestKey)
 {
-    webRequest(actionUrl(action), fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
+    webRequest(actionUrl(action), fields, operation, policy, QStringLiteral("data"), std::move(handler), requestKey);
 }
 
 QUrl CloudBackend::actionUrl(const QString &action) const
@@ -1623,24 +1626,24 @@ QUrl CloudBackend::actionUrl(const QString &action) const
     return url;
 }
 
-void CloudBackend::ajaxJson(const QString &action, const QJsonObject &body, const QString &operation,
+void CloudBackend::ajaxJson(const QString &action, const QJsonObject &body, const QString &operation, RequestPolicy policy,
                            Handler handler, const QString &requestKey)
 {
-    ajaxJson(actionUrl(action), body, operation, std::move(handler), requestKey);
+    ajaxJson(actionUrl(action), body, operation, policy, std::move(handler), requestKey);
 }
 
-void CloudBackend::ajaxJson(QUrl url, const QJsonObject &body, const QString &operation,
+void CloudBackend::ajaxJson(QUrl url, const QJsonObject &body, const QString &operation, RequestPolicy policy,
                            Handler handler, const QString &requestKey)
 {
     auto *buffer = new QBuffer;
     buffer->setData(QJsonDocument(body).toJson(QJsonDocument::Compact));
     buffer->open(QIODevice::ReadOnly);
-    webRequestRaw(std::move(url), buffer, {{"Content-Type", "application/json"}}, operation,
+    webRequestRaw(std::move(url), buffer, {{"Content-Type", "application/json"}}, operation, policy,
                   QStringLiteral("data"), std::move(handler), requestKey);
 }
 
 void CloudBackend::componentAction(const QString &action, const Fields &fields,
-                                   const QString &operation, Handler handler, const QString &component,
+                                   const QString &operation, RequestPolicy policy, Handler handler, const QString &component,
                                    const QString &requestKey)
 {
     QUrl url = OriginGuard(m_session.origin).resolve(QStringLiteral("/bitrix/services/main/ajax.php"));
@@ -1649,7 +1652,7 @@ void CloudBackend::componentAction(const QString &action, const Fields &fields,
     query.addQueryItem(QStringLiteral("c"), component);
     query.addQueryItem(QStringLiteral("action"), action);
     url.setQuery(query);
-    webRequest(url, fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
+    webRequest(url, fields, operation, policy, QStringLiteral("data"), std::move(handler), requestKey);
 }
 
 void CloudBackend::failShape(const QString &operation)
@@ -1657,13 +1660,13 @@ void CloudBackend::failShape(const QString &operation)
     emit failed(operation, QStringLiteral("Портал вернул неподдерживаемый формат данных"));
 }
 
-void CloudBackend::withCurrentUser(const QString &operation, std::function<void(qint64)> onUser)
+void CloudBackend::withCurrentUser(const QString &operation, RequestPolicy policy, std::function<void(qint64)> onUser)
 {
     if (!numericId(m_userId).isEmpty()) {
         onUser(m_userId.toLongLong());
         return;
     }
-    requestCurrentUser(operation, [this, onUser = std::move(onUser)](const QString &id) {
+    requestCurrentUser(operation, policy, [this, onUser = std::move(onUser)](const QString &id) {
         if (!id.isEmpty())
             rememberCurrentUser(id);
         onUser(id.toLongLong());
@@ -1672,18 +1675,18 @@ void CloudBackend::withCurrentUser(const QString &operation, std::function<void(
 
 void CloudBackend::requestCurrentPerson(PersonHandler complete)
 {
-    const auto operation = currentPersonPrefix + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto operation = operationKey(OperationKind::CurrentPerson, QUuid::createUuid().toString(QUuid::WithoutBraces));
     const auto account = m_accountScopeRevision;
-    withCurrentUser(operation, [this, operation, account, complete = std::move(complete)](qint64 userId) mutable {
+    withCurrentUser(operation, RequestPolicy::Optional, [this, operation, account, complete = std::move(complete)](qint64 userId) mutable {
         if (account != m_accountScopeRevision || userId <= 0) {
             complete({});
             return;
         }
-        loadPerson(QString::number(userId), operation, std::move(complete), true);
+        loadPerson(QString::number(userId), operation, RequestPolicy::Optional, std::move(complete), true);
     });
 }
 
-void CloudBackend::requestCurrentUser(const QString &operation,
+void CloudBackend::requestCurrentUser(const QString &operation, RequestPolicy policy,
                                       std::function<void(const QString &)> onUser,
                                       const std::shared_ptr<Session> &candidate)
 {
@@ -1693,8 +1696,8 @@ void CloudBackend::requestCurrentUser(const QString &operation,
     query.addQueryItem(QStringLiteral("e"), extension);
     url.setQuery(query);
     webRequest(url, {{QStringLiteral("extension[0]"), extension}, {QStringLiteral("coreLoaded"), QStringLiteral("Y")}},
-               operation, QStringLiteral("data"), [this, extension, operation, onUser = std::move(onUser)](QJsonValue data) {
-        if (!data.isArray() && !optionalLookup(operation))
+               operation, policy, QStringLiteral("data"), [this, extension, operation, policy, onUser = std::move(onUser)](QJsonValue data) {
+        if (!data.isArray() && policy != RequestPolicy::Optional)
             return failShape(operation);
         for (const auto &entry : data.toArray()) {
             const auto item = entry.toObject();
@@ -1708,7 +1711,7 @@ void CloudBackend::requestCurrentUser(const QString &operation,
             }
             break;
         }
-        if (optionalLookup(operation))
+        if (policy == RequestPolicy::Optional)
             onUser({});
         else
             emit failed(operation, QStringLiteral("Портал не подтвердил текущего пользователя"));
@@ -1734,7 +1737,7 @@ void CloudBackend::recoverSession(const Session &candidate, std::function<bool()
     }
     const auto expectedUser = m_userId;
     auto verified = std::make_shared<Session>(candidate);
-    requestCurrentUser(sessionRecoveryOp, [this, verified, expectedUser, stillAllowed = std::move(stillAllowed)](const QString &id) {
+    requestCurrentUser(sessionRecoveryOp, RequestPolicy::Required, [this, verified, expectedUser, stillAllowed = std::move(stillAllowed)](const QString &id) {
         if (stillAllowed && !stillAllowed())
             return;
         if (!sessionUsable(*verified, m_allowLoopback)) {
@@ -1866,7 +1869,7 @@ void CloudBackend::requestProjectTaskChats(const QString &projectId, int offset)
         resetProjectTaskChats();
         return;
     }
-    const auto operation = projectTaskChatsPrefix + projectId;
+    const auto operation = operationKey(OperationKind::ProjectTaskChats, projectId);
     if (!m_started || numericId(projectId) != projectId || offset < 0
         || offset > std::numeric_limits<int>::max() - projectTaskChatsPageSize
         || (offset > 0 && (projectId != m_projectTaskChatsProject || offset != m_projectTaskChatsNext)))
@@ -1886,7 +1889,7 @@ void CloudBackend::requestProjectTaskChats(const QString &projectId, int offset)
     for (const auto *name : {"ID", "TITLE", "GROUP_ID", "CHAT_ID", "ACTIVITY_DATE"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.list.json"));
-    webRequest(url, fields, operation, QStringLiteral("result"),
+    webRequest(url, fields, operation, RequestPolicy::Required, QStringLiteral("result"),
         [this, projectId, offset, request, operation, bindingRevision](const QJsonValue &response) {
             if (m_projectTaskChatsRequest != request || m_authExpired)
                 return;
@@ -1947,7 +1950,7 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
     ajax(QStringLiteral("im.v2.Recent.load"),
          {{QStringLiteral("filter[recentSection]"), task ? QStringLiteral("tasksTask") : QStringLiteral("default")},
           {QStringLiteral("limit"), QString::number(tunables::kPageSizeChats)}},
-         operation, [this, task, badgesOnly, operation, scope = m_accountScopeRevision,
+         operation, RequestPolicy::Required, [this, task, badgesOnly, operation, scope = m_accountScopeRevision,
                      counterRevision = m_chatBadgeRevision](QJsonValue data) {
         if (scope != m_accountScopeRevision)
             return;
@@ -2120,7 +2123,7 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
             if (!usersWithoutStatus.isEmpty())
                 hydrateRecentUserStatuses(chats, usersWithoutStatus, generation);
             if (m_userId.isEmpty() && std::any_of(chats.cbegin(), chats.cend(), [](const Chat &chat) { return chat.dismissed; }))
-                withCurrentUser(settingsIdentityOp, [](qint64) {});
+                withCurrentUser(settingsIdentityOp, RequestPolicy::Optional, [](qint64) {});
             return;
         }
         for (const auto &legacy : std::as_const(m_legacyTaskChats)) {
@@ -2152,7 +2155,7 @@ void CloudBackend::hydrateRecentUserStatuses(QVector<Chat> chats, const QStringL
         rememberDismissalStatus(id, std::nullopt);
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.list.get.json"));
-    webRequest(url, fields, recentUserStatusOp, QStringLiteral("result"),
+    webRequest(url, fields, recentUserStatusOp, RequestPolicy::Optional, QStringLiteral("result"),
                [this, pending = std::move(pending), chats = std::move(chats), generation](QJsonValue data) mutable {
         if (data.isNull() || generation != m_recentStatusGeneration)
             return;
@@ -2185,7 +2188,7 @@ void CloudBackend::hydrateRecentUserStatuses(QVector<Chat> chats, const QStringL
         if (changed) {
             publishRecentChats(std::move(chats), false);
             if (m_userId.isEmpty())
-                withCurrentUser(settingsIdentityOp, [](qint64) {});
+                withCurrentUser(settingsIdentityOp, RequestPolicy::Optional, [](qint64) {});
         }
     }, recentUserStatusOp + QLatin1Char(':') + QString::number(generation));
 }
@@ -2309,7 +2312,7 @@ void CloudBackend::applyRecentPull(const QString &command, const QString &dialog
             if (m_recentPullsAwaitingIdentity.size() >= 8)
                 m_recentPullsAwaitingIdentity.removeFirst();
             m_recentPullsAwaitingIdentity.append({command, dialog, chatId, params, extra});
-            withCurrentUser(settingsIdentityOp, [this](qint64 id) {
+            withCurrentUser(settingsIdentityOp, RequestPolicy::Optional, [this](qint64 id) {
                 if (id == 0)
                     m_recentPullsAwaitingIdentity.clear();
             });
@@ -2454,7 +2457,7 @@ void CloudBackend::resolveTaskChatTitles(QVector<Chat> chats, const QString &key
     std::sort(ids.begin(), ids.end());
     for (qsizetype i = 0; i < ids.size(); ++i)
         fields.append({QStringLiteral("filter[ID][%1]").arg(i), ids.at(i)});
-    ajax(QStringLiteral("tasks.task.list"), fields, QStringLiteral("task-chat-titles"),
+    ajax(QStringLiteral("tasks.task.list"), fields, operationKey(OperationKind::TaskChatTitles), RequestPolicy::Required,
          [this, generation, chats = std::move(chats), missing = std::move(missing),
           deliver = std::move(deliver)](QJsonValue data) mutable {
         if (generation != m_taskTitleGeneration)
@@ -2475,7 +2478,7 @@ void CloudBackend::resolveTaskChatTitles(QVector<Chat> chats, const QString &key
         }
         if (changed)
             deliver(std::move(chats));
-    }, QStringLiteral("task-chat-titles:") + key + QLatin1Char(':') + ids.join(QLatin1Char(',')));
+    }, operationKey(OperationKind::TaskChatTitlesRequest, key, ids.join(QLatin1Char(','))));
 }
 
 void CloudBackend::resetHistoryRetries()
@@ -2491,8 +2494,9 @@ void CloudBackend::resetHistoryRetries()
 bool CloudBackend::scheduleHistoryRetry(const QString &operation, quint64 revision,
                                         const std::shared_ptr<InflightRequest> &pending)
 {
-    const bool task = operation.startsWith(QLatin1String("task-messages:"));
-    const auto key = operation.section(QLatin1Char(':'), 1);
+    const auto parsed = parseOperation(operation);
+    const bool task = parsed.kind == OperationKind::TaskMessages;
+    const auto key = parsed.ids.value(0);
     auto &attempt = task ? m_taskHistoryRetry : m_chatHistoryRetry;
     const auto dialog = attempt.dialog;
     const auto scope = m_accountScopeRevision;
@@ -2528,7 +2532,7 @@ bool CloudBackend::scheduleHistoryRetry(const QString &operation, quint64 revisi
             [this, pending](QJsonValue result) { pending->notify(this, result); },
             [this, pending](const QString &error) { pending->notify(this, {}, error); }
         };
-        webRequest(pending->url, form.queryItems(QUrl::FullyDecoded), pending->operation,
+        webRequest(pending->url, form.queryItems(QUrl::FullyDecoded), pending->operation, pending->policy,
                    pending->envelope, std::move(subscribers), operation, pending->candidate,
                    pending->includeResponseMeta);
     });
@@ -2545,11 +2549,11 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
         pending.append({key, dialogId, task});
         if (!m_triedHistoryIdentity) {
             m_triedHistoryIdentity = true;
-            withCurrentUser(chatIdentityOp, [this](qint64) { resumeHistoriesWithIdentity(); });
+            withCurrentUser(chatIdentityOp, RequestPolicy::Required, [this](qint64) { resumeHistoriesWithIdentity(); });
         }
         return;
     }
-    const auto operation = (task ? QStringLiteral("task-messages:") : QStringLiteral("chat:")) + key;
+    const auto operation = operationKey(task ? OperationKind::TaskMessages : OperationKind::Chat, key);
     if (m_inflightOperations.contains(operation))
         return;
     auto &attempt = task ? m_taskHistoryRetry : m_chatHistoryRetry;
@@ -2571,7 +2575,8 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
     const auto expectedChatId = badgeChatId(dialogId);
     const auto groupChatId = groupDialogChatId(dialogId);
     const auto popupChatId = groupChatId > 0 ? groupChatId : expectedChatId;
-    const auto snapshotOperation = (expectedChatId > 0 ? historySnapshotPrefix : historyReadPrefix) + operation;
+    const bool snapshot = expectedChatId > 0;
+    const auto snapshotOperation = operationKey(snapshot ? OperationKind::ChatHistorySnapshot : OperationKind::ChatHistoryRead, operation);
     const auto deliver = [this, key, dialogId, popupChatId, task](const QJsonObject &history, bool trustedMetadata) {
         const auto messages = decodeMessages(history, true, dialogId);
         if (trustedMetadata && (task ? m_openTask == key : m_openDialog == dialogId)) {
@@ -2585,7 +2590,8 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
     };
     ajax(QStringLiteral("im.v2.Chat.load"),
          {{QStringLiteral("dialogId"), dialogId}, {QStringLiteral("messageLimit"), QStringLiteral("25")}},
-         snapshotOperation, [this, key, dialogId, task, operation, superseded, deliver, popupChatId,
+         snapshotOperation, snapshot ? RequestPolicy::HistorySnapshot : RequestPolicy::HistoryRead,
+         [this, key, dialogId, task, operation, superseded, deliver, popupChatId,
                              counterRevision = ++m_chatBadgeRevision](QJsonValue data) {
         if (superseded())
             return;
@@ -2632,7 +2638,7 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
 
         ajax(QStringLiteral("im.v2.Chat.Message.list"),
              {{QStringLiteral("chatId"), chatId}, {QStringLiteral("limit"), QStringLiteral("25")}},
-             historyReadPrefix + operation, [this, operation, dialogId, pagingChatId, superseded, publishHistory](QJsonValue page) {
+             operationKey(OperationKind::ChatHistoryRead, operation), RequestPolicy::HistoryRead, [this, operation, dialogId, pagingChatId, superseded, publishHistory](QJsonValue page) {
             if (superseded())
                 return;
             const auto result = page.toObject();
@@ -2769,7 +2775,7 @@ void CloudBackend::requestChatMessages(const QString &dialogId)
 {
     const auto valid = validDialog(dialogId);
     if (valid.isEmpty()) {
-        emit failed(QStringLiteral("chat:") + dialogId, QStringLiteral("Некорректный номер диалога"));
+        emit failed(operationKey(OperationKind::Chat, dialogId), QStringLiteral("Некорректный номер диалога"));
         return;
     }
     if (m_openDialog != valid) {
@@ -2781,7 +2787,7 @@ void CloudBackend::requestChatMessages(const QString &dialogId)
     if (m_activeSection == 0)
         updateHistoryCatchup(true);
     if (m_activeSection == 0 && canAutoRefreshChats() && (m_requests.size() >= maxRequests
-        || m_inflightOperations.contains(QStringLiteral("chat:") + dialogId))) {
+        || m_inflightOperations.contains(operationKey(OperationKind::Chat, dialogId)))) {
         m_chatDirty = true;
         scheduleRefresh();
         return;
@@ -3050,7 +3056,7 @@ void CloudBackend::requestProjects()
     m_nextProjectGridPage.clear();
     m_nextProjectOffset = -1;
     m_emptyProjectPages = 0;
-    withCurrentUser(projectPinIdentityOp, [this](qint64 userId) {
+    withCurrentUser(projectPinIdentityOp, RequestPolicy::Optional, [this](qint64 userId) {
         if (userId <= 0) {
             loadProjectFallback(0);
             return;
@@ -3155,7 +3161,7 @@ void CloudBackend::loadProjectFallback(qint64 offset)
           {QStringLiteral("start"), offsetField}, {QStringLiteral("select[0]"), QStringLiteral("ID")},
           {QStringLiteral("select[1]"), QStringLiteral("NAME")}, {QStringLiteral("select[2]"), QStringLiteral("AVATAR")},
           {QStringLiteral("select[3]"), QStringLiteral("TYPE")}, {QStringLiteral("select[4]"), QStringLiteral("AVATAR_TYPE")}},
-         projectFallbackOp, [this, offset](QJsonValue data) {
+         projectFallbackOp, RequestPolicy::Optional, [this, offset](QJsonValue data) {
             const auto rows = list(data, {"items", "groups", "workgroups", "result"});
             if (!rows.isArray()) {
                 m_loadingProjects = false;
@@ -3225,7 +3231,7 @@ void CloudBackend::publishProjectPage(QVector<Project> rows)
 
 void CloudBackend::requestProjectMembers(const QString &projectId)
 {
-    const auto operation = QStringLiteral("project-members:") + projectId;
+    const auto operation = operationKey(OperationKind::ProjectMembers, projectId);
     if (numericId(projectId).isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный номер проекта"));
         return;
@@ -3235,7 +3241,7 @@ void CloudBackend::requestProjectMembers(const QString &projectId)
     ajaxJson(QStringLiteral("socialnetwork.api.workgroup.get"),
         {{QStringLiteral("params"), QJsonObject{{QStringLiteral("groupId"), projectId.toLongLong()},
                                                 {QStringLiteral("select"), fields}}}},
-        operation, Handler::checked(QStringLiteral("Не удалось получить участников проекта"),
+        operation, RequestPolicy::Optional, Handler::checked(QStringLiteral("Не удалось получить участников проекта"),
         [projectId](const QJsonValue &data) {
             const auto payload = data.toObject();
             const auto list = payload.value(QStringLiteral("LIST_OF_MEMBERS"));
@@ -3308,7 +3314,7 @@ void CloudBackend::requestProjectMembers(const QString &projectId)
 
 void CloudBackend::requestProjectFiles(const QString &projectId, const QString &folderId, int offset)
 {
-    const auto operation = QStringLiteral("project-files:%1:%2").arg(projectId, folderId);
+    const auto operation = operationKey(OperationKind::ProjectFiles, projectId, folderId);
     if (numericId(projectId).isEmpty() || offset < 0 || offset > std::numeric_limits<int>::max() - 50) {
         emit failed(operation, QStringLiteral("Некорректная папка проекта"));
         return;
@@ -3324,7 +3330,7 @@ void CloudBackend::requestProjectFiles(const QString &projectId, const QString &
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/disk.storage.getList.json"));
     webRequest(url, {{QStringLiteral("filter[ENTITY_TYPE]"), QStringLiteral("group")},
-                     {QStringLiteral("filter[ENTITY_ID]"), projectId}}, operation,
+                     {QStringLiteral("filter[ENTITY_ID]"), projectId}}, operation, RequestPolicy::Optional,
                QStringLiteral("result"), Handler::checked(QStringLiteral("Диск проекта недоступен"),
                [](const QJsonValue &data) { return data.isArray(); },
                [this, projectId, operation](QJsonValue data) {
@@ -3349,12 +3355,12 @@ void CloudBackend::requestProjectFiles(const QString &projectId, const QString &
 void CloudBackend::loadProjectDiskItems(const QString &projectId, const QString &folderId, int offset)
 {
     const auto disk = m_projectDisks.value(projectId);
-    const auto operation = QStringLiteral("project-files:%1:%2").arg(projectId, folderId);
+    const auto operation = operationKey(OperationKind::ProjectFiles, projectId, folderId);
     const auto endpoint = folderId.isEmpty() ? QStringLiteral("/rest/disk.storage.getChildren.json")
                                             : QStringLiteral("/rest/disk.folder.getChildren.json");
     const auto url = OriginGuard(m_session.origin).resolve(endpoint);
     webRequest(url, {{QStringLiteral("id"), folderId.isEmpty() ? disk.id : folderId},
-                     {QStringLiteral("start"), QString::number(offset)}}, operation, QStringLiteral("result"),
+                     {QStringLiteral("start"), QString::number(offset)}}, operation, RequestPolicy::Optional, QStringLiteral("result"),
                Handler::checked(QStringLiteral("Не удалось получить файлы проекта"),
                [](const QJsonValue &data) { return data.isArray(); },
                [this, projectId, folderId, operation, storage = disk.id, root = disk.root, offset](QJsonValue data) {
@@ -3401,14 +3407,14 @@ void CloudBackend::loadProjectDiskItems(const QString &projectId, const QString 
 
 void CloudBackend::setChatPinned(const QString &dialogId, bool pinned)
 {
-    const auto operation = QStringLiteral("chat-pin:") + dialogId;
+    const auto operation = operationKey(OperationKind::ChatPin, dialogId);
     const auto dialog = validDialog(dialogId);
     if (dialog.isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный номер диалога"));
         return;
     }
     const auto endpoint = pinned ? QStringLiteral("im.v2.Chat.pin") : QStringLiteral("im.v2.Chat.unpin");
-    ajax(endpoint, {{QStringLiteral("dialogId"), dialog}}, operation, [this, dialogId, pinned, operation](QJsonValue result) {
+    ajax(endpoint, {{QStringLiteral("dialogId"), dialog}}, operation, RequestPolicy::NotifyAccountChange, [this, dialogId, pinned, operation](QJsonValue result) {
         if (result == false)
             return failShape(operation);
         emit chatPinChanged(dialogId, pinned);
@@ -3418,17 +3424,17 @@ void CloudBackend::setChatPinned(const QString &dialogId, bool pinned)
 void CloudBackend::setProjectPinned(const QString &projectId, bool pinned)
 {
     Q_UNUSED(pinned); // The official project controller changes the current pin and returns its new state.
-    const auto operation = QStringLiteral("project-pin:") + projectId;
+    const auto operation = operationKey(OperationKind::ProjectPin, projectId);
     const auto id = numericId(projectId);
     if (id.isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный номер проекта"));
         return;
     }
-    withCurrentUser(operation, [this, id, projectId, operation](qint64) {
+    withCurrentUser(operation, RequestPolicy::NotifyAccountChange, [this, id, projectId, operation](qint64) {
         ajaxJson(QStringLiteral("socialnetwork.v2.Project.changePin"),
                  {{QStringLiteral("projectId"), id.toLongLong()},
                   {QStringLiteral("mode"), m_taskProjectScope ? QStringLiteral("tasks_project") : QString()}},
-                 operation, [this, id, projectId, operation, key = projectPinSettingsKey(), taskScope = m_taskProjectScope](QJsonValue result) {
+                 operation, RequestPolicy::NotifyAccountChange, [this, id, projectId, operation, key = projectPinSettingsKey(), taskScope = m_taskProjectScope](QJsonValue result) {
             const auto actual = notificationFlag(result.toObject().value(QStringLiteral("pinned")));
             if (!actual)
                 return failShape(operation);
@@ -3455,16 +3461,16 @@ void CloudBackend::setProjectPinned(const QString &projectId, bool pinned)
 
 void CloudBackend::createProject(const QString &name)
 {
-    const auto op = QStringLiteral("create-project");
+    const auto op = operationKey(OperationKind::CreateProject);
     const auto title = name.trimmed();
     if (title.isEmpty()) {
         emit failed(op, QStringLiteral("Введите название проекта"));
         return;
     }
-    withCurrentUser(op, [this, title, op](qint64 userId) {
+    withCurrentUser(op, RequestPolicy::NotifyAccountChange, [this, title, op](qint64 userId) {
         ajaxJson(QStringLiteral("socialnetwork.V2.Project.add"),
                  {{QStringLiteral("project"), newProjectDto(title, userId)}},
-                 op, [this, op](QJsonValue result) {
+                 op, RequestPolicy::NotifyAccountChange, [this, op](QJsonValue result) {
             const auto id = numericId(field(result.toObject(), {"id"}));
             if (id.isEmpty())
                 return failShape(op);
@@ -3475,7 +3481,7 @@ void CloudBackend::createProject(const QString &name)
 
 void CloudBackend::searchProjectTasks(const QString &projectId, const QString &query)
 {
-    const auto operation = QStringLiteral("search-project-tasks:") + projectId;
+    const auto operation = operationKey(OperationKind::SearchProjectTasks, projectId);
     if (numericId(projectId).isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный номер проекта"));
         return;
@@ -3501,7 +3507,7 @@ void CloudBackend::searchProjectTasks(const QString &projectId, const QString &q
     }
     for (const auto *name : {"ID", "TITLE", "GROUP_ID", "STAGE_ID", "DEADLINE", "PRIORITY", "RESPONSIBLE_ID"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
-    ajax(QStringLiteral("tasks.task.list"), fields, operation,
+    ajax(QStringLiteral("tasks.task.list"), fields, operation, RequestPolicy::NotifyAccountChange,
          Handler::checked(QStringLiteral("Портал вернул неподдерживаемый формат данных"),
          [](const QJsonValue &data) { return data.toObject().value(QStringLiteral("tasks")).isArray(); },
          [this, projectId, query, matchId](QJsonValue data) {
@@ -3552,7 +3558,7 @@ Task CloudBackend::boardTask(const QJsonObject &item, const QString &id, const Q
 
 void CloudBackend::requestProjectBoard(const QString &projectId)
 {
-    const auto op = QStringLiteral("board:") + projectId;
+    const auto op = operationKey(OperationKind::Board, projectId);
     if (numericId(projectId).isEmpty()) {
         emit failed(op, QStringLiteral("Некорректный номер проекта"));
         return;
@@ -3566,7 +3572,7 @@ void CloudBackend::requestProjectBoard(const QString &projectId)
     }
     const auto component = QStringLiteral("bitrix:tasks.kanban");
     const auto generation = ++m_boardPageGeneration;
-    componentAction(QStringLiteral("applyFilter"), boardFields(projectId), op, [this, projectId, op, generation](QJsonValue data) {
+    componentAction(QStringLiteral("applyFilter"), boardFields(projectId), op, RequestPolicy::Required, [this, projectId, op, generation](QJsonValue data) {
         if (m_openBoard != projectId || m_boardPageGeneration != generation)
             return;
         const auto board = data.toObject();
@@ -3628,14 +3634,14 @@ void CloudBackend::requestProjectBoard(const QString &projectId)
 
 void CloudBackend::requestMoreBoardTasks(const QString &projectId, const QString &stageId)
 {
-    const auto operation = QStringLiteral("board-column:") + projectId + QLatin1Char(':') + stageId;
+    const auto operation = operationKey(OperationKind::BoardColumn, projectId, stageId);
     auto cursor = m_boardColumnCursors.find(stageId);
     if (projectId != m_openBoard || cursor == m_boardColumnCursors.end() || !boardStageId(stageId)) {
         emit failed(operation, QStringLiteral("Эта колонка сейчас недоступна"));
         return;
     }
     const auto generation = m_boardPageGeneration;
-    if (m_inflightOperations.contains(boardReadKey(QStringLiteral("board:") + projectId, generation))) {
+    if (m_inflightOperations.contains(boardReadKey(operationKey(OperationKind::Board, projectId), generation))) {
         emit failed(operation, QStringLiteral("Дождитесь обновления доски"));
         return;
     }
@@ -3654,7 +3660,7 @@ void CloudBackend::requestMoreBoardTasks(const QString &projectId, const QString
     auto fields = boardFields(projectId);
     fields.append({QStringLiteral("pageId"), QString::number(cursor->nextPage)});
     fields.append({QStringLiteral("columnId"), stageId});
-    componentAction(QStringLiteral("getColumnItems"), fields, operation,
+    componentAction(QStringLiteral("getColumnItems"), fields, operation, RequestPolicy::Required,
         [this, projectId, stageId, operation, generation](QJsonValue data) {
         auto current = m_boardColumnCursors.find(stageId);
         if (generation != m_boardPageGeneration || projectId != m_openBoard || current == m_boardColumnCursors.end())
@@ -3708,23 +3714,23 @@ void CloudBackend::publishDeferredBoardTasks(const QString &projectId, const QSt
 
 void CloudBackend::requestProjectStages(const QString &projectId)
 {
-    const auto operation = QStringLiteral("project-stages:") + projectId;
+    const auto operation = operationKey(OperationKind::ProjectStages, projectId);
     if (numericId(projectId).isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный номер проекта"));
         return;
     }
-    loadProjectStages(projectId, operation, [this, operation, projectId](std::optional<QVector<Stage>> stages) {
+    loadProjectStages(projectId, operation, RequestPolicy::Required, [this, operation, projectId](std::optional<QVector<Stage>> stages) {
         if (!stages)
             return failShape(operation);
         emit projectStagesLoaded(projectId, *stages);
     });
 }
 
-void CloudBackend::loadProjectStages(const QString &projectId, const QString &operation, ProjectStagesHandler complete)
+void CloudBackend::loadProjectStages(const QString &projectId, const QString &operation, RequestPolicy policy, ProjectStagesHandler complete)
 {
     const QJsonObject group{{QStringLiteral("id"), projectId.toLongLong()}};
     ajaxJson(QStringLiteral("tasks.v2.Group.Stage.list"), {{QStringLiteral("group"), group}},
-             operation, [projectId, complete = std::move(complete)](QJsonValue data) {
+             operation, policy, [projectId, complete = std::move(complete)](QJsonValue data) {
         if (!data.isArray())
             return complete(std::nullopt);
         QSet<QString> seen;
@@ -3788,7 +3794,7 @@ void CloudBackend::loadLinkStage(const QString &projectId, const QString &stageI
     pending.append(std::move(deliver));
     if (pending.size() > 1)
         return;
-    loadProjectStages(projectId, QStringLiteral("link-preview:stage:") + key,
+    loadProjectStages(projectId, operationKey(OperationKind::LinkPreviewStage, key), RequestPolicy::Optional,
         [this, key, scope](std::optional<QVector<Stage>> stages) {
             const auto pending = m_pendingLinkStages.take(key);
             if (m_authExpired || settingsScope() != scope)
@@ -3820,12 +3826,12 @@ void CloudBackend::boardMutation(const QString &action, const QString &projectId
     fields.append(boardFields(projectId));
     if (!onData.onData)
         onData = [this, projectId](QJsonValue) { emit boardUpdated(projectId); };
-    componentAction(action, fields, QStringLiteral("board-edit:") + projectId, std::move(onData));
+    componentAction(action, fields, operationKey(OperationKind::BoardEdit, projectId), RequestPolicy::NotifyAccountChange, std::move(onData));
 }
 
 void CloudBackend::moveTask(const QString &projectId, const QString &taskId, const QString &stageId)
 {
-    const auto operation = QStringLiteral("board-edit:") + projectId;
+    const auto operation = operationKey(OperationKind::BoardEdit, projectId);
     if (numericId(projectId).isEmpty() || numericId(taskId).isEmpty() || numericId(stageId).isEmpty()) {
         emit failed(operation, QStringLiteral("Проверьте проект, задачу и стадию"));
         return;
@@ -3853,7 +3859,7 @@ void CloudBackend::moveTask(const QString &projectId, const QString &taskId, con
 void CloudBackend::saveStage(const QString &projectId, const QString &stageId, const QString &title,
                              const QString &afterStageId, const QString &color)
 {
-    const auto operation = QStringLiteral("board-edit:") + projectId;
+    const auto operation = operationKey(OperationKind::BoardEdit, projectId);
     const auto cleanTitle = title.trimmed();
     const auto requestedColor = normalizedStageColor(color);
     if (!color.isEmpty() && requestedColor.isEmpty()) {
@@ -3867,7 +3873,7 @@ void CloudBackend::saveStage(const QString &projectId, const QString &stageId, c
         emit failed(operation, QStringLiteral("Проверьте название и положение стадии"));
         return;
     }
-    componentAction(QStringLiteral("applyFilter"), boardFields(projectId), operation,
+    componentAction(QStringLiteral("applyFilter"), boardFields(projectId), operation, RequestPolicy::NotifyAccountChange,
                     [this, projectId, stageId, cleanTitle, afterStageId, requestedColor, colorOnly, operation](QJsonValue data) {
         const auto columns = data.toObject().value(QStringLiteral("columns"));
         if (!columns.isArray())
@@ -3924,12 +3930,12 @@ void CloudBackend::saveStage(const QString &projectId, const QString &stageId, c
 
 void CloudBackend::deleteStage(const QString &projectId, const QString &stageId)
 {
-    const auto operation = QStringLiteral("board-edit:") + projectId;
+    const auto operation = operationKey(OperationKind::BoardEdit, projectId);
     if (numericId(projectId).isEmpty() || numericId(stageId).isEmpty()) {
         emit failed(operation, QStringLiteral("Проверьте проект и стадию"));
         return;
     }
-    componentAction(QStringLiteral("applyFilter"), boardFields(projectId), operation,
+    componentAction(QStringLiteral("applyFilter"), boardFields(projectId), operation, RequestPolicy::NotifyAccountChange,
                     [this, projectId, stageId, operation](QJsonValue data) {
         const auto board = data.toObject();
         const auto columns = board.value(QStringLiteral("columns"));
@@ -3954,7 +3960,7 @@ void CloudBackend::deleteStage(const QString &projectId, const QString &stageId)
         ajax(QStringLiteral("tasks.task.list"),
              {{QStringLiteral("filter[GROUP_ID]"), projectId}, {QStringLiteral("filter[STAGE_ID]"), stageId},
               {QStringLiteral("select[]"), QStringLiteral("ID")}, {QStringLiteral("start"), QStringLiteral("0")}},
-             operation, [this, projectId, stageId, operation](QJsonValue result) {
+             operation, RequestPolicy::NotifyAccountChange, [this, projectId, stageId, operation](QJsonValue result) {
             const auto tasks = result.toObject().value(QStringLiteral("tasks"));
             if (!tasks.isArray())
                 return failShape(operation);
@@ -3976,7 +3982,7 @@ void CloudBackend::createTask(const QString &projectId, const TaskEdit &edit)
 void CloudBackend::createSubtask(const QString &parentId, const QString &projectId, const TaskEdit &edit)
 {
     if (numericId(parentId).isEmpty()) {
-        emit failed(QStringLiteral("create-subtask:") + parentId, QStringLiteral("Номер родительской задачи недействителен"));
+        emit failed(operationKey(OperationKind::CreateSubtask, parentId), QStringLiteral("Номер родительской задачи недействителен"));
         return;
     }
     createTaskRequest(projectId, parentId, edit);
@@ -3985,7 +3991,7 @@ void CloudBackend::createSubtask(const QString &parentId, const QString &project
 void CloudBackend::createTaskRequest(const QString &projectId, const QString &parentId, const TaskEdit &edit)
 {
     const bool child = !parentId.isEmpty();
-    const auto operation = child ? QStringLiteral("create-subtask:") + parentId : QStringLiteral("create-task:") + projectId;
+    const auto operation = child ? operationKey(OperationKind::CreateSubtask, parentId) : operationKey(OperationKind::CreateTask, projectId);
     const auto title = edit.title.value_or(QString()).trimmed();
     const auto deadline = taskDeadline(edit.deadline.value_or(QString()));
     if (((!child || !projectId.isEmpty()) && numericId(projectId).isEmpty()) || title.isEmpty() || !deadline) {
@@ -4019,7 +4025,7 @@ void CloudBackend::createTaskRequest(const QString &projectId, const QString &pa
     if (edit.deadline)
         task.insert(QStringLiteral("deadlineTs"), *deadline);
     const auto account = m_accountScopeRevision;
-    withCurrentUser(operation, [this, projectId, parentId, task = std::move(task), deadline, operation, account,
+    withCurrentUser(operation, RequestPolicy::AccountScoped, [this, projectId, parentId, task = std::move(task), deadline, operation, account,
                                 creatorId, assigneeId](qint64 userId) mutable {
         if (account != m_accountScopeRevision)
             return;
@@ -4031,7 +4037,7 @@ void CloudBackend::createTaskRequest(const QString &projectId, const QString &pa
         ajaxJson(QStringLiteral("tasks.v2.Task.add"),
                  {{QStringLiteral("task"), task}, {QStringLiteral("view"), false},
                   {QStringLiteral("deadlineManuallySet"), *deadline != 0}},
-                 operation, [this, projectId, parentId, operation](QJsonValue result) {
+                 operation, RequestPolicy::AccountScoped, [this, projectId, parentId, operation](QJsonValue result) {
             const auto taskId = numericId(field(result.toObject(), {"id"}));
             if (taskId.isEmpty())
                 return failShape(operation);
@@ -4045,7 +4051,7 @@ void CloudBackend::createTaskRequest(const QString &projectId, const QString &pa
 
 void CloudBackend::updateTask(const QString &taskId, const TaskEdit &edit)
 {
-    const auto operation = QStringLiteral("update-task:") + taskId;
+    const auto operation = operationKey(OperationKind::UpdateTask, taskId);
     const auto deadline = taskDeadline(edit.deadline.value_or(QString()));
     if (numericId(taskId).isEmpty() || (edit.title && edit.title->trimmed().isEmpty()) || !deadline
         || (edit.deadlineReason && edit.deadlineReason->size() > 2000)) {
@@ -4088,7 +4094,7 @@ void CloudBackend::updateTask(const QString &taskId, const TaskEdit &edit)
     }
     if (!edit.hasChanges())
         return;
-    ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}}, operation,
+    ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}}, operation, RequestPolicy::Required,
              [this, taskId, id, edit, writes = std::move(writes), operation]
              (QJsonValue result) mutable {
         const auto current = result.toObject();
@@ -4130,15 +4136,15 @@ void CloudBackend::updateTask(const QString &taskId, const TaskEdit &edit)
 
 void CloudBackend::deleteTask(const QString &taskId)
 {
-    const auto operation = QStringLiteral("delete-task:") + taskId;
+    const auto operation = operationKey(OperationKind::DeleteTask, taskId);
     if (!m_started || taskId.isEmpty() || numericId(taskId) != taskId)
         return failShape(operation);
     const auto account = m_accountScopeRevision;
     const auto key = taskActionRequestKey(account, taskId);
-    if (m_inflightOperations.contains(key) || m_inflightOperations.contains(QStringLiteral("update-task:") + taskId))
+    if (m_inflightOperations.contains(key) || m_inflightOperations.contains(operationKey(OperationKind::UpdateTask, taskId)))
         return;
     const QJsonObject id{{QStringLiteral("id"), taskId.toLongLong()}};
-    ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}}, operation,
+    ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}}, operation, RequestPolicy::Required,
              [this, taskId, operation, account, key](QJsonValue response) {
         if (account != m_accountScopeRevision)
             return;
@@ -4150,7 +4156,7 @@ void CloudBackend::deleteTask(const QString &taskId)
             return;
         }
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.delete.json"));
-        webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, QStringLiteral("result"),
+        webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, RequestPolicy::Required, QStringLiteral("result"),
                    [this, taskId, operation, account](QJsonValue result) {
             if (account != m_accountScopeRevision)
                 return;
@@ -4170,7 +4176,7 @@ void CloudBackend::deleteTask(const QString &taskId)
 
 void CloudBackend::updateTaskRequisite(const QString &taskId, const TaskEdit &edit)
 {
-    const auto operation = QStringLiteral("update-task:") + taskId;
+    const auto operation = operationKey(OperationKind::UpdateTask, taskId);
     if ((edit.creatorId && numericId(*edit.creatorId).isEmpty())
         || (edit.assigneeId && numericId(*edit.assigneeId).isEmpty())
         || (edit.projectId && !boardStageId(*edit.projectId))
@@ -4184,7 +4190,7 @@ void CloudBackend::updateTaskRequisite(const QString &taskId, const TaskEdit &ed
     const auto account = m_accountScopeRevision;
     const auto requestKey = (edit.rating || edit.statusAction || edit.assigneeId || edit.projectId || edit.stageId)
         ? taskActionRequestKey(account, taskId) : QString();
-    ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}}, operation,
+    ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}}, operation, RequestPolicy::Required,
              [this, taskId, operation, id, edit, account, requestKey](QJsonValue data) {
         const auto current = data.toObject();
         if (!requestKey.isEmpty() && account != m_accountScopeRevision)
@@ -4212,7 +4218,7 @@ void CloudBackend::updateTaskRequisite(const QString &taskId, const TaskEdit &ed
             auto *buffer = new QBuffer;
             buffer->setData(QJsonDocument(body).toJson(QJsonDocument::Compact));
             buffer->open(QIODevice::ReadOnly);
-            webRequestRaw(url, buffer, {{"Content-Type", "application/json"}}, operation, QStringLiteral("result"),
+            webRequestRaw(url, buffer, {{"Content-Type", "application/json"}}, operation, RequestPolicy::Required, QStringLiteral("result"),
                           [this, taskId, operation, rating, account](QJsonValue result) {
                 if (account != m_accountScopeRevision)
                     return;
@@ -4230,7 +4236,7 @@ void CloudBackend::updateTaskRequisite(const QString &taskId, const TaskEdit &ed
         }
         if (edit.stageId) {
             componentAction(QStringLiteral("moveStage"),
-                {{QStringLiteral("taskId"), taskId}, {QStringLiteral("stageId"), *edit.stageId}}, operation,
+                {{QStringLiteral("taskId"), taskId}, {QStringLiteral("stageId"), *edit.stageId}}, operation, RequestPolicy::Required,
                 [this, taskId, operation, account](QJsonValue result) {
                     if (account != m_accountScopeRevision)
                         return;
@@ -4241,7 +4247,7 @@ void CloudBackend::updateTaskRequisite(const QString &taskId, const TaskEdit &ed
             return;
         }
         const auto postAction = [this, taskId, operation, requestKey](const QString &action, const QJsonObject &body) {
-            ajaxJson(action, body, operation, [this, taskId, operation](QJsonValue result) {
+            ajaxJson(action, body, operation, RequestPolicy::Required, [this, taskId, operation](QJsonValue result) {
                 if (result == false)
                     return failShape(operation);
                 emit taskUpdated(taskId);
@@ -4318,7 +4324,7 @@ void CloudBackend::updateTaskRequisite(const QString &taskId, const TaskEdit &ed
             const bool adding = !added.isEmpty();
             const auto changed = adding ? added : removed;
             const bool canWatch = current.value(QStringLiteral("rights")).toObject().value(QStringLiteral("watch")) == true;
-            withCurrentUser(operation, [this, taskId, operation, id, changed, adding, canWatch,
+            withCurrentUser(operation, RequestPolicy::Required, [this, taskId, operation, id, changed, adding, canWatch,
                                         canManage = rights.observers](qint64 currentUser) {
                 const bool self = changed.size() == 1 && changed.first().toLongLong() == currentUser;
                 if (self ? !canWatch : !canManage) {
@@ -4353,8 +4359,8 @@ void CloudBackend::updateTaskFields(const QString &taskId, QQueue<QPair<QString,
         return;
     }
     const auto [action, task] = writes.dequeue();
-    const auto operation = QStringLiteral("update-task:") + taskId;
-    ajaxJson(action, {{QStringLiteral("task"), task}}, operation,
+    const auto operation = operationKey(OperationKind::UpdateTask, taskId);
+    ajaxJson(action, {{QStringLiteral("task"), task}}, operation, RequestPolicy::Required,
              [this, taskId, operation, title = task.value(QStringLiteral("title")).toString(),
               changedProject = task.contains(QStringLiteral("group")),
               project = task.value(QStringLiteral("group")).toObject().value(QStringLiteral("id")).toInteger(-1),
@@ -4399,7 +4405,7 @@ void CloudBackend::loadLinkProject(const QString &id, const QString &operation,
           {QStringLiteral("select[0]"), QStringLiteral("ID")}, {QStringLiteral("select[1]"), QStringLiteral("NAME")},
           {QStringLiteral("select[2]"), QStringLiteral("DESCRIPTION")}, {QStringLiteral("select[3]"), QStringLiteral("AVATAR")},
           {QStringLiteral("select[4]"), QStringLiteral("AVATAR_TYPE")}},
-         operation, [this, id, scope, complete = std::move(complete)](QJsonValue value) {
+         operation, RequestPolicy::Optional, [this, id, scope, complete = std::move(complete)](QJsonValue value) {
         if (m_authExpired || settingsScope() != scope) {
             complete({}, {});
             return;
@@ -4436,7 +4442,7 @@ void CloudBackend::requestMessageLinkPreview(const QUrl &url, LinkPreviewHandler
         complete({});
         return;
     }
-    const auto operation = QStringLiteral("link-preview:") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const auto operation = operationKey(OperationKind::LinkPreview, QUuid::createUuid().toString(QUuid::WithoutBraces));
     const auto scope = settingsScope();
     const auto finish = [this, scope, complete = std::move(complete)](MessageLinkPreview preview) {
         if (m_authExpired || settingsScope() != scope)
@@ -4445,7 +4451,7 @@ void CloudBackend::requestMessageLinkPreview(const QUrl &url, LinkPreviewHandler
     };
     switch (target->kind) {
     case NotificationTargetKind::Task:
-        loadTask(target->id, operation, [this, finish, scope, operation](const QJsonObject &row) {
+        loadTask(target->id, operation, RequestPolicy::Optional, [this, finish, scope, operation](const QJsonObject &row) {
             if (m_authExpired || settingsScope() != scope) {
                 finish({});
                 return;
@@ -4519,7 +4525,7 @@ void CloudBackend::requestMessageLinkPreview(const QUrl &url, LinkPreviewHandler
         });
         break;
     case NotificationTargetKind::Person:
-        loadPerson(target->id, operation, [finish](const Person &person) {
+        loadPerson(target->id, operation, RequestPolicy::Optional, [finish](const Person &person) {
             finish({person.name, person.position.isEmpty() ? QStringList{} : QStringList{person.position},
                     MessageLinkPreviewKind::Person, person.avatarUrl});
         });
@@ -4527,7 +4533,7 @@ void CloudBackend::requestMessageLinkPreview(const QUrl &url, LinkPreviewHandler
     case NotificationTargetKind::Chat:
         ajax(QStringLiteral("im.v2.Chat.load"),
              {{QStringLiteral("dialogId"), target->id}, {QStringLiteral("messageLimit"), QStringLiteral("1")}},
-             operation, [this, dialogId = target->id, finish](QJsonValue value) {
+             operation, RequestPolicy::Optional, [this, dialogId = target->id, finish](QJsonValue value) {
             const auto chat = value.toObject().value(QStringLiteral("chat")).toObject();
             const auto supplied = field(chat, {"dialogId", "DIALOG_ID"});
             if (chatDialog(field(chat, {"id", "chatId", "ID"})) != dialogId
@@ -4542,7 +4548,7 @@ void CloudBackend::requestMessageLinkPreview(const QUrl &url, LinkPreviewHandler
     }
 }
 
-void CloudBackend::loadTask(const QString &taskId, const QString &operation,
+void CloudBackend::loadTask(const QString &taskId, const QString &operation, RequestPolicy policy,
                             std::function<void(QJsonObject)> onTask, const QString &requestKey, bool remember)
 {
     if (numericId(taskId).isEmpty()) {
@@ -4553,7 +4559,7 @@ void CloudBackend::loadTask(const QString &taskId, const QString &operation,
     for (const auto *name : {"ID", "TITLE", "STAGE_ID", "DESCRIPTION", "RESPONSIBLE_ID", "DEADLINE", "PRIORITY",
                             "CHAT_ID", "UF_TASK_WEBDAV_FILES", "CREATED_BY", "CREATED_DATE", "GROUP_ID", "STATUS", "AUDITORS", "TAGS", "MARK"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
-    ajax(QStringLiteral("tasks.task.get"), fields, operation,
+    ajax(QStringLiteral("tasks.task.get"), fields, operation, policy,
          [this, taskId, operation, onTask = std::move(onTask), remember, scope = m_accountScopeRevision,
           bindingRevision = m_projectUnreadBindingRevision](QJsonValue data) {
         if (remember && scope != m_accountScopeRevision)
@@ -4600,7 +4606,7 @@ QUrl CloudBackend::taskRoleAvatar(const QJsonObject &current, const QJsonObject 
 
 void CloudBackend::requestTask(const QString &taskId)
 {
-    const auto operation = taskReadOperationPrefix + taskId;
+    const auto operation = operationKey(OperationKind::Task, taskId);
     if (numericId(taskId) != taskId || taskId.isEmpty()) {
         emit failed(operation, QStringLiteral("Некорректный номер задачи"));
         return;
@@ -4615,8 +4621,8 @@ void CloudBackend::requestTask(const QString &taskId)
     m_taskCardReads.insert(taskId, TaskCardRead{});
     m_taskAttachmentRevisions.remove(taskId);
     const auto account = m_accountScopeRevision;
-    const auto key = taskCardReadPrefix + QString::number(account) + QLatin1Char(':') + taskId;
-    loadTask(taskId, operation, [this, taskId, account](const QJsonObject &data) {
+    const auto key = operationKey(OperationKind::TaskCardRead, QString::number(account), taskId);
+    loadTask(taskId, operation, RequestPolicy::Required, [this, taskId, account](const QJsonObject &data) {
         if (account != m_accountScopeRevision)
             return;
         const auto current = m_taskCardReads.find(taskId);
@@ -4646,7 +4652,7 @@ void CloudBackend::requestTask(const QString &taskId)
     }
     const QJsonObject id{{QStringLiteral("id"), taskId.toLongLong()}};
     ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}},
-             QStringLiteral("task-details:") + taskId, [this, taskId, account](QJsonValue element) {
+             operationKey(OperationKind::TaskDetails, taskId), RequestPolicy::Optional, [this, taskId, account](QJsonValue element) {
         if (account != m_accountScopeRevision)
             return;
         const auto read = m_taskCardReads.find(taskId);
@@ -4700,7 +4706,7 @@ void CloudBackend::loadTaskChecklist(const QString &taskId, const QString &opera
         return;
     }
     ajaxJson(QStringLiteral("tasks.v2.CheckList.get"), {{QStringLiteral("taskId"), taskId.toLongLong()}},
-             operation, [this, operation, handler = std::move(handler)](QJsonValue data) {
+             operation, RequestPolicy::Required, [this, operation, handler = std::move(handler)](QJsonValue data) {
         const auto object = data.toObject();
         const auto status = object.value(QStringLiteral("status"));
         const auto rows = data.isArray() ? data : object.value(QStringLiteral("checklist"));
@@ -4712,7 +4718,7 @@ void CloudBackend::loadTaskChecklist(const QString &taskId, const QString &opera
 
 void CloudBackend::requestTaskChecklist(const QString &taskId)
 {
-    loadTaskChecklist(taskId, QStringLiteral("checklist:") + taskId, [this, taskId](QJsonArray rows, QJsonValue) {
+    loadTaskChecklist(taskId, operationKey(OperationKind::Checklist, taskId), [this, taskId](QJsonArray rows, QJsonValue) {
         QVector<TaskChecklistItem> items;
         QSet<QString> seen;
         for (const auto value : rows) {
@@ -4733,8 +4739,8 @@ void CloudBackend::requestTaskChecklist(const QString &taskId)
 
 void CloudBackend::updateTaskChecklist(const QString &taskId, const QString &action, QJsonObject payload)
 {
-    const auto operation = QStringLiteral("checklist-write:") + taskId;
-    ajaxJson(action, payload, operation, [this, taskId, operation](QJsonValue data) {
+    const auto operation = operationKey(OperationKind::ChecklistWrite, taskId);
+    ajaxJson(action, payload, operation, RequestPolicy::Required, [this, taskId, operation](QJsonValue data) {
         const auto status = data.toObject().value(QStringLiteral("status"));
         if (status == QLatin1String("conflict")) {
             emit failed(operation, QStringLiteral("Чек-лист изменился на портале. Повторите действие"));
@@ -4750,7 +4756,7 @@ void CloudBackend::updateTaskChecklist(const QString &taskId, const QString &act
 
 void CloudBackend::addTaskChecklistItem(const QString &taskId, const QString &parentId, const QString &title)
 {
-    const auto operation = QStringLiteral("checklist-write:") + taskId;
+    const auto operation = operationKey(OperationKind::ChecklistWrite, taskId);
     const auto name = title.trimmed();
     if (name.isEmpty() || name.size() > 300 || (!parentId.isEmpty() && numericId(parentId).isEmpty())) {
         emit failed(operation, QStringLiteral("Проверьте название пункта и номер чек-листа"));
@@ -4798,7 +4804,7 @@ void CloudBackend::addTaskChecklistItem(const QString &taskId, const QString &pa
 
 void CloudBackend::setTaskChecklistComplete(const QString &taskId, const QString &itemId, bool complete)
 {
-    const auto operation = QStringLiteral("checklist-write:") + taskId;
+    const auto operation = operationKey(OperationKind::ChecklistWrite, taskId);
     loadTaskChecklist(taskId, operation, [this, taskId, itemId, complete, operation](QJsonArray rows, QJsonValue) {
         for (const auto value : rows) {
             auto row = value.toObject();
@@ -4818,7 +4824,7 @@ void CloudBackend::setTaskChecklistComplete(const QString &taskId, const QString
 
 void CloudBackend::requestSubtasks(const QString &taskId)
 {
-    const auto operation = QStringLiteral("subtasks:") + taskId;
+    const auto operation = operationKey(OperationKind::Subtasks, taskId);
     if (numericId(taskId).isEmpty()) {
         emit failed(operation, QStringLiteral("Номер задачи недействителен"));
         return;
@@ -4827,7 +4833,7 @@ void CloudBackend::requestSubtasks(const QString &taskId)
         {{QStringLiteral("taskId"), taskId.toLongLong()}, {QStringLiteral("withIds"), false},
          {QStringLiteral("withCompleted"), true}, {QStringLiteral("withSubTasks"), false},
          {QStringLiteral("navigation"), QJsonObject{{QStringLiteral("size"), tunables::kPageSizeChats}}}},
-        operation, [this, taskId, operation](QJsonValue data) {
+        operation, RequestPolicy::Required, [this, taskId, operation](QJsonValue data) {
         const auto tasks = data.toObject().value(QStringLiteral("tasks"));
         if (!tasks.isArray())
             return failShape(operation);
@@ -4849,7 +4855,7 @@ void CloudBackend::requestSubtasks(const QString &taskId)
 
 void CloudBackend::requestTaskDependencies(const QString &taskId)
 {
-    const auto operation = QStringLiteral("gantt-links:") + taskId;
+    const auto operation = operationKey(OperationKind::GanttLinks, taskId);
     if (numericId(taskId).isEmpty()) {
         emit failed(operation, QStringLiteral("Номер задачи недействителен"));
         return;
@@ -4858,7 +4864,7 @@ void CloudBackend::requestTaskDependencies(const QString &taskId)
         {{QStringLiteral("taskId"), taskId.toLongLong()}, {QStringLiteral("withIds"), false},
          {QStringLiteral("withCompleted"), true}, {QStringLiteral("withSubTasks"), false},
          {QStringLiteral("navigation"), QJsonObject{{QStringLiteral("size"), tunables::kPageSizeChats}}}},
-        operation, [this, taskId, operation](QJsonValue data) {
+        operation, RequestPolicy::Required, [this, taskId, operation](QJsonValue data) {
         const auto tasks = data.toObject().value(QStringLiteral("tasks"));
         if (!tasks.isArray())
             return failShape(operation);
@@ -4894,13 +4900,13 @@ void CloudBackend::requestTaskDependencies(const QString &taskId)
 
 void CloudBackend::requestTaskHistory(const QString &taskId)
 {
-    const auto operation = QStringLiteral("task-history:") + taskId;
+    const auto operation = operationKey(OperationKind::TaskHistory, taskId);
     if (numericId(taskId).isEmpty()) {
         emit failed(operation, QStringLiteral("Номер задачи недействителен"));
         return;
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.history.list.json"));
-    webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, QStringLiteral("result"),
+    webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, RequestPolicy::Optional, QStringLiteral("result"),
                Handler::checked(QStringLiteral("История задачи недоступна"),
                [](const QJsonValue &data) { return data.toObject().value(QStringLiteral("list")).isArray(); },
                [this, taskId](QJsonValue data) {
@@ -4952,7 +4958,7 @@ void CloudBackend::requestTaskHistory(const QString &taskId)
 void CloudBackend::requestProjectTimeline(const QString &projectId)
 {
     if (numericId(projectId).isEmpty()) {
-        emit failed(QStringLiteral("timeline:") + projectId, QStringLiteral("Некорректный номер проекта"));
+        emit failed(operationKey(OperationKind::Timeline, projectId), QStringLiteral("Некорректный номер проекта"));
         return;
     }
     loadProjectTimeline(projectId, 0, {});
@@ -4960,13 +4966,13 @@ void CloudBackend::requestProjectTimeline(const QString &projectId)
 
 void CloudBackend::loadProjectTimeline(const QString &projectId, int offset, QVector<Task> tasks)
 {
-    const auto operation = QStringLiteral("timeline:") + projectId;
+    const auto operation = operationKey(OperationKind::Timeline, projectId);
     Fields fields{{QStringLiteral("filter[GROUP_ID]"), projectId},
                   {QStringLiteral("order[ID]"), QStringLiteral("DESC")},
                   {QStringLiteral("start"), QString::number(offset)}};
     for (const auto *name : {"ID", "TITLE", "GROUP_ID", "START_DATE_PLAN", "END_DATE_PLAN"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
-    ajax(QStringLiteral("tasks.task.list"), fields, operation,
+    ajax(QStringLiteral("tasks.task.list"), fields, operation, RequestPolicy::Required,
          [this, projectId, offset, operation, tasks = std::move(tasks)](QJsonValue data) mutable {
         const auto rows = data.toObject().value(QStringLiteral("tasks"));
         if (!rows.isArray())
@@ -5001,7 +5007,7 @@ void CloudBackend::requestTaskMessages(const QString &taskId)
     }
     updateHistoryCatchup(true);
     if (canAutoRefreshChats() && (m_requests.size() >= maxRequests
-        || m_inflightOperations.contains(QStringLiteral("task-messages:") + taskId))) {
+        || m_inflightOperations.contains(operationKey(OperationKind::TaskMessages, taskId)))) {
         m_taskMessagesDirty = true;
         scheduleRefresh();
         return;
@@ -5010,8 +5016,8 @@ void CloudBackend::requestTaskMessages(const QString &taskId)
         loadMessages(taskId, id, true);
         return;
     }
-    const auto op = QStringLiteral("task-messages:") + taskId;
-    loadTask(taskId, op, [this, taskId, op](const QJsonObject &) {
+    const auto op = operationKey(OperationKind::TaskMessages, taskId);
+    loadTask(taskId, op, RequestPolicy::Required, [this, taskId, op](const QJsonObject &) {
         const auto dialog = m_taskDialogs.value(taskId);
         if (dialog.isEmpty()) {
             emit failed(op, QStringLiteral("У задачи нет чата. Старые обсуждения могут быть в комментариях портала"));
@@ -5024,8 +5030,8 @@ void CloudBackend::requestTaskMessages(const QString &taskId)
 void CloudBackend::sendMessage(const QString &key, const QString &dialogId, const QString &text, bool task,
                                const QString &replyId)
 {
-    const auto scope = (task ? QStringLiteral("task:") : QStringLiteral("chat:")) + key;
-    const auto op = QStringLiteral("send:") + scope;
+    const auto scope = operationKey(task ? OperationKind::Task : OperationKind::Chat, key);
+    const auto op = operationKey(task ? OperationKind::SendTask : OperationKind::SendChat, key);
     if (m_inflightOperations.contains(op))
         return;
     if (validDialog(dialogId).isEmpty() || text.trimmed().isEmpty() || text.size() > 20000) {
@@ -5047,7 +5053,7 @@ void CloudBackend::sendMessage(const QString &key, const QString &dialogId, cons
     if (!reply.isEmpty())
         fields.append({QStringLiteral("fields[replyId]"), reply});
     ajax(QStringLiteral("im.v2.Chat.Message.send"), std::move(fields),
-         op, [this, key, scope, op, dialogId, task](QJsonValue data) {
+         op, RequestPolicy::NotifyAccountChange, [this, key, scope, op, dialogId, task](QJsonValue data) {
         const auto id = field(data.toObject(), {"id", "messageId"});
         if (id.isEmpty()) {
             emit failed(op, QStringLiteral("Портал не подтвердил отправку. Проверьте историю перед повтором"));
@@ -5070,7 +5076,7 @@ void CloudBackend::sendChatMessage(const QString &dialogId, const QString &text)
 void CloudBackend::sendChatReply(const QString &dialog, const QString &text, const QString &replyId)
 {
     if (replyId.isEmpty()) {
-        emit failed(QStringLiteral("send:chat:") + dialog, QStringLiteral("Выберите сообщение для ответа"));
+        emit failed(operationKey(OperationKind::SendChat, dialog), QStringLiteral("Выберите сообщение для ответа"));
         return;
     }
     sendMessage(dialog, dialog, text, false, replyId);
@@ -5084,7 +5090,7 @@ void CloudBackend::sendTaskMessage(const QString &taskId, const QString &text)
 void CloudBackend::sendTaskReply(const QString &taskId, const QString &text, const QString &replyId)
 {
     if (replyId.isEmpty()) {
-        emit failed(QStringLiteral("send:task:") + taskId, QStringLiteral("Выберите сообщение для ответа"));
+        emit failed(operationKey(OperationKind::SendTask, taskId), QStringLiteral("Выберите сообщение для ответа"));
         return;
     }
     sendTaskMessage(taskId, text, replyId);
@@ -5094,7 +5100,7 @@ void CloudBackend::sendTaskMessage(const QString &taskId, const QString &text, c
 {
     const auto dialog = m_taskDialogs.value(taskId);
     if (dialog.isEmpty()) {
-        emit failed(QStringLiteral("send:task:") + taskId, QStringLiteral("Сначала откройте чат задачи"));
+        emit failed(operationKey(OperationKind::SendTask, taskId), QStringLiteral("Сначала откройте чат задачи"));
         return;
     }
     sendMessage(taskId, dialog, text, true, replyId);
@@ -5136,7 +5142,7 @@ void CloudBackend::notificationBatch(const QString &method, const QUrlQuery &par
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
     webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")},
                      {QStringLiteral("cmd[notify]"), command}},
-               operation, QStringLiteral("result"),
+               operation, RequestPolicy::Required, QStringLiteral("result"),
                [this, operation, onResult = std::move(onResult)](QJsonValue batch) {
         const auto result = batch.toObject().value(QStringLiteral("result")).toObject().value(QStringLiteral("notify"));
         if (result.isUndefined() || result.isNull())
@@ -5265,7 +5271,7 @@ void CloudBackend::requestOlderNotifications()
 
 void CloudBackend::searchNotifications(const QString &query)
 {
-    const auto operation = QStringLiteral("search-notifications:") + query;
+    const auto operation = operationKey(OperationKind::SearchNotifications, query);
     if (query.size() < 3 || query.size() > 200)
         return failShape(operation);
     if (m_notificationSearchQuery != query)
@@ -5332,7 +5338,7 @@ void CloudBackend::removeNotification(const QString &id)
 
 void CloudBackend::markNotificationRead(const QString &id)
 {
-    const auto operation = QStringLiteral("read-notification");
+    const auto operation = operationKey(OperationKind::ReadNotification);
     if (id.isEmpty() || numericId(id) != id)
         return failShape(operation);
     QUrlQuery parameters;
@@ -5352,7 +5358,7 @@ void CloudBackend::markNotificationsRead(const QStringList &ids)
 {
     if (ids.isEmpty())
         return;
-    const auto operation = QStringLiteral("read-notifications");
+    const auto operation = operationKey(OperationKind::ReadNotifications);
     QStringList selected;
     QStringList local;
     QSet<QString> seen;
@@ -5398,7 +5404,7 @@ void CloudBackend::markNotificationsRead(const QStringList &ids)
 
 void CloudBackend::markAllNotificationsRead()
 {
-    const auto operation = QStringLiteral("read-all-notifications");
+    const auto operation = operationKey(OperationKind::ReadAllNotifications);
     QStringList snapshot;
     for (const auto *source : {&m_notifications, &m_notificationSearchRows})
         for (const auto &item : *source)
@@ -5439,7 +5445,7 @@ QString CloudBackend::notificationTaskId(const QString &dialog, const QJsonObjec
 
 void CloudBackend::deleteNotification(const QString &id)
 {
-    const auto operation = QStringLiteral("delete-notification");
+    const auto operation = operationKey(OperationKind::DeleteNotification);
     if (id.isEmpty() || numericId(id) != id)
         return failShape(operation);
     QUrlQuery parameters;
@@ -5460,7 +5466,7 @@ void CloudBackend::connectPull()
     QUrlQuery configQuery;
     configQuery.addQueryItem(QStringLiteral("logTag"), QStringLiteral("client_start"));
     url.setQuery(configQuery);
-    webRequest(url, {{QStringLiteral("CACHE"), QStringLiteral("N")}}, pushOp, QStringLiteral("result"),
+    webRequest(url, {{QStringLiteral("CACHE"), QStringLiteral("N")}}, pushOp, RequestPolicy::Required, QStringLiteral("result"),
                [this](QJsonValue response) {
         const auto config = response.toObject();
         const auto server = config.value(QStringLiteral("server")).toObject();
@@ -6224,7 +6230,7 @@ void CloudBackend::deliverChatPopups()
 
 void CloudBackend::requestNotificationSettings()
 {
-    requestNotificationSettings(QStringLiteral("notification-settings"));
+    requestNotificationSettings(operationKey(OperationKind::NotificationSettings));
 }
 
 void CloudBackend::requestNotificationSettings(const QString &operation, const QString &updated, int expected,
@@ -6233,11 +6239,11 @@ void CloudBackend::requestNotificationSettings(const QString &operation, const Q
     const auto before = started.value_or(m_notificationSettingsRevision);
     const auto popupGeneration = m_chatPopupSettingsGeneration;
     const auto accountScope = m_accountScopeRevision;
-    withCurrentUser(operation, [this, operation, updated, expected, before, popupGeneration, accountScope](qint64 userId) {
+    withCurrentUser(operation, RequestPolicy::Required, [this, operation, updated, expected, before, popupGeneration, accountScope](qint64 userId) {
         if (accountScope != m_accountScopeRevision)
             return;
         ajax(QStringLiteral("im.v2.Settings.General.list"), {{QStringLiteral("userId"), QString::number(userId)}},
-             operation, [this, operation, updated, expected, before, popupGeneration, accountScope](QJsonValue result) {
+             operation, RequestPolicy::Required, [this, operation, updated, expected, before, popupGeneration, accountScope](QJsonValue result) {
             if (accountScope != m_accountScopeRevision)
                 return;
             auto data = result.toObject();
@@ -6276,18 +6282,18 @@ void CloudBackend::requestNotificationSettings(const QString &operation, const Q
 
 void CloudBackend::updateNotificationSetting(const QString &name, int value)
 {
-    const auto operation = QStringLiteral("notification-settings-update");
+    const auto operation = operationKey(OperationKind::NotificationSettingsUpdate);
     const bool toggle = name == soundMuted || simpleChannels.contains(name);
     if (!m_notificationSettings.contains(name) || (!toggle && name != volumeGeneral && name != volumeMessages))
         return failShape(operation);
     if (value < 0 || value > (toggle ? 1 : 100))
         return failShape(operation);
-    withCurrentUser(operation, [this, name, value, toggle, operation, started = m_notificationSettingsRevision](qint64 userId) {
+    withCurrentUser(operation, RequestPolicy::Required, [this, name, value, toggle, operation, started = m_notificationSettingsRevision](qint64 userId) {
         const auto setting = toggle ? QJsonValue(value != 0) : QJsonValue(value);
         ajaxJson(QStringLiteral("im.v2.Settings.General.update"),
                  {{QStringLiteral("userId"), userId}, {QStringLiteral("name"), name}, {QStringLiteral("value"), setting},
                   {QStringLiteral("actionUuid"), QUuid::createUuid().toString(QUuid::WithoutBraces)}},
-                 operation, [this, name, value, operation, started](QJsonValue response) {
+                 operation, RequestPolicy::Required, [this, name, value, operation, started](QJsonValue response) {
             if (response == false)
                 return failShape(operation);
             requestNotificationSettings(operation, name, value, started);
@@ -6303,7 +6309,7 @@ void CloudBackend::loadChatPopupSettings()
     m_nextChatPopupSettingsRequest = now + 3000;
     const bool hadUser = !m_userId.isEmpty();
     const auto generation = m_chatPopupSettingsGeneration;
-    withCurrentUser(soundsOp, [this, hadUser, generation](qint64 userId) {
+    withCurrentUser(soundsOp, RequestPolicy::Required, [this, hadUser, generation](qint64 userId) {
         if (generation != m_chatPopupSettingsGeneration) {
             loadChatPopupSettings();
             return;
@@ -6316,7 +6322,7 @@ void CloudBackend::loadChatPopupSettings()
             scheduleRefresh();
         }
         ajax(QStringLiteral("im.v2.Settings.General.list"), {{QStringLiteral("userId"), QString::number(userId)}},
-             soundsOp, [this, generation](QJsonValue data) {
+             soundsOp, RequestPolicy::Required, [this, generation](QJsonValue data) {
             if (generation != m_chatPopupSettingsGeneration) {
                 loadChatPopupSettings();
                 return;
