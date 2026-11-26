@@ -3,6 +3,7 @@
 #include "chromesignin/chrome_signin.h"
 #include "cloud/cloud_backend.h"
 #include "core/demo_backend.h"
+#include "core/operations.h"
 #include "core/origin_guard.h"
 #include "signin/session_restore.h"
 #include "signin/session_store.h"
@@ -304,8 +305,9 @@ public:
                 record(QStringLiteral("pushConnected"), true);
         });
         connect(backend, &Backend::failed, this, [this](const QString &operation, const QString &) {
-            m_result.insert(QStringLiteral("failed:") + operation.section(QLatin1Char(':'), 0, 0), true);
-            if (operation.startsWith(QStringLiteral("board:")))
+            const auto kind = parseOperation(operation).kind;
+            m_result.insert(QStringLiteral("failed:") + operationName(kind), true);
+            if (kind == OperationKind::Board)
                 nextBoard();
         });
         QTimer::singleShot(15000, this, [this] { finish(false); });
@@ -462,7 +464,7 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
             });
         });
         QObject::connect(cloud, &Backend::failed, &tray, [&](const QString &operation, const QString &) {
-            if (recovery == Recovery::Identity && operation == QLatin1String("session-recovery"))
+            if (recovery == Recovery::Identity && parseOperation(operation).kind == OperationKind::SessionRecovery)
                 requireManualSignin();
         });
         QObject::connect(&sessionStore, &signin::SessionStore::saved, &tray, [&](bool) {

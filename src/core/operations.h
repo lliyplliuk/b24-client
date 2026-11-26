@@ -107,6 +107,15 @@ enum class OperationKind {
     Count
 };
 
+enum class RequestPolicy {
+    Required,
+    Optional,
+    AccountScoped,        // Use a separate in-flight key per account revision.
+    NotifyAccountChange,  // Release a busy UI control when its request becomes stale.
+    HistorySnapshot,
+    HistoryRead
+};
+
 struct ParsedOperation {
     OperationKind kind = OperationKind::Unknown;
     QStringList ids;
@@ -126,6 +135,8 @@ inline QString operationKey(OperationKind kind, const QString &first, const QStr
     return operationKey(kind, QStringList{first, second, third});
 }
 ParsedOperation parseOperation(const QString &key);
+QString operationName(OperationKind kind);
+RequestPolicy defaultRequestPolicy(OperationKind kind);
 QString operationErrorHint(OperationKind kind);
 
 } // namespace bx

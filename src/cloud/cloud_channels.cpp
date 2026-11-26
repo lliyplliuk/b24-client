@@ -262,7 +262,6 @@ struct CloudBackend::Upload {
     QString scopeId;
     QString kind;
     QString operation;
-    RequestPolicy policy;
     QString requestKey;
     QString caption;
     bool image = false;
@@ -1006,7 +1005,7 @@ void CloudBackend::acceptPinnedSnapshot(const QString &dialog, const QJsonObject
     ajax(QStringLiteral("im.v2.Chat.Pin.tail"),
          {{QStringLiteral("dialogId"), dialog}, {QStringLiteral("filter[lastId]"), last},
           {QStringLiteral("order[id]"), QStringLiteral("DESC")}, {QStringLiteral("limit"), QStringLiteral("25")}},
-         operation, RequestPolicy::Required, [this, generation, dialog, last](QJsonValue data) {
+         operation, [this, generation, dialog, last](QJsonValue data) {
         if (m_pinnedGeneration != generation || m_pinnedDialog != dialog)
             return;
         auto next = decodePinnedMessages(data.toObject());
@@ -1050,7 +1049,7 @@ void CloudBackend::requestPinnedMessages(const QString &dialogId)
         const auto operation = operationKey(OperationKind::Pins, dialog);
         ajax(QStringLiteral("im.v2.Chat.load"),
              {{QStringLiteral("dialogId"), dialog}, {QStringLiteral("messageLimit"), QStringLiteral("1")}},
-             operation, RequestPolicy::Required, [this, dialog, generation](QJsonValue data) {
+             operation, [this, dialog, generation](QJsonValue data) {
             if (m_pinnedGeneration != generation)
                 return;
             const auto payload = data.toObject();
@@ -1130,7 +1129,7 @@ void CloudBackend::rememberDialog(const QString &dialog, const QJsonObject &obje
     m_dialogChatIds.insert(dialog, id);
 }
 
-void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QString &operation, RequestPolicy policy,
+void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QString &operation,
                                  const QString &requestKey, ResolvedDialog onDialog)
 {
     if (task) {
@@ -1139,7 +1138,7 @@ void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QStrin
             onDialog(known, id);
             return;
         }
-        loadTask(scopeId, operation, policy, [this, scopeId, operation, onDialog](const QJsonObject &) {
+        loadTask(scopeId, operation, [this, scopeId, operation, onDialog](const QJsonObject &) {
             const auto dialog = m_taskDialogs.value(scopeId);
             const auto chatId = groupChatId(dialog);
             if (chatId == 0) {
@@ -1162,7 +1161,7 @@ void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QStrin
     }
     ajax(QStringLiteral("im.v2.Chat.load"),
          {{QStringLiteral("dialogId"), dialog}, {QStringLiteral("messageLimit"), QStringLiteral("1")}},
-         operation, policy, [this, operation, dialog, onDialog, scope = m_accountScopeRevision](QJsonValue data) {
+         operation, [this, operation, dialog, onDialog, scope = m_accountScopeRevision](QJsonValue data) {
         if (scope != m_accountScopeRevision)
             return;
         rememberDialog(dialog, data.toObject());
@@ -1196,7 +1195,7 @@ void CloudBackend::searchTaskChats(const QString &query)
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
     const auto scope = m_accountScopeRevision;
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.list.json"));
-    webRequest(url, std::move(fields), operation, RequestPolicy::Required, resultEnvelope,
+    webRequest(url, std::move(fields), operation, resultEnvelope,
                [this, scope, query, needle, id, operation](QJsonValue data) {
         if (scope != m_accountScopeRevision || m_authExpired)
             return;
@@ -1271,7 +1270,7 @@ void CloudBackend::searchChats(const QString &query)
     const QJsonObject search{{QStringLiteral("queryWords"), words}, {QStringLiteral("query"), trimmed}};
     ajaxJson(QStringLiteral("ui.entityselector.doSearch"),
              {{QStringLiteral("dialog"), dialog}, {QStringLiteral("searchQuery"), search}},
-             operation, RequestPolicy::Required, [this, query, operation](QJsonValue data) {
+             operation, [this, query, operation](QJsonValue data) {
         const auto items = data.toObject().value(QStringLiteral("dialog")).toObject().value(QStringLiteral("items"));
         if (!items.isArray())
             return failShape(operation);
@@ -1309,9 +1308,9 @@ void CloudBackend::requestChatAssets(const QString &dialog, ChatAssetKind kind, 
         emit failed(operation, QStringLiteral("Некорректная граница списка вложений"));
         return;
     }
-    resolveDialog(dialog, false, operation, RequestPolicy::Required, operation,
+    resolveDialog(dialog, false, operation, operation,
                   [this, dialog, kind, cursor, operation, boundary](const QString &, qint64 chatId) {
-        loadChatAssets(chatId, kind, boundary, operation, RequestPolicy::Required, [this, dialog, kind, cursor](QVector<ChatAsset> items, QString next) {
+        loadChatAssets(chatId, kind, boundary, operation, [this, dialog, kind, cursor](QVector<ChatAsset> items, QString next) {
             emit chatAssetsLoaded(dialog, kind, cursor, items, next);
         });
     });
@@ -1326,13 +1325,13 @@ void CloudBackend::requestChatLinkPreviews(const QString &scopeId, bool task, Ch
         return;
     }
     const auto operation = operationKey(OperationKind::LinkPreviewChatAssets, QUuid::createUuid().toString(QUuid::WithoutBraces));
-    loadChatAssets(chatId, ChatAssetKind::Links, 0, operation, RequestPolicy::Optional,
+    loadChatAssets(chatId, ChatAssetKind::Links, 0, operation,
                    [complete = std::move(complete)](QVector<ChatAsset> items, QString) {
         complete(std::move(items));
     });
 }
 
-void CloudBackend::loadChatAssets(qint64 chatId, ChatAssetKind kind, qint64 boundary, const QString &operation, RequestPolicy policy,
+void CloudBackend::loadChatAssets(qint64 chatId, ChatAssetKind kind, qint64 boundary, const QString &operation,
                                   std::function<void(QVector<ChatAsset>, QString)> complete)
 {
     const bool links = kind == ChatAssetKind::Links;
@@ -1345,7 +1344,7 @@ void CloudBackend::loadChatAssets(qint64 chatId, ChatAssetKind kind, qint64 boun
         fields.append({links ? QStringLiteral("OFFSET") : QStringLiteral("LAST_ID"), QString::number(boundary)});
     const auto url = OriginGuard(m_session.origin).resolve(links ? QStringLiteral("/rest/im.chat.url.get.json")
                                                                  : QStringLiteral("/rest/im.chat.file.get.json"));
-    webRequest(url, fields, operation, policy, resultEnvelope,
+    webRequest(url, fields, operation, resultEnvelope,
                [this, operation, links, boundary, chatId, preview, scope,
                 complete = std::move(complete)](const QJsonValue &value) {
         if (preview && (m_authExpired || settingsScope() != scope)) {
@@ -1441,7 +1440,7 @@ void CloudBackend::requestMessageViewers(const QString &scopeId, const QString &
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.v2.Chat.Message.tailViewers.json"));
     webRequest(url, {{QStringLiteral("id"), QString::number(id)},
                      {QStringLiteral("limit"), QString::number(tunables::kPageSizeChats)}},
-               operation, RequestPolicy::Optional, resultEnvelope,
+               operation, resultEnvelope,
                [this, scope, dialog, task, scopeId, id, chatId, count = *knownCount, group, viewerDialog, key,
                 complete = std::move(complete)](QJsonValue response) {
         const auto result = response.toObject();
@@ -1502,7 +1501,7 @@ void CloudBackend::requestOlderChatMessages(const QString &scopeId, const QStrin
     if (before == 0)
         return failShape(operation);
     const auto scope = m_accountScopeRevision;
-    resolveDialog(scopeId, task, operation, RequestPolicy::Required, operation,
+    resolveDialog(scopeId, task, operation, operation,
                   [this, scopeId, beforeId, before, task, operation, scope](const QString &dialog, qint64 chatId) {
         if (scope != m_accountScopeRevision)
             return;
@@ -1512,7 +1511,7 @@ void CloudBackend::requestOlderChatMessages(const QString &scopeId, const QStrin
         ajax(QStringLiteral("im.v2.Chat.Message.tail"),
              {{QStringLiteral("chatId"), QString::number(chatId)}, {QStringLiteral("filter[lastId]"), QString::number(before)},
               {QStringLiteral("order[id]"), QStringLiteral("DESC")}, {QStringLiteral("limit"), QString::number(limit)}},
-             operation, RequestPolicy::Required, [this, scopeId, beforeId, before, task, operation, dialog, chatId, generation, scope, revision](QJsonValue data) {
+             operation, [this, scopeId, beforeId, before, task, operation, dialog, chatId, generation, scope, revision](QJsonValue data) {
             if (scope != m_accountScopeRevision || m_dialogMessageStates.value(dialog).historyGeneration != generation)
                 return;
             auto page = data.toObject();
@@ -1558,11 +1557,11 @@ void CloudBackend::searchMessages(const QString &scopeId, const QString &query, 
         return;
     }
     const auto key = operation + QLatin1Char('\n') + trimmed;
-    resolveDialog(scopeId, task, operation, RequestPolicy::Required, key,
+    resolveDialog(scopeId, task, operation, key,
                   [this, scopeId, query, trimmed, task, operation, key](const QString &dialog, qint64 chatId) {
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.dialog.messages.search.json"));
         webRequest(url, {{QStringLiteral("CHAT_ID"), QString::number(chatId)},
-                         {QStringLiteral("SEARCH_MESSAGE"), trimmed}}, operation, RequestPolicy::Required, resultEnvelope,
+                         {QStringLiteral("SEARCH_MESSAGE"), trimmed}}, operation, resultEnvelope,
                    [this, scopeId, query, task, operation, dialog](QJsonValue result) {
             const auto obj = result.toObject();
             if (!obj.value(QStringLiteral("messages")).isArray())
@@ -1604,7 +1603,7 @@ void CloudBackend::loadTaskAttachments(Task task, const QJsonObject &row)
     const auto operation = operationKey(OperationKind::TaskFiles, task.id);
     const auto key = operation + QLatin1Char(':') + QString::number(revision);
     ajaxJson(QStringLiteral("tasks.v2.File.listObjects"), {{QStringLiteral("ids"), ids}},
-             operation, RequestPolicy::Required, [this, task = std::move(task), ids, operation, revision](QJsonValue data) mutable {
+             operation, [this, task = std::move(task), ids, operation, revision](QJsonValue data) mutable {
         if (m_taskAttachmentRevisions.value(task.id) != revision)
             return;
         if (!data.isArray()) {
@@ -1649,8 +1648,9 @@ void CloudBackend::loadTaskAttachments(Task task, const QJsonObject &row)
 }
 
 std::shared_ptr<CloudBackend::Upload> CloudBackend::openUpload(const QString &scopeId,
-    const QString &localPath, const QString &kind, const QString &operation, RequestPolicy policy)
+    const QString &localPath, const QString &kind, const QString &operation)
 {
+    const auto policy = defaultRequestPolicy(parseOperation(operation).kind);
     if (m_inflightOperations.contains(scopedRequestKey(operation, policy)))
         return {};
     const QFileInfo info(localPath);
@@ -1675,7 +1675,6 @@ std::shared_ptr<CloudBackend::Upload> CloudBackend::openUpload(const QString &sc
     upload->scopeId = scopeId;
     upload->kind = kind;
     upload->operation = operation;
-    upload->policy = policy;
     return upload;
 }
 
@@ -1703,7 +1702,7 @@ void CloudBackend::uploadChatAttachment(const QString &scopeId, const QString &l
     if (m_inflightOperations.contains(imageKey))
         return;
     const auto kind = task ? QStringLiteral("task-chat") : QStringLiteral("chat");
-    const auto upload = openUpload(scopeId, localPath, kind, operation, RequestPolicy::NotifyAccountChange);
+    const auto upload = openUpload(scopeId, localPath, kind, operation);
     if (!upload)
         return;
     if (image && upload->size > tunables::kChatClipboardPngBytes) {
@@ -1715,12 +1714,12 @@ void CloudBackend::uploadChatAttachment(const QString &scopeId, const QString &l
     upload->temporaryDirectory = std::move(temporaryDirectory);
     upload->image = image;
     upload->accountScope = accountScope;
-    resolveDialog(scopeId, task, operation, RequestPolicy::NotifyAccountChange, upload->requestKey,
+    resolveDialog(scopeId, task, operation, upload->requestKey,
                   [this, upload](const QString &dialogId, qint64 chatId) {
         if (!upload->activeFor(m_accountScopeRevision))
             return;
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.disk.folder.get.json"));
-        webRequest(url, {{QStringLiteral("chat_id"), QString::number(chatId)}}, upload->operation, upload->policy, resultEnvelope,
+        webRequest(url, {{QStringLiteral("chat_id"), QString::number(chatId)}}, upload->operation, resultEnvelope,
                    [this, upload, chatId, dialogId](QJsonValue result) {
             if (!upload->activeFor(m_accountScopeRevision))
                 return;
@@ -1745,7 +1744,7 @@ void CloudBackend::attachTaskFile(const QString &taskId, const QString &localPat
         emit failed(operation, QStringLiteral("Некорректный номер задачи"));
         return;
     }
-    if (const auto upload = openUpload(taskId, localPath, QStringLiteral("task"), operation, RequestPolicy::AccountScoped))
+    if (const auto upload = openUpload(taskId, localPath, QStringLiteral("task"), operation))
         uploadChunk(upload, 0);
 }
 
@@ -1774,7 +1773,7 @@ void CloudBackend::uploadChunk(const std::shared_ptr<Upload> &upload, qint64 off
     }
     // The request body must keep the staged directory alive until its file is closed.
     auto chunkFile = std::shared_ptr<QFile>(upload, upload->file.get());
-    webRequestRaw(url, new FileChunk(std::move(chunkFile), offset, length), headers, upload->operation, upload->policy, dataEnvelope,
+    webRequestRaw(url, new FileChunk(std::move(chunkFile), offset, length), headers, upload->operation, dataEnvelope,
                   [this, upload, end](QJsonValue response) {
         if (!upload->activeFor(m_accountScopeRevision))
             return;
@@ -1825,7 +1824,7 @@ void CloudBackend::commitUpload(const std::shared_ptr<Upload> &upload)
         const QJsonObject task{{QStringLiteral("id"), positiveId(upload->scopeId)}};
         ajaxJson(QStringLiteral("tasks.v2.File.attach"),
                  {{QStringLiteral("task"), task}, {QStringLiteral("ids"), QJsonArray{taskObjectId}}},
-                 upload->operation, upload->policy, complete);
+                 upload->operation, complete);
         return;
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.disk.file.commit.json"));
@@ -1834,7 +1833,7 @@ void CloudBackend::commitUpload(const std::shared_ptr<Upload> &upload)
                      {QStringLiteral("template_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
                      {QStringLiteral("file_template_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
                      {QStringLiteral("as_file"), upload->image ? QStringLiteral("N") : QStringLiteral("Y")},
-                     {QStringLiteral("upload_id"), fileId.mid(1)}}, upload->operation, upload->policy, resultEnvelope, complete,
+                     {QStringLiteral("upload_id"), fileId.mid(1)}}, upload->operation, resultEnvelope, complete,
                      upload->requestKey);
 }
 

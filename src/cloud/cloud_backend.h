@@ -190,22 +190,13 @@ private:
     std::weak_ptr<WorktimeExport> m_worktimeExport;
     quint64 m_worktimeRevision = 0;
 
-    enum class RequestPolicy {
-        Required,
-        Optional,
-        AccountScoped,        // Use a separate in-flight key per account revision.
-        NotifyAccountChange,  // Release a busy UI control when its request becomes stale.
-        HistorySnapshot,
-        HistoryRead
-    };
-
-    void ajax(const QString &action, Fields fields, const QString &operation, RequestPolicy policy, Handler onData,
+    void ajax(const QString &action, Fields fields, const QString &operation, Handler onData,
               const QString &requestKey = {});
-    void ajaxJson(const QString &action, const QJsonObject &body, const QString &operation, RequestPolicy policy, Handler onData,
+    void ajaxJson(const QString &action, const QJsonObject &body, const QString &operation, Handler onData,
                   const QString &requestKey = {});
-    void ajaxJson(QUrl url, const QJsonObject &body, const QString &operation, RequestPolicy policy, Handler onData,
+    void ajaxJson(QUrl url, const QJsonObject &body, const QString &operation, Handler onData,
                   const QString &requestKey = {});
-    void componentAction(const QString &action, const Fields &fields, const QString &operation, RequestPolicy policy, Handler onData,
+    void componentAction(const QString &action, const Fields &fields, const QString &operation, Handler onData,
                          const QString &component = QStringLiteral("bitrix:tasks.kanban"), const QString &requestKey = {});
     // An occupied key admits only matching subscribers to an idempotent buffered read.
     // Other duplicates, including mutations and uploads, are dropped without another POST.
@@ -213,16 +204,18 @@ private:
     // delivers data or a private error to each subscriber. Required reads emit failed once
     // per request. Optional lookups can deliver an empty fallback. Stopped backends and
     // stale account scopes discard replies, except for existing busy-control failures.
-    void webRequest(QUrl url, const Fields &fields, const QString &operation, RequestPolicy policy,
+    void webRequest(QUrl url, const Fields &fields, const QString &operation,
                     const QString &envelope, Handler onData, const QString &requestKey = {},
-                    const std::shared_ptr<Session> &candidate = {}, bool includeResponseMeta = false);
-    void webRequestRaw(QUrl url, QIODevice *body, const Headers &headers, const QString &operation, RequestPolicy policy,
+                    const std::shared_ptr<Session> &candidate = {}, bool includeResponseMeta = false,
+                    std::optional<RequestPolicy> policyOverride = {});
+    void webRequestRaw(QUrl url, QIODevice *body, const Headers &headers, const QString &operation,
                        const QString &envelope, Handler onData, const QString &requestKey = {},
-                       const std::shared_ptr<Session> &candidate = {}, bool includeResponseMeta = false);
+                       const std::shared_ptr<Session> &candidate = {}, bool includeResponseMeta = false,
+                       std::optional<RequestPolicy> policyOverride = {});
     QString scopedRequestKey(const QString &operation, RequestPolicy policy, const QString &requestKey = {}) const;
     QUrl actionUrl(const QString &action) const;
-    void withCurrentUser(const QString &operation, RequestPolicy policy, std::function<void(qint64)> onUser);
-    void requestCurrentUser(const QString &operation, RequestPolicy policy, std::function<void(const QString &)> onUser,
+    void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser);
+    void requestCurrentUser(const QString &operation, std::function<void(const QString &)> onUser,
                             const std::shared_ptr<Session> &candidate = {});
     void resetAccountScopedState();
     void rememberCurrentUser(const QString &id);
@@ -234,15 +227,15 @@ private:
     void updateTaskFields(const QString &taskId, QQueue<QPair<QString, QJsonObject>> writes,
                           const QString &requestKey = {});
     void updateTaskRequisite(const QString &taskId, const TaskEdit &edit);
-    void loadTask(const QString &taskId, const QString &operation, RequestPolicy policy,
+    void loadTask(const QString &taskId, const QString &operation,
                   std::function<void(QJsonObject)> onTask, const QString &requestKey = {}, bool remember = true);
     void finishTaskCardRead(const QString &taskId);
-    void loadPerson(const QString &id, const QString &operation, RequestPolicy policy, PersonHandler onPerson, bool requireName = false);
+    void loadPerson(const QString &id, const QString &operation, PersonHandler onPerson, bool requireName = false);
     Project projectFromApiRow(const QJsonObject &row) const;
     void loadLinkProject(const QString &id, const QString &operation,
                          std::function<void(Project, QString)> complete);
     using ProjectStagesHandler = std::function<void(std::optional<QVector<Stage>>)>;
-    void loadProjectStages(const QString &projectId, const QString &operation, RequestPolicy policy, ProjectStagesHandler complete);
+    void loadProjectStages(const QString &projectId, const QString &operation, ProjectStagesHandler complete);
     void loadLinkStage(const QString &projectId, const QString &stageId, std::function<void(Stage)> complete);
     QUrl taskRoleAvatar(const QJsonObject &current, const QJsonObject &legacy, const QString &personId) const;
     struct LinkStageSnapshot {
@@ -374,9 +367,9 @@ private:
     // Chat lookup, message attachments and the portal uploader.
     struct Upload;
     using ResolvedDialog = std::function<void(const QString &dialogId, qint64 chatId)>;
-    void loadChatAssets(qint64 chatId, ChatAssetKind kind, qint64 boundary, const QString &operation, RequestPolicy policy,
+    void loadChatAssets(qint64 chatId, ChatAssetKind kind, qint64 boundary, const QString &operation,
                         std::function<void(QVector<ChatAsset>, QString)> complete);
-    void resolveDialog(const QString &scopeId, bool task, const QString &operation, RequestPolicy policy,
+    void resolveDialog(const QString &scopeId, bool task, const QString &operation,
                        const QString &requestKey, ResolvedDialog onDialog);
     void rememberDialog(const QString &dialogId, const QJsonObject &payload, bool rememberCounter = true);
     void rememberChatContact(const QString &dialogId, const QJsonObject &user, bool publish);
@@ -429,7 +422,7 @@ private:
     void uploadChatAttachment(const QString &scopeId, const QString &localPath, bool task, bool image,
                               const QString &caption, std::shared_ptr<QTemporaryDir> temporaryDirectory = {});
     std::shared_ptr<Upload> openUpload(const QString &scopeId, const QString &localPath,
-                                       const QString &kind, const QString &operation, RequestPolicy policy);
+                                       const QString &kind, const QString &operation);
     void uploadChunk(const std::shared_ptr<Upload> &upload, qint64 offset);
     void commitUpload(const std::shared_ptr<Upload> &upload);
     QHash<QString, qint64> m_dialogChatIds;

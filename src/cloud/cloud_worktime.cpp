@@ -695,7 +695,7 @@ void CloudBackend::pollWorktimeExport(const std::shared_ptr<WorktimeExport> &job
         emit failed(job->operation, u"Портал не завершил формирование файла вовремя."_s);
         return;
     }
-    ajax(u"timeman.api.export.dispatcher"_s, job->fields, job->operation, RequestPolicy::Required, [this, job](const QJsonValue &result) {
+    ajax(u"timeman.api.export.dispatcher"_s, job->fields, job->operation, [this, job](const QJsonValue &result) {
         if (!m_started || job->revision != m_worktimeRevision)
             return;
         const auto data = result.toObject();

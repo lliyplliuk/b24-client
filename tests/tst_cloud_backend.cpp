@@ -4037,7 +4037,7 @@ void TestCloudBackend::dropsDuplicateSendBeforePosting()
     const auto action = u"im.v2.Chat.Message.send"_s;
     const auto send = [&](const QString &text, int &completed) {
         backend.ajax(action, {{u"dialogId"_s, u"chat91"_s}, {u"fields[message]"_s, text}},
-                    u"send:chat:chat91"_s, CloudBackend::RequestPolicy::NotifyAccountChange, [&completed](QJsonValue) { ++completed; });
+                    u"send:chat:chat91"_s, [&completed](QJsonValue) { ++completed; });
     };
     int first = 0, duplicates = 0;
     send(u"Первое"_s, first);
@@ -4059,13 +4059,13 @@ void TestCloudBackend::rejectedRequestUsesExplicitPolicy()
         ++fallbacks;
     };
 
-    backend.ajax(QStringLiteral("tasks.task.history.list"), {}, operation,
-                 CloudBackend::RequestPolicy::Optional, onData);
+    const auto url = backend.actionUrl(QStringLiteral("tasks.task.history.list"));
+    backend.webRequest(url, {}, operation, QStringLiteral("data"), onData);
     QCOMPARE(fallbacks, 1);
     QVERIFY(failures.isEmpty());
 
-    backend.ajax(QStringLiteral("tasks.task.history.list"), {}, operation,
-                 CloudBackend::RequestPolicy::Required, onData);
+    // The same optional endpoint is mandatory for this caller.
+    backend.webRequest(url, {}, operation, QStringLiteral("data"), onData, {}, {}, false, RequestPolicy::Required);
     QCOMPARE(fallbacks, 1);
     QCOMPARE(failures.size(), 1);
     QCOMPARE(failures.first().first().toString(), operation);
@@ -4087,8 +4087,8 @@ void TestCloudBackend::overlappingTaskSearchFailure()
         [&](const QString &reason) { errors.append(reason); }
     };
     const auto operation = u"search-project-tasks:17"_s;
-    backend.ajax(u"tasks.task.list"_s, {}, operation, CloudBackend::RequestPolicy::NotifyAccountChange, subscriber);
-    backend.ajax(u"tasks.task.list"_s, {}, operation, CloudBackend::RequestPolicy::NotifyAccountChange, subscriber);
+    backend.ajax(u"tasks.task.list"_s, {}, operation, subscriber);
+    backend.ajax(u"tasks.task.list"_s, {}, operation, subscriber);
     QTRY_VERIFY(!failures.isEmpty());
     QCOMPARE(failures.size(), 1);
     QCOMPARE(failures.first().first().toString(), operation);
@@ -5336,7 +5336,7 @@ void TestCloudBackend::retriesCoalescedHistoryRead()
     QStringList errors;
     const auto subscribe = [&] {
         backend.ajax(action, {{u"dialogId"_s, dialog}, {u"messageLimit"_s, u"25"_s}},
-                     u"chat-history-read:"_s + key, CloudBackend::RequestPolicy::HistoryRead, {
+                     u"chat-history-read:"_s + key, {
                          [&](QJsonValue data) { results.append(data); },
                          [&](const QString &error) { errors.append(error); }
                      }, key);

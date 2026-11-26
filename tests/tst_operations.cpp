@@ -13,111 +13,113 @@ private slots:
         QTest::addColumn<OperationKind>("kind");
         QTest::addColumn<QString>("prefix");
         QTest::addColumn<int>("arity");
+        QTest::addColumn<RequestPolicy>("policy");
         using K = OperationKind;
-        struct Row { K kind; const char *prefix; int arity; };
+        using P = RequestPolicy;
+        struct Row { K kind; const char *prefix; int arity; P policy; };
         constexpr Row rows[] = {
-            {K::AttachTask, "attach-task:", 1},
-            {K::Board, "board:", 1},
-            {K::BoardColumn, "board-column:", 2},
-            {K::BoardEdit, "board-edit:", 1},
-            {K::Chat, "chat:", 1},
-            {K::ChatAssets, "chat-assets:", 3},
-            {K::ChatBadgesSnapshot, "chat-badges-snapshot", 0},
-            {K::ChatHistoryIdentity, "chat-history-identity", 0},
-            {K::ChatHistoryRead, "chat-history-read:", 1},
-            {K::ChatHistorySnapshot, "chat-history-snapshot:", 1},
-            {K::ChatImageUpload, "chat-image-upload:", 2},
-            {K::ChatMember, "chat-member:", 1},
-            {K::ChatPin, "chat-pin:", 1},
-            {K::ChatSoundSettings, "chat-sound-settings", 0},
-            {K::ChatTyping, "chat-typing:", 1},
-            {K::Chats, "chats", 0},
-            {K::Checklist, "checklist:", 1},
-            {K::ChecklistWrite, "checklist-write:", 1},
-            {K::CreateChat, "create-chat", 0},
-            {K::CreateProject, "create-project", 0},
-            {K::CreateSubtask, "create-subtask:", 1},
-            {K::CreateTask, "create-task:", 1},
-            {K::CreateTaskFromMessage, "create-task-from-message:", 2},
-            {K::CsrfRefresh, "csrf-refresh", 0},
-            {K::CurrentPerson, "current-person:", 1},
-            {K::DeleteNotification, "delete-notification", 0},
-            {K::DeleteTask, "delete-task:", 1},
-            {K::ForwardMessage, "forward-message:", 2},
-            {K::GanttLinks, "gantt-links:", 1},
-            {K::InvalidMessageReaction, "message-reaction", 0},
-            {K::LinkPreview, "link-preview:", 1},
-            {K::LinkPreviewChatAssets, "link-preview:chat-assets:", 1},
-            {K::LinkPreviewStage, "link-preview:stage:", 1},
-            {K::MessageAction, "message-action:", 2},
-            {K::MessageContext, "message-context:", 2},
-            {K::MessageEdit, "message-edit:", 2},
-            {K::MessageFileDownload, "message-file-download", 0},
-            {K::MessageReaction, "message-reaction:", 3},
-            {K::MessageViewers, "message-viewers:", 1},
-            {K::NotificationBatch, "notification-batch:", 2},
-            {K::NotificationSettings, "notification-settings", 0},
-            {K::NotificationSettingsUpdate, "notification-settings-update", 0},
-            {K::Notifications, "notifications", 0},
-            {K::NotificationsOlder, "notifications-older", 0},
-            {K::OlderChat, "older-chat:", 3},
-            {K::Person, "person:", 1},
-            {K::Pins, "pins:", 1},
-            {K::PortalStatus, "portal-status", 0},
-            {K::PortalStatusBootstrap, "portal-status-bootstrap", 0},
-            {K::PortalStatusUpdate, "portal-status-update", 0},
-            {K::ProjectFiles, "project-files:", 2},
-            {K::ProjectMembers, "project-members:", 1},
-            {K::ProjectPageFallback, "project-page-fallback", 0},
-            {K::ProjectPin, "project-pin:", 1},
-            {K::ProjectPinIdentity, "project-pin-identity", 0},
-            {K::ProjectStages, "project-stages:", 1},
-            {K::ProjectTaskChats, "project-task-chats:", 1},
-            {K::ProjectUnreadDialogs, "project-unread:dialogs", 0},
-            {K::ProjectUnreadTasks, "project-unread:tasks", 0},
-            {K::Projects, "projects", 0},
-            {K::Push, "push", 0},
-            {K::ReadAllNotifications, "read-all-notifications", 0},
-            {K::ReadNotification, "read-notification", 0},
-            {K::ReadNotifications, "read-notifications", 0},
-            {K::ReadVisibleAnchors, "read-visible:anchors:", 1},
-            {K::ReadVisibleMessages, "read-visible:messages:", 1},
-            {K::RecentUserStatus, "recent-user-status", 0},
-            {K::SearchChat, "search-chat:", 1},
-            {K::SearchChats, "search-chats:", 1},
-            {K::SearchNotifications, "search-notifications:", 1},
-            {K::SearchPeople, "search-people:", 1},
-            {K::SearchProjectTasks, "search-project-tasks:", 1},
-            {K::SearchTaskChat, "search-task-chat:", 1},
-            {K::SearchTaskChats, "search-task-chats:", 1},
-            {K::SendChat, "send:chat:", 1},
-            {K::SendTask, "send:task:", 1},
-            {K::SessionKeepalive, "session-keepalive", 0},
-            {K::SessionRecovery, "session-recovery", 0},
-            {K::SettingsIdentity, "settings-identity", 0},
-            {K::Subtasks, "subtasks:", 1},
-            {K::Task, "task:", 1},
-            {K::TaskCardAction, "task-card-action:", 2},
-            {K::TaskCardRead, "task-card-read:", 2},
-            {K::TaskChatTitles, "task-chat-titles", 0},
-            {K::TaskChatTitlesRequest, "task-chat-titles:", 2},
-            {K::TaskChats, "task-chats", 0},
-            {K::TaskDetails, "task-details:", 1},
-            {K::TaskFiles, "task-files:", 1},
-            {K::TaskHistory, "task-history:", 1},
-            {K::TaskMessages, "task-messages:", 1},
-            {K::Timeline, "timeline:", 1},
-            {K::UpdateTask, "update-task:", 1},
-            {K::UploadChat, "upload-chat:", 1},
-            {K::UploadTaskChat, "upload-task-chat:", 1},
-            {K::Workday, "workday", 0},
-            {K::WorkdayChange, "workday-change", 0},
-            {K::WorktimeExport, "worktime-export:", 1},
-            {K::WorktimeSheet, "worktime-sheet:", 1},
+            {K::AttachTask, "attach-task:", 1, P::AccountScoped},
+            {K::Board, "board:", 1, P::Required},
+            {K::BoardColumn, "board-column:", 2, P::Required},
+            {K::BoardEdit, "board-edit:", 1, P::NotifyAccountChange},
+            {K::Chat, "chat:", 1, P::Required},
+            {K::ChatAssets, "chat-assets:", 3, P::Required},
+            {K::ChatBadgesSnapshot, "chat-badges-snapshot", 0, P::Optional},
+            {K::ChatHistoryIdentity, "chat-history-identity", 0, P::Required},
+            {K::ChatHistoryRead, "chat-history-read:", 1, P::HistoryRead},
+            {K::ChatHistorySnapshot, "chat-history-snapshot:", 1, P::HistorySnapshot},
+            {K::ChatImageUpload, "chat-image-upload:", 2, P::Required},
+            {K::ChatMember, "chat-member:", 1, P::Required},
+            {K::ChatPin, "chat-pin:", 1, P::NotifyAccountChange},
+            {K::ChatSoundSettings, "chat-sound-settings", 0, P::Required},
+            {K::ChatTyping, "chat-typing:", 1, P::Optional},
+            {K::Chats, "chats", 0, P::Required},
+            {K::Checklist, "checklist:", 1, P::Required},
+            {K::ChecklistWrite, "checklist-write:", 1, P::Required},
+            {K::CreateChat, "create-chat", 0, P::Required},
+            {K::CreateProject, "create-project", 0, P::NotifyAccountChange},
+            {K::CreateSubtask, "create-subtask:", 1, P::AccountScoped},
+            {K::CreateTask, "create-task:", 1, P::AccountScoped},
+            {K::CreateTaskFromMessage, "create-task-from-message:", 2, P::Required},
+            {K::CsrfRefresh, "csrf-refresh", 0, P::Required},
+            {K::CurrentPerson, "current-person:", 1, P::Optional},
+            {K::DeleteNotification, "delete-notification", 0, P::Required},
+            {K::DeleteTask, "delete-task:", 1, P::Required},
+            {K::ForwardMessage, "forward-message:", 2, P::Required},
+            {K::GanttLinks, "gantt-links:", 1, P::Required},
+            {K::InvalidMessageReaction, "message-reaction", 0, P::Required},
+            {K::LinkPreview, "link-preview:", 1, P::Optional},
+            {K::LinkPreviewChatAssets, "link-preview:chat-assets:", 1, P::Optional},
+            {K::LinkPreviewStage, "link-preview:stage:", 1, P::Optional},
+            {K::MessageAction, "message-action:", 2, P::Required},
+            {K::MessageContext, "message-context:", 2, P::Required},
+            {K::MessageEdit, "message-edit:", 2, P::Required},
+            {K::MessageFileDownload, "message-file-download", 0, P::Required},
+            {K::MessageReaction, "message-reaction:", 3, P::Required},
+            {K::MessageViewers, "message-viewers:", 1, P::Optional},
+            {K::NotificationBatch, "notification-batch:", 2, P::Required},
+            {K::NotificationSettings, "notification-settings", 0, P::Required},
+            {K::NotificationSettingsUpdate, "notification-settings-update", 0, P::Required},
+            {K::Notifications, "notifications", 0, P::Required},
+            {K::NotificationsOlder, "notifications-older", 0, P::Required},
+            {K::OlderChat, "older-chat:", 3, P::Required},
+            {K::Person, "person:", 1, P::AccountScoped},
+            {K::Pins, "pins:", 1, P::Required},
+            {K::PortalStatus, "portal-status", 0, P::Required},
+            {K::PortalStatusBootstrap, "portal-status-bootstrap", 0, P::Optional},
+            {K::PortalStatusUpdate, "portal-status-update", 0, P::Required},
+            {K::ProjectFiles, "project-files:", 2, P::Optional},
+            {K::ProjectMembers, "project-members:", 1, P::Optional},
+            {K::ProjectPageFallback, "project-page-fallback", 0, P::Optional},
+            {K::ProjectPin, "project-pin:", 1, P::NotifyAccountChange},
+            {K::ProjectPinIdentity, "project-pin-identity", 0, P::Optional},
+            {K::ProjectStages, "project-stages:", 1, P::Required},
+            {K::ProjectTaskChats, "project-task-chats:", 1, P::Required},
+            {K::ProjectUnreadDialogs, "project-unread:dialogs", 0, P::Optional},
+            {K::ProjectUnreadTasks, "project-unread:tasks", 0, P::Optional},
+            {K::Projects, "projects", 0, P::Required},
+            {K::Push, "push", 0, P::Required},
+            {K::ReadAllNotifications, "read-all-notifications", 0, P::Required},
+            {K::ReadNotification, "read-notification", 0, P::Required},
+            {K::ReadNotifications, "read-notifications", 0, P::Required},
+            {K::ReadVisibleAnchors, "read-visible:anchors:", 1, P::Optional},
+            {K::ReadVisibleMessages, "read-visible:messages:", 1, P::Optional},
+            {K::RecentUserStatus, "recent-user-status", 0, P::Optional},
+            {K::SearchChat, "search-chat:", 1, P::Required},
+            {K::SearchChats, "search-chats:", 1, P::Required},
+            {K::SearchNotifications, "search-notifications:", 1, P::Required},
+            {K::SearchPeople, "search-people:", 1, P::Optional},
+            {K::SearchProjectTasks, "search-project-tasks:", 1, P::NotifyAccountChange},
+            {K::SearchTaskChat, "search-task-chat:", 1, P::Required},
+            {K::SearchTaskChats, "search-task-chats:", 1, P::Required},
+            {K::SendChat, "send:chat:", 1, P::NotifyAccountChange},
+            {K::SendTask, "send:task:", 1, P::NotifyAccountChange},
+            {K::SessionKeepalive, "session-keepalive", 0, P::Optional},
+            {K::SessionRecovery, "session-recovery", 0, P::Required},
+            {K::SettingsIdentity, "settings-identity", 0, P::Optional},
+            {K::Subtasks, "subtasks:", 1, P::Required},
+            {K::Task, "task:", 1, P::Required},
+            {K::TaskCardAction, "task-card-action:", 2, P::Required},
+            {K::TaskCardRead, "task-card-read:", 2, P::Required},
+            {K::TaskChatTitles, "task-chat-titles", 0, P::Required},
+            {K::TaskChatTitlesRequest, "task-chat-titles:", 2, P::Required},
+            {K::TaskChats, "task-chats", 0, P::Required},
+            {K::TaskDetails, "task-details:", 1, P::Optional},
+            {K::TaskFiles, "task-files:", 1, P::Required},
+            {K::TaskHistory, "task-history:", 1, P::Optional},
+            {K::TaskMessages, "task-messages:", 1, P::Required},
+            {K::Timeline, "timeline:", 1, P::Required},
+            {K::UpdateTask, "update-task:", 1, P::Required},
+            {K::UploadChat, "upload-chat:", 1, P::NotifyAccountChange},
+            {K::UploadTaskChat, "upload-task-chat:", 1, P::NotifyAccountChange},
+            {K::Workday, "workday", 0, P::Required},
+            {K::WorkdayChange, "workday-change", 0, P::Required},
+            {K::WorktimeExport, "worktime-export:", 1, P::Required},
+            {K::WorktimeSheet, "worktime-sheet:", 1, P::Required},
         };
         static_assert(std::size(rows) == int(K::Count) - 1);
         for (const auto &row : rows)
-            QTest::newRow(row.prefix) << row.kind << QString::fromLatin1(row.prefix) << row.arity;
+            QTest::newRow(row.prefix) << row.kind << QString::fromLatin1(row.prefix) << row.arity << row.policy;
     }
 
     void roundTrip()
@@ -125,6 +127,9 @@ private slots:
         QFETCH(OperationKind, kind);
         QFETCH(QString, prefix);
         QFETCH(int, arity);
+        QFETCH(RequestPolicy, policy);
+        QCOMPARE(defaultRequestPolicy(kind), policy);
+        QCOMPARE(operationName(kind), prefix.section(QLatin1Char(':'), 0, 0));
         QStringList ids;
         for (int i = 0; i < arity; ++i)
             ids.append(QString::number(i + 1));
@@ -157,9 +162,29 @@ private slots:
     void unrecognizedKeys()
     {
         QCOMPARE(parseOperation(QStringLiteral("missing:key")).kind, OperationKind::Unknown);
+        QCOMPARE(defaultRequestPolicy(OperationKind::Unknown), RequestPolicy::Required);
+        QVERIFY(operationName(OperationKind::Unknown).isEmpty());
         QCOMPARE(parseOperation(QStringLiteral("board-column:only-one")).kind, OperationKind::Unknown);
         QCOMPARE(parseOperation(QStringLiteral("workday:extra")).kind, OperationKind::Unknown);
-        QVERIFY(operationKey(OperationKind::BoardColumn, QStringLiteral("only-one")).isEmpty());
+    }
+
+    void wrongArityProducesDistinctOpaqueKeys()
+    {
+#if defined(QT_NO_DEBUG) && !defined(QT_FORCE_ASSERTS)
+        const auto wrongKey = [] {
+            QTest::ignoreMessage(QtWarningMsg, "operationKey: board-column: expected 2 ids, got 1");
+            return operationKey(OperationKind::BoardColumn, QStringLiteral("only-one"));
+        };
+        const auto first = wrongKey();
+        const auto second = wrongKey();
+        QVERIFY(!first.isEmpty());
+        QVERIFY(!second.isEmpty());
+        QVERIFY(first != second);
+        QVERIFY(!first.contains(QStringLiteral("only-one")));
+        QCOMPARE(parseOperation(first).kind, OperationKind::Unknown);
+#else
+        QSKIP("A wrong argument count asserts in debug builds");
+#endif
     }
 };
 

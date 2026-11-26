@@ -59,7 +59,7 @@ void CloudBackend::notifyChatTyping(const QString &dialog)
     m_lastTypingRequest.insert(scope, now);
     ajaxJson(QStringLiteral("im.v2.Chat.InputAction.notify"),
              {{QStringLiteral("dialogId"), scope}, {QStringLiteral("type"), QStringLiteral("writing")}},
-             operationKey(OperationKind::ChatTyping, scope), RequestPolicy::Optional, [](const QJsonValue &) {});
+             operationKey(OperationKind::ChatTyping, scope), [](const QJsonValue &) {});
 }
 
 void CloudBackend::refreshChangedChat(const QString &dialog, bool pins)
@@ -119,7 +119,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
     };
     const auto rest = [this, &operation, &acknowledge](const QString &method, const Fields &fields) {
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/") + method + QStringLiteral(".json"));
-        webRequest(url, fields, operation, RequestPolicy::Required, QStringLiteral("result"), acknowledge);
+        webRequest(url, fields, operation, QStringLiteral("result"), acknowledge);
     };
 
     switch (action) {
@@ -128,7 +128,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
         const auto method = action == MessageAction::React ? QStringLiteral("im.v2.Chat.Message.Reaction.add")
                                                            : QStringLiteral("im.v2.Chat.Message.Reaction.delete");
         ajax(method, {{QStringLiteral("messageId"), QString::number(messageNumber)},
-                      {QStringLiteral("reaction"), value}}, operation, RequestPolicy::Required, acknowledge);
+                      {QStringLiteral("reaction"), value}}, operation, acknowledge);
         break;
     }
     case MessageAction::Edit:
@@ -138,11 +138,11 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
         }
         ajax(QStringLiteral("im.v2.Chat.Message.update"),
              {{QStringLiteral("id"), QString::number(messageNumber)},
-              {QStringLiteral("fields[message]"), value}}, operation, RequestPolicy::Required, acknowledge);
+              {QStringLiteral("fields[message]"), value}}, operation, acknowledge);
         break;
     case MessageAction::Delete:
         ajaxJson(QStringLiteral("im.v2.Chat.Message.delete"),
-                 {{QStringLiteral("messageIds"), QJsonArray{messageNumber}}}, operation, RequestPolicy::Required, acknowledge);
+                 {{QStringLiteral("messageIds"), QJsonArray{messageNumber}}}, operation, acknowledge);
         break;
     case MessageAction::CreateTask: {
         if (!m_started || !m_online) {
@@ -161,7 +161,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
         const auto account = m_accountScopeRevision;
         webRequest(url, {{QStringLiteral("MESSAGE_ID"), message}, {QStringLiteral("DIALOG_ID"), scope},
                          {QStringLiteral("TYPE"), QStringLiteral("TASK")}},
-                   operation, RequestPolicy::Required, QStringLiteral("result"), [this, operation, scope, account](const QJsonValue &result) {
+                   operation, QStringLiteral("result"), [this, operation, scope, account](const QJsonValue &result) {
             if (account != m_accountScopeRevision)
                 return;
             if (result != QJsonValue(true)) {
@@ -211,7 +211,7 @@ void CloudBackend::forwardMessage(const QString &source, const QString &id, cons
     const QJsonObject fields{{QStringLiteral("forwardIds"), QJsonObject{{uuid, message.toLongLong()}}}};
     ajaxJson(QStringLiteral("im.v2.Chat.Message.send"),
              {{QStringLiteral("dialogId"), destination}, {QStringLiteral("fields"), fields}},
-             operation, RequestPolicy::Required, [this, operation, origin, destination, uuid](const QJsonValue &value) {
+             operation, [this, operation, origin, destination, uuid](const QJsonValue &value) {
         const auto result = value.toObject();
         const auto failures = result.value(QStringLiteral("failureMap")).toObject();
         const auto id = jsonId(result.value(QStringLiteral("uuidMap")).toObject().value(uuid));
@@ -247,7 +247,7 @@ void CloudBackend::createGroupChat(const QString &title, const QStringList &memb
         seen.insert(id);
         fields.append({QStringLiteral("fields[users][%1]").arg(seen.size() - 1), id});
     }
-    webRequest(url, fields, op, RequestPolicy::Required, QStringLiteral("result"), [this, op](const QJsonValue &value) {
+    webRequest(url, fields, op, QStringLiteral("result"), [this, op](const QJsonValue &value) {
         const auto id = jsonId(value.toObject().value(QStringLiteral("chatId")));
         if (id.isEmpty()) {
             emit failed(op, QStringLiteral("Портал не подтвердил создание чата"));
@@ -271,7 +271,7 @@ void CloudBackend::changeChatMember(const QString &dialog, const QString &user, 
     const auto fields = add ? Fields{{QStringLiteral("CHAT_ID"), scope.mid(4)},
                                      {QStringLiteral("USERS[0]"), id}, {QStringLiteral("HIDE_HISTORY"), QStringLiteral("Y")}}
                             : Fields{{QStringLiteral("dialogId"), scope}, {QStringLiteral("userId"), id}};
-    webRequest(url, fields, op, RequestPolicy::Required, QStringLiteral("result"), [this, scope, op, add](const QJsonValue &result) {
+    webRequest(url, fields, op, QStringLiteral("result"), [this, scope, op, add](const QJsonValue &result) {
         if (!commandAccepted(result)) {
             emit failed(op, QStringLiteral("Портал отклонил изменение состава чата"));
             return;
