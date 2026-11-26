@@ -13,7 +13,6 @@
 class QIODevice;
 class QNetworkAccessManager;
 class QNetworkReply;
-class TestCloudBackend;
 
 namespace bx {
 
@@ -126,7 +125,6 @@ public:
     void beginHistory(const QString &dialog, bool task, bool retry);
 
 private:
-    friend class ::TestCloudBackend;
     PortalSession &m_session;
     QNetworkAccessManager &m_network;
     struct InflightRequest;

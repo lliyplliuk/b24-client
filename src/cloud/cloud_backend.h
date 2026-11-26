@@ -21,7 +21,7 @@
 
 class QNetworkReply;
 class QUrlQuery;
-class TestCloudBackend;
+class CloudTestAccess;
 
 namespace bx {
 
@@ -143,7 +143,7 @@ signals:
     void sessionRecovered();
 
 private:
-    friend class ::TestCloudBackend;
+    friend class ::CloudTestAccess;
 
     const Session &currentSession() const override { return m_session; }
     quint64 sessionRevision() const override { return m_sessionRevision; }
