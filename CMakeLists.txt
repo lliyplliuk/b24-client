@@ -52,6 +52,9 @@ add_library(bxwidgets STATIC
     src/ui/main_window.h
     src/ui/notifications_panel.h
     src/ui/notifications_panel.cpp
+    src/ui/projects_panel.cpp
+    src/ui/projects_panel.h
+    src/ui/workspace_presentation.cpp
     src/ui/main_window.cpp
     src/ui/task_dialogs.cpp
     src/ui/chat_widgets.cpp

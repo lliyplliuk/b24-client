@@ -1,6 +1,5 @@
 #include "ui/notifications_panel.h"
 
-#include "ui/main_window.h"
 #include "ui/portal_dnd_control.h"
 #include "ui/task_dialogs.h"
 #include "ui/workspace_presentation.h"

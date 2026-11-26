@@ -11442,9 +11442,17 @@ private slots:
         const auto threshold = [&] { return scroll->minimum() + ((scroll->maximum() - scroll->minimum()) * 2 + 2) / 3; };
         scroll->setValue(threshold() / 2);
         scroll->triggerAction(QAbstractSlider::SliderSingleStepAdd);
-        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
         QVERIFY(scroll->value() < threshold());
         QCOMPARE(backend->projectMoreRequests, 0);
+
+        // Leaving the board before the queued scroll check runs must cancel this load.
+        scroll->triggerAction(QAbstractSlider::SliderToMaximum);
+        sections->setCurrentRow(0);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+        QCOMPARE(backend->projectMoreRequests, 0);
+        sections->setCurrentRow(1);
+        scroll->setValue(scroll->minimum());
         const auto boundary = threshold();
         scroll->setTracking(false);
         scroll->setSliderDown(true);
@@ -11456,7 +11464,7 @@ private slots:
         QTRY_COMPARE(backend->projectMoreRequests, 1);
         emit backend->projectsMoreAvailable(true); // This signal precedes the fetched page.
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
-        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 1);
 
         emit backend->failed(QStringLiteral("projects"), QStringLiteral("Страница недоступна"));
@@ -11464,7 +11472,7 @@ private slots:
         QVERIFY(more->text().contains(QStringLiteral("Повторить")));
         scroll->setValue(threshold() - 1);
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
-        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 1);
         more->click();
         QCOMPARE(backend->projectMoreRequests, 2);
@@ -11480,7 +11488,7 @@ private slots:
         QTRY_COMPARE(scroll->value(), position);
         QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), selection);
         QTRY_VERIFY(more->isHidden());
-        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 2);
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
         QTRY_COMPARE(backend->projectMoreRequests, 3);
@@ -11488,7 +11496,7 @@ private slots:
         emit backend->projectsLoaded(extended);
         scroll->setValue(scroll->minimum());
         scroll->triggerAction(QAbstractSlider::SliderToMaximum);
-        QCoreApplication::sendPostedEvents(&window, QEvent::MetaCall);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
         QCOMPARE(backend->projectMoreRequests, 3);
         QVERIFY(more->isHidden());
     }

@@ -41,21 +41,9 @@ class QTemporaryDir;
 
 namespace bx {
 
-class BoardWidget;
-namespace ui {
-struct ListViewportAnchor {
-    QStringList successors;
-    int offset = 0;
-    int scroll = 0;
-};
-ListViewportAnchor listViewportAnchor(const QListWidget *list);
-void restoreListViewport(QListWidget *list, const ListViewportAnchor &anchor);
-QLabel *emptyState(const QString &text, QWidget *parent);
-}
-namespace ui { class TaskGanttView; }
+class ProjectsPanel;
 namespace ui { class WorktimePanel; class ChatVideoPreviews; }
-namespace ui { class ProjectToolsDialog; }
-namespace ui { class AvatarBadge; class ChatComposer; class HistoryList; class PinnedMessageBar; class TaskCardDialog; class TaskEditForm; class NameDialog; class StageManagerDialog; class GlyphButton; }
+namespace ui { class AvatarBadge; class ChatComposer; class HistoryList; class PinnedMessageBar; class TaskCardDialog; class TaskEditForm; class GlyphButton; }
 
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -98,23 +86,18 @@ private slots:
     void onSectionChanged(int index);
     void onChatSelected();
     void onSendChat();
-    void onProjectSelected();
     void onRefresh();
     void onFailed(const QString &operation, const QString &reason);
     void onTaskUpdated(const QString &taskId);
     void confirmTaskDeletion(ui::TaskCardDialog *card);
     void onTaskDeleted(const QString &taskId);
     void onTaskCreated(const QString &projectId, const QString &taskId);
-    void onProjectCreated(const QString &projectId);
-    void onBoardUpdated(const QString &projectId);
     void onMessagesFound(const QString &scopeId, const QString &query, bool task,
                          const QVector<Message> &messages);
     void onFileUploaded(const QString &scopeId, const QString &kind);
-    void onProjectTasksFound(const QString &projectId, const QString &query, const QVector<Task> &tasks);
 
 private:
     QWidget *buildChatPanel();
-    QWidget *buildProjectsPanel();
     void refreshCurrentSection(bool reloadProjectDirectory = true);
     void updateComposers();
     bool clearTask();
@@ -164,23 +147,7 @@ private:
     void setRailStatus(int row, const QString &detail);
     void requestRailWorkday();
     void updateRailWorkday();
-    void showProjects();
-    void scheduleProjectsPageCheck();
-    void maybeLoadMoreProjects();
-    void updateProjectsRailPagination();
-    void requestNextProjectsPage();
-    void updateProjectUnreadRows();
-    void onProjectScopeChanged(int scope);
-    void ensureProjectTaskView();
-    void openProjectTaskChats();
-    void closeProjectTaskChats();
-    bool refreshProjectTaskChats(const QString &project);
-    void requestProjectTaskChatPage();
-    void updateProjectTaskChatControls();
-    void updateProjectTaskChatTab();
-    void onProjectTaskChatsLoaded(const QString &project, int offset, const QVector<Chat> &rows, int nextOffset);
-    void updateProjectTaskChatBadges(const QString &project, const QVector<Chat> &rows);
-    void showPinMenu(QListWidget *list, const QPoint &point, bool project);
+    void showChatPinMenu(QListWidget *list, const QPoint &point);
     void scheduleAvatars();
     void loadVisibleAvatars();
     void requestAvatar(const QUrl &url);
@@ -210,8 +177,6 @@ private:
     void playMessageVideo(const MessageFile &file, QWidget *parent, std::function<bool()> stillVisible);
     void saveMessageFile(const MessageFile &file, QWidget *parent, const QImage &preview = {});
     void showMessageResults(const QVector<Message> &messages);
-    void runProjectTaskSearch();
-    void displayProjectTaskResults();
     void updateWriteAvailability();
     void onTaskSummaryLoaded(const Task &task);
     void updateTaskCardChatBinding(const QString &previousDialog);
@@ -220,10 +185,6 @@ private:
     void createSubtask(ui::TaskCardDialog *card);
     bool beginTaskFormFiles(const QString &taskId, const QString &projectToOpen = {});
     bool uploadNextTaskFormFile();
-    void showProjectTimeline(bool show);
-    void openProjectTools();
-    void createProject();
-    void openStageManager();
     void pickFile(const QString &scope, const QString &kind);
     void sendFromComposer(ui::ComposerSendController &controller, ui::ChatComposer *composer, const QString &id);
     void uploadPastedChatImage(ui::ChatComposer *composer, const QString &scope, bool task, const QString &caption);
@@ -233,8 +194,6 @@ private:
     void clearDescriptionUpload();
     void pasteDescriptionPhoto(const QString &taskId, const QImage &image);
     void requestMessageSearch(const QString &scope, const QString &query, bool task);
-    bool canMoveBoardTask(const QString &taskId, const QString &sourceStage, const QString &targetStage) const;
-    void requestCurrentProjectBoard();
     bool writable() const { return !m_readOnly && m_online; }
     void onPeopleFound(const QString &requestId, const QVector<Person> &people);
 
@@ -242,7 +201,6 @@ private:
     bool m_readOnly;
     bool m_online = false;
     bool m_closingWorkspace = false;
-    BoardWidget *m_board = nullptr;
 
     QListWidget *m_sections = nullptr;
     QTimer *m_railWorkdayTimer = nullptr;
@@ -331,12 +289,6 @@ private:
     QTimer *m_messageSearchTimer = nullptr;
     QTimer *m_visibleChatReadTimer = nullptr;
 
-    QListWidget *m_projects = nullptr;
-    QVector<Project> m_projectDirectory;
-    QHash<QString, qint64> m_projectUnreadCounts;
-    bool m_projectUnreadCountsComplete = false;
-    ui::AvatarBadge *m_projectAvatar = nullptr;
-    QUrl m_projectAvatarUrl;
     QCache<QUrl, QPixmap> m_avatars{128};
     ui::ChatImagePreviews m_chatImagePreviews;
     std::unique_ptr<ui::ChatVideoPreviews> m_chatVideoPreviews;
@@ -359,59 +311,14 @@ private:
     QSet<QUrl> m_requestedAvatars;
     bool m_avatarUpdateQueued = false;
     QSet<QString> m_pendingPins;
-    QLabel *m_projectTitle = nullptr;
-    QLabel *m_projectDirectoryTitle = nullptr;
-    QTabBar *m_projectTabs = nullptr;
-    QStackedWidget *m_projectViews = nullptr;
-    QListWidget *m_projectTaskChats = nullptr;
-    QLabel *m_projectTaskChatStatus = nullptr;
-    QPushButton *m_moreProjectTaskChats = nullptr;
-    bool m_projectTaskViewRequested = false;
-    QString m_projectTaskChatScope;
-    QString m_projectTaskChatError;
-    QHash<QString, QListWidgetItem *> m_projectTaskChatRows;
-    qint64 m_projectTaskChatUnread = 0;
-    int m_projectTaskChatNext = 0;
-    int m_projectTaskChatPending = -1;
-    QLineEdit *m_filter = nullptr;
-    QLabel *m_projectTaskSearchStatus = nullptr;
-    QLineEdit *m_projectNameSearch = nullptr;
-    QString m_projectNameQuery;
-    bool m_projectDirectoryLoaded = false;
-    bool m_projectsMoreAvailable = false;
-    bool m_projectsPagePending = false;
-    bool m_projectsPageFailed = false;
-    bool m_projectsPageCheckQueued = false;
-    QPushButton *m_kanbanButton = nullptr;
-    QPushButton *m_listButton = nullptr;
-    ui::TaskGanttView *m_projectTimeline = nullptr;
-    bool m_ganttMode = false;
-    QPushButton *m_newTaskButton = nullptr;
-    QPushButton *m_newProjectButton = nullptr;
-    QPushButton *m_moreProjectsButton = nullptr;
-    QPushButton *m_projectToolsButton = nullptr;
-    QPointer<ui::ProjectToolsDialog> m_projectTools;
-    QPushButton *m_stagesButton = nullptr;
-    QVector<Stage> m_stages;
-    QSet<QString> m_loadedBoardTaskIds;
     ui::TaskCardDialog *m_card = nullptr;
     bool m_loadCardChat = false;
     bool m_cardDetailsReady = false;
     bool m_cardSummaryPending = false;
     bool m_cardRequestedProjectDirectory = false;
     QString m_cardRequestedStages;
-    ui::StageManagerDialog *m_stageManager = nullptr;
-    QTimer *m_projectSearchTimer = nullptr;
-    QHash<QString, QString> m_pendingProjectSearches;
-    QVector<Task> m_projectSearchResults;
-    bool m_projectSearchDisplayed = false;
-
+    ProjectsPanel *m_projectsPanel = nullptr;
     NotificationsPanel *m_events = nullptr;
-    QString m_linkedProjectId;
-    struct {
-        NotificationTarget target;
-        QUrl url;
-    } m_pendingMessageProject;
     QPointer<QDialog> m_personDialog;
     QLabel *m_personName = nullptr;
     QLabel *m_personPosition = nullptr;
@@ -430,13 +337,9 @@ private:
     QString m_reactionAccountScope;
     QHash<QString, ui::ChatDraft> m_taskDrafts;
     QString m_currentChatId;
-    QString m_currentProjectId;
-    QString m_pendingProjectId;
     QPointer<ui::TaskEditForm> m_taskForm;
-    ui::NameDialog *m_projectForm = nullptr;
     QString m_pendingCreateTask;
     QString m_pendingCreateSubtask;
-    bool m_pendingCreateProject = false;
     QString m_pendingTaskEdit;
     QPointer<ui::TaskCardDialog> m_pendingTaskEditCard;
     QString m_pendingTaskEditProject;
@@ -444,9 +347,6 @@ private:
     QString m_pendingTaskDelete;
     QPointer<ui::TaskCardDialog> m_pendingTaskDeleteCard;
     QString m_pendingTaskDeleteProject;
-    QString m_pendingBoardEdit;
-    QString m_pendingMoveTask;
-    QString m_boardMoveRefreshProject;
     ui::ComposerSendController m_chatSendController;
     ui::ComposerSendController m_taskSendController;
     int m_lastSection = 0;

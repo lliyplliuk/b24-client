@@ -13,8 +13,23 @@
 #include <QUrlQuery>
 
 #include <algorithm>
+#include <functional>
+
+class QMenu;
 
 namespace bx::ui {
+
+QMenu *directoryPinMenu(QWidget *parent, bool pinned, std::function<bool()> canChange,
+                        std::function<void()> togglePin);
+
+struct ListViewportAnchor {
+    QStringList successors;
+    int offset = 0;
+    int scroll = 0;
+};
+ListViewportAnchor listViewportAnchor(const QListWidget *list);
+void restoreListViewport(QListWidget *list, const ListViewportAnchor &anchor);
+QLabel *emptyState(const QString &text, QWidget *parent);
 
 inline bool positiveTaskId(const QString &id)
 {
