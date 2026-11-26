@@ -154,6 +154,9 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
             emit failed(operation, QStringLiteral("Откройте исходный чат сообщения"));
             break;
         }
+        // A repeated creation command for this message has a single UI acknowledgement.
+        if (m_inflightOperations.contains(operation))
+            return;
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.message.share.json"));
         const auto account = m_accountScopeRevision;
         webRequest(url, {{QStringLiteral("MESSAGE_ID"), message}, {QStringLiteral("DIALOG_ID"), scope},

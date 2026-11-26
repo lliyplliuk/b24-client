@@ -15,6 +15,7 @@
 #include <QMap>
 #include <QNetworkReply>
 #include <QNetworkProxy>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSettings>
@@ -170,6 +171,16 @@ qint64 recentMessageId(const QJsonObject &message)
     return numericId(field(message, {"id", "ID"})).toLongLong();
 }
 
+template<typename T>
+void storeChatMetadata(QCache<QString, T> &cache, const QString &id, const T &value)
+{
+    // QCache trims before replacing a key, so update a hit in place at capacity.
+    if (auto *cached = cache.object(id))
+        *cached = value;
+    else
+        cache.insert(id, new T(value));
+}
+
 std::optional<qint64> explicitMessageAuthorId(const QJsonObject &message)
 {
     std::optional<qint64> author;
@@ -228,6 +239,29 @@ bool mutedListContains(const QJsonValue &list, const QString &user)
         return std::any_of(entries.cbegin(), entries.cend(), [&user](const QJsonValue &entry) { return string(entry) == user; });
     }
     return list.toObject().value(user).toBool();
+}
+
+bool shareableRead(const QString &operation)
+{
+    // Classify the whole operation: even a GET-like step of a mutation may start a write.
+    // Unknown operations keep the single-flight behavior of mutations and uploads.
+    static const QSet<QString> reads{
+        recentOp, taskRecentOp, projectFallbackOp, projectPinIdentityOp, settingsIdentityOp,
+        recentUserStatusOp, soundsOp, chatIdentityOp, sessionKeepaliveOp, notificationsOp, olderNotificationsOp,
+        QStringLiteral("chat-history-read"), QStringLiteral("chat-history-snapshot"), QStringLiteral("task-messages"),
+        QStringLiteral("task-chat-titles"), QStringLiteral("project-task-chats"), QStringLiteral("chat-badges-snapshot"),
+        QStringLiteral("project-unread"), QStringLiteral("portal-status"), QStringLiteral("portal-status-bootstrap"),
+        QStringLiteral("person"), QStringLiteral("current-person"), QStringLiteral("search-people"),
+        QStringLiteral("project-files"), QStringLiteral("project-members"), QStringLiteral("project-stages"),
+        QStringLiteral("board"), QStringLiteral("board-column"), QStringLiteral("search-project-tasks"),
+        QStringLiteral("task"), QStringLiteral("task-details"), QStringLiteral("task-files"), QStringLiteral("checklist"),
+        QStringLiteral("subtasks"), QStringLiteral("gantt-links"), QStringLiteral("task-history"), QStringLiteral("timeline"),
+        QStringLiteral("link-preview"), QStringLiteral("message-context"), QStringLiteral("message-viewers"),
+        QStringLiteral("pins"), QStringLiteral("chat-assets"), QStringLiteral("older-chat"), QStringLiteral("search-chat"),
+        QStringLiteral("search-task-chat"), QStringLiteral("search-chats"), QStringLiteral("search-task-chats"),
+        QStringLiteral("search-notifications"), QStringLiteral("notification-settings")
+    };
+    return reads.contains(operation.section(QLatin1Char(':'), 0, 0));
 }
 
 bool optionalLookup(const QString &operation)
@@ -974,8 +1008,7 @@ void CloudBackend::resetAccountScopedState()
     // Resume history updates only when a view requests them for the new account.
     m_openDialog.clear();
     m_openTask.clear();
-    m_chatHistoryRetry = {};
-    m_taskHistoryRetry = {};
+    resetHistoryRetries();
     m_recentDirty = false;
     m_chatDirty = false;
     m_taskMessagesDirty = false;
@@ -1313,6 +1346,33 @@ QString CloudBackend::taskFormMutationKey(const QString &operation) const
     return {};
 }
 
+struct CloudBackend::InflightRequest {
+    QUrl url;
+    Headers headers;
+    std::optional<QByteArray> bufferedBody;
+    QString operation;
+    QString envelope;
+    quint64 scope;
+    quint64 revision;
+    std::shared_ptr<Session> candidate;
+    bool includeResponseMeta;
+    QList<Handler> handlers;
+    bool waitingForHistoryRetry = false;
+
+    void notify(CloudBackend *backend, const QJsonValue &value, const QString &error = {}) const
+    {
+        QPointer<CloudBackend> alive(backend);
+        for (const auto &handler : handlers) {
+            if (!alive || !backend->m_started || scope != backend->m_accountScopeRevision)
+                return;
+            if (error.isEmpty())
+                handler.onData(value);
+            else
+                handler.reject(error, optionalLookup(operation));
+        }
+    }
+};
+
 void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers,
                                  const QString &operation, const QString &envelope, Handler onData,
                                  const QString &requestKey, const std::shared_ptr<Session> &candidate,
@@ -1330,13 +1390,26 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
         ? m_taskHistoryRetry : m_chatHistoryRetry).revision;
     const auto failedOperation = latestHistory ? key : operation;
     const auto rejectRequest = [&](const QString &reason) {
-        if (optionalLookup(operation))
-            onData({});
-        else
-            emit failed(failedOperation, reason);
+        const bool optional = optionalLookup(operation);
+        QPointer<CloudBackend> alive(this);
+        const auto detail = optional && onData.accepts ? onData.invalidMessage : reason;
+        if (!optional || onData.accepts)
+            emit failed(failedOperation, detail);
+        if (alive && accountScope == m_accountScopeRevision)
+            onData.reject(detail, optional);
     };
-    if (m_inflightOperations.contains(key))
+    auto *buffer = qobject_cast<QBuffer *>(body);
+    const auto revision = m_sessionRevision;
+    if (m_inflightOperations.contains(key)) {
+        const auto pending = m_inflightOperations.value(key);
+        if (buffer && pending && shareableRead(operation) && pending->scope == accountScope
+            && pending->revision == revision && pending->candidate == candidate && pending->operation == operation
+            && pending->url == url && pending->headers == headers && pending->bufferedBody
+            && *pending->bufferedBody == buffer->data() && pending->envelope == envelope
+            && pending->includeResponseMeta == includeResponseMeta)
+            pending->handlers.append(std::move(onData));
         return;
+    }
     const auto &credentials = candidate ? *candidate : m_session;
     if (m_authExpired && !candidate) {
         rejectRequest(QStringLiteral("Вход в портал истёк. Обновите подключение."));
@@ -1385,7 +1458,10 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
     auto *reply = m_http.post(request, body);
     ownedBody.release()->setParent(reply);
     m_requests.insert(reply, key);
-    m_inflightOperations.insert(key);
+    auto pending = std::make_shared<InflightRequest>(InflightRequest{
+        url, headers, buffer ? std::optional<QByteArray>(buffer->data()) : std::nullopt, operation, envelope,
+        accountScope, revision, candidate, includeResponseMeta, {std::move(onData)}});
+    m_inflightOperations.insert(key, pending);
     if (operation == sessionRecoveryOp)
         m_sessionRecoveryReply = reply;
     reply->setReadBufferSize(maxResponse + 1);
@@ -1397,11 +1473,9 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
         if (reply->bytesAvailable() > maxResponse)
             reply->abort();
     });
-    const auto revision = m_sessionRevision;
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, operation, key, envelope, revision, candidate, historySnapshot, latestHistory, historyRevision, failedOperation,
-             accountScope, includeResponseMeta,
-             handler = std::move(onData)] {
+             accountScope, includeResponseMeta, pending] {
         m_requests.remove(reply);
         reply->deleteLater();
         if (operation == sessionRecoveryOp) {
@@ -1409,7 +1483,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
                 return;
             m_sessionRecoveryReply = nullptr;
         }
-        m_inflightOperations.remove(key);
+        m_inflightOperations.remove(key, pending);
         if (!m_started)
             return;
         if (accountScope != m_accountScopeRevision) {
@@ -1430,6 +1504,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
             && key != boardReadKey(operation, m_boardPageGeneration))
             return;
 
+        const QPointer<CloudBackend> alive(this);
         const auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const bool redirect = status >= 300 && status < 400;
         const bool complete = reply->isOpen() && reply->bytesAvailable() <= maxResponse && !redirect;
@@ -1455,10 +1530,10 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
             if (historySnapshot && !denied && !m_authExpired
                 && (temporary || (status >= 200 && status < 300))) {
                 // The separate message list can still be usable if the full chat snapshot fails.
-                handler({});
+                pending->notify(this, {});
                 return;
             }
-            if (latestHistory && !denied && temporary && scheduleHistoryRetry(key, historyRevision))
+            if (latestHistory && !denied && temporary && scheduleHistoryRetry(key, historyRevision, pending))
                 return;
             if (operation == csrfRefreshOp) {
                 if (denied && revision == m_sessionRevision)
@@ -1481,10 +1556,6 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
                     }
                 }
             }
-            if (lookup) {
-                handler({});
-                return;
-            }
             QString detail = refreshing ? QStringLiteral("Клиент проверяет вход в портал. Повторите действие после проверки")
                 : denied && revision != m_sessionRevision && !m_authExpired
                     ? QStringLiteral("Параметры входа обновлены. Повторите действие")
@@ -1500,8 +1571,14 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
             if (operation.startsWith(QLatin1String("update-task:"))
                 || operation.startsWith(QLatin1String("board-edit:")))
                 detail += QStringLiteral(". Проверьте сохранённые изменения перед повтором");
-            emit this->failed(failedOperation, detail);
-            if (operation == pushOp && !m_authExpired)
+            const auto &first = pending->handlers.first();
+            if (lookup && first.accepts)
+                detail = first.invalidMessage;
+            if (!lookup || first.accepts)
+                emit this->failed(failedOperation, detail);
+            if (alive)
+                pending->notify(this, {}, detail);
+            if (operation == pushOp && alive && !m_authExpired)
                 scheduleReconnect();
             return;
         }
@@ -1517,7 +1594,17 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
                 emit sessionUpdated(m_session);
             }
         }
-        handler(includeResponseMeta ? QJsonValue(object) : result);
+        if (!alive || !m_started || accountScope != m_accountScopeRevision)
+            return;
+        const auto value = includeResponseMeta ? QJsonValue(object) : result;
+        const auto &first = pending->handlers.first();
+        if (first.accepts && !first.accepts(value)) {
+            emit this->failed(failedOperation, first.invalidMessage);
+            if (alive)
+                pending->notify(this, {}, first.invalidMessage);
+            return;
+        }
+        pending->notify(this, value);
     });
 }
 
@@ -1698,16 +1785,15 @@ void CloudBackend::rememberCurrentUser(const QString &id)
 
 void CloudBackend::rememberDismissalStatus(const QString &id, std::optional<bool> dismissed)
 {
-    if (!m_personalChatStatuses.contains(id) && m_personalChatStatuses.size() >= 2 * tunables::kPageSizeChats)
-        m_personalChatStatuses.erase(m_personalChatStatuses.begin());
     const auto ttl = dismissed.has_value() ? 300 : 5;
-    m_personalChatStatuses.insert(id, {dismissed, QDateTime::currentSecsSinceEpoch() + ttl});
+    const PersonalChatStatus status{dismissed, QDateTime::currentSecsSinceEpoch() + ttl};
+    storeChatMetadata(m_personalChatStatuses, id, status);
 }
 
 std::optional<bool> CloudBackend::cachedDismissalStatus(const QString &id) const
 {
-    const auto cached = m_personalChatStatuses.constFind(id);
-    if (cached != m_personalChatStatuses.cend() && cached->expiresAt > QDateTime::currentSecsSinceEpoch())
+    const auto *cached = m_personalChatStatuses.object(id);
+    if (cached && cached->expiresAt > QDateTime::currentSecsSinceEpoch())
         return cached->dismissed;
     return std::nullopt;
 }
@@ -2012,15 +2098,13 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
                 live.counter = chat.unread;
             }
 
-            if (!m_recentTitles.contains(dialogId) && m_recentTitles.size() >= 2 * tunables::kPageSizeChats)
-                m_recentTitles.erase(m_recentTitles.begin());
-            m_recentTitles.insert(dialogId, chat.title);
+            storeChatMetadata(m_recentTitles, dialogId, chat.title);
             if (!task && chat.taskChat && legacyTasks.size() < tunables::kPageSizeChats)
                 legacyTasks.append(chat);
             if (chat.taskChat == task && chats.size() < tunables::kPageSizeChats) {
-                const auto status = m_personalChatStatuses.constFind(dialogId);
+                const auto *status = m_personalChatStatuses.object(dialogId);
                 if (!task && chat.kind == QLatin1String("im")
-                    && (status == m_personalChatStatuses.cend() || status->expiresAt <= QDateTime::currentSecsSinceEpoch())
+                    && (!status || status->expiresAt <= QDateTime::currentSecsSinceEpoch())
                     && !usersWithoutStatus.contains(dialogId)) {
                     usersWithoutStatus.append(dialogId);
                 }
@@ -2045,15 +2129,14 @@ void CloudBackend::loadRecentChats(bool task, bool badgesOnly)
             if (!taskDialogs.contains(legacy.id))
                 chats.append(legacy);
         }
+        ++m_taskTitleGeneration;
         if (badgesOnly && !m_showTaskChats) {
             publishRecentChats(std::move(chats), true);
             return;
         }
-        resolveTaskChatTitles(std::move(chats), taskRecentOp, [this, scope = m_accountScopeRevision](QVector<Chat> result) {
-            if (scope != m_accountScopeRevision)
-                return;
+        resolveTaskChatTitles(std::move(chats), taskRecentOp, [this](QVector<Chat> result) {
             for (const auto &chat : result)
-                m_recentTitles.insert(chat.id, chat.title);
+                storeChatMetadata(m_recentTitles, chat.id, chat.title);
             publishRecentChats(std::move(result), true);
         });
     });
@@ -2287,7 +2370,7 @@ void CloudBackend::applyRecentPull(const QString &command, const QString &dialog
         live.incomingId = messageId;
         if (inRecentScope && (!params.value(QStringLiteral("skipRecentUpdate")).toBool() || !knownRow)) {
             if (candidate.title.isEmpty())
-                candidate.title = m_recentTitles.value(dialog, QStringLiteral("Диалог %1").arg(dialog));
+                candidate.title = recentTitle(dialog, QStringLiteral("Диалог %1").arg(dialog));
             candidate.lastMessage = field(message, {"text", "message"}).left(2000);
             candidate.updated = date(message.value(QStringLiteral("date")));
             if (!candidate.updated.isValid())
@@ -2337,9 +2420,13 @@ void CloudBackend::rememberTaskTitle(const QString &id, const QString &title)
 {
     if (id.isEmpty() || title.isEmpty())
         return;
-    if (!m_taskChatTitles.contains(id) && m_taskChatTitles.size() >= 2 * tunables::kPageSizeChats)
-        m_taskChatTitles.erase(m_taskChatTitles.begin());
-    m_taskChatTitles.insert(id, title);
+    storeChatMetadata(m_taskChatTitles, id, title);
+}
+
+QString CloudBackend::recentTitle(const QString &dialog, const QString &fallback) const
+{
+    const auto *title = m_recentTitles.object(dialog);
+    return title ? *title : fallback;
 }
 
 void CloudBackend::resolveTaskChatTitles(QVector<Chat> chats, const QString &key, std::function<void(QVector<Chat>)> deliver)
@@ -2351,20 +2438,27 @@ void CloudBackend::resolveTaskChatTitles(QVector<Chat> chats, const QString &key
     for (auto &chat : chats) {
         if (chat.taskId.isEmpty())
             continue;
-        const auto title = m_taskChatTitles.value(chat.taskId);
-        if (!title.isEmpty()) {
-            chat.title = title;
-        } else if (!missing.contains(chat.taskId)) {
-            fields.append({QStringLiteral("filter[ID][%1]").arg(missing.size()), chat.taskId});
+        if (const auto *title = m_taskChatTitles.object(chat.taskId)) {
+            chat.title = *title;
+        } else {
             missing.insert(chat.taskId);
         }
     }
+    const auto generation = m_taskTitleGeneration;
+    const auto scope = m_accountScopeRevision;
     // Show available rows even if the optional title batch is unavailable.
     deliver(chats);
-    if (missing.isEmpty())
+    if (missing.isEmpty() || scope != m_accountScopeRevision || generation != m_taskTitleGeneration)
         return;
+    auto ids = missing.values();
+    std::sort(ids.begin(), ids.end());
+    for (qsizetype i = 0; i < ids.size(); ++i)
+        fields.append({QStringLiteral("filter[ID][%1]").arg(i), ids.at(i)});
     ajax(QStringLiteral("tasks.task.list"), fields, QStringLiteral("task-chat-titles"),
-         [this, chats = std::move(chats), missing = std::move(missing), deliver = std::move(deliver)](QJsonValue data) mutable {
+         [this, generation, chats = std::move(chats), missing = std::move(missing),
+          deliver = std::move(deliver)](QJsonValue data) mutable {
+        if (generation != m_taskTitleGeneration)
+            return;
         for (const auto row : data.toObject().value(QStringLiteral("tasks")).toArray()) {
             const auto item = row.toObject();
             const auto id = numericId(field(item, {"id", "ID"}));
@@ -2373,18 +2467,29 @@ void CloudBackend::resolveTaskChatTitles(QVector<Chat> chats, const QString &key
         }
         bool changed = false;
         for (auto &chat : chats) {
-            const auto title = m_taskChatTitles.value(chat.taskId);
-            if (!title.isEmpty() && chat.title != title) {
-                chat.title = title;
+            const auto *title = m_taskChatTitles.object(chat.taskId);
+            if (title && chat.title != *title) {
+                chat.title = *title;
                 changed = true;
             }
         }
         if (changed)
             deliver(std::move(chats));
-    }, QStringLiteral("task-chat-titles:") + key);
+    }, QStringLiteral("task-chat-titles:") + key + QLatin1Char(':') + ids.join(QLatin1Char(',')));
 }
 
-bool CloudBackend::scheduleHistoryRetry(const QString &operation, quint64 revision)
+void CloudBackend::resetHistoryRetries()
+{
+    // Waiting reads have no live reply for the account reset to abort.
+    m_inflightOperations.removeIf([](decltype(m_inflightOperations)::iterator it) {
+        return it.value() && it.value()->waitingForHistoryRetry;
+    });
+    m_chatHistoryRetry = {};
+    m_taskHistoryRetry = {};
+}
+
+bool CloudBackend::scheduleHistoryRetry(const QString &operation, quint64 revision,
+                                        const std::shared_ptr<InflightRequest> &pending)
 {
     const bool task = operation.startsWith(QLatin1String("task-messages:"));
     const auto key = operation.section(QLatin1Char(':'), 1);
@@ -2400,9 +2505,32 @@ bool CloudBackend::scheduleHistoryRetry(const QString &operation, quint64 revisi
     if (attempt.used || !current())
         return false;
     attempt.used = true;
-    QTimer::singleShot(350, this, [this, key, dialog, task, current] {
-        if (current())
+    pending->waitingForHistoryRetry = true;
+    m_inflightOperations.insert(operation, pending);
+    QTimer::singleShot(350, this, [this, key, dialog, task, current, operation, pending] {
+        m_inflightOperations.remove(operation, pending);
+        if (!current()) {
+            // A newer view may have deferred its refresh while this key was occupied.
+            if (pending->scope == m_accountScopeRevision)
+                scheduleRefresh();
+            pending->notify(this, {}, QStringLiteral("Чтение истории больше не актуально"));
+            return;
+        }
+        if (pending->handlers.size() == 1) {
             loadMessages(key, dialog, task, true);
+            return;
+        }
+        // Subscribers need the failed stage's response. A fresh chat snapshot could
+        // contain messages inline and skip the message-list request they subscribed to.
+        QUrlQuery form(QString::fromUtf8(*pending->bufferedBody));
+        form.removeAllQueryItems(QStringLiteral("sessid"));
+        Handler subscribers{
+            [this, pending](QJsonValue result) { pending->notify(this, result); },
+            [this, pending](const QString &error) { pending->notify(this, {}, error); }
+        };
+        webRequest(pending->url, form.queryItems(QUrl::FullyDecoded), pending->operation,
+                   pending->envelope, std::move(subscribers), operation, pending->candidate,
+                   pending->includeResponseMeta);
     });
     return true;
 }
@@ -3107,14 +3235,14 @@ void CloudBackend::requestProjectMembers(const QString &projectId)
     ajaxJson(QStringLiteral("socialnetwork.api.workgroup.get"),
         {{QStringLiteral("params"), QJsonObject{{QStringLiteral("groupId"), projectId.toLongLong()},
                                                 {QStringLiteral("select"), fields}}}},
-        operation, [this, projectId, operation](QJsonValue data) {
+        operation, Handler::checked(QStringLiteral("Не удалось получить участников проекта"),
+        [projectId](const QJsonValue &data) {
+            const auto payload = data.toObject();
+            const auto list = payload.value(QStringLiteral("LIST_OF_MEMBERS"));
+            return field(payload, {"ID", "id"}) == projectId
+                && (list.isObject() || list.isArray() || payload.value(QStringLiteral("MEMBERS")).isArray());
+        }, [this, projectId](QJsonValue data) {
         const auto payload = data.toObject();
-        const auto memberList = payload.value(QStringLiteral("LIST_OF_MEMBERS"));
-        if (field(payload, {"ID", "id"}) != projectId
-            || (!memberList.isObject() && !memberList.isArray() && !payload.value(QStringLiteral("MEMBERS")).isArray())) {
-            emit failed(operation, QStringLiteral("Не удалось получить участников проекта"));
-            return;
-        }
         QHash<QString, ProjectMember> entries;
         const auto append = [&entries](const QString &id, ProjectMemberRole role, const QJsonObject &row = {}) {
             if (id.isEmpty() || (entries.size() >= 200 && !entries.contains(id)))
@@ -3175,7 +3303,7 @@ void CloudBackend::requestProjectMembers(const QString &projectId)
             return a.role != b.role ? a.role < b.role : QString::localeAwareCompare(a.name, b.name) < 0;
         });
         emit projectMembersLoaded(projectId, roster);
-    });
+    }));
 }
 
 void CloudBackend::requestProjectFiles(const QString &projectId, const QString &folderId, int offset)
@@ -3197,11 +3325,9 @@ void CloudBackend::requestProjectFiles(const QString &projectId, const QString &
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/disk.storage.getList.json"));
     webRequest(url, {{QStringLiteral("filter[ENTITY_TYPE]"), QStringLiteral("group")},
                      {QStringLiteral("filter[ENTITY_ID]"), projectId}}, operation,
-               QStringLiteral("result"), [this, projectId, operation](QJsonValue data) {
-        if (!data.isArray()) {
-            emit failed(operation, QStringLiteral("Диск проекта недоступен"));
-            return;
-        }
+               QStringLiteral("result"), Handler::checked(QStringLiteral("Диск проекта недоступен"),
+               [](const QJsonValue &data) { return data.isArray(); },
+               [this, projectId, operation](QJsonValue data) {
         for (const auto value : data.toArray()) {
             const auto entry = value.toObject();
             if (field(entry, {"ENTITY_TYPE"}) != QLatin1String("group") || field(entry, {"ENTITY_ID"}) != projectId)
@@ -3217,7 +3343,7 @@ void CloudBackend::requestProjectFiles(const QString &projectId, const QString &
             return;
         }
         emit failed(operation, QStringLiteral("Диск проекта недоступен"));
-    });
+    }));
 }
 
 void CloudBackend::loadProjectDiskItems(const QString &projectId, const QString &folderId, int offset)
@@ -3229,14 +3355,12 @@ void CloudBackend::loadProjectDiskItems(const QString &projectId, const QString 
     const auto url = OriginGuard(m_session.origin).resolve(endpoint);
     webRequest(url, {{QStringLiteral("id"), folderId.isEmpty() ? disk.id : folderId},
                      {QStringLiteral("start"), QString::number(offset)}}, operation, QStringLiteral("result"),
+               Handler::checked(QStringLiteral("Не удалось получить файлы проекта"),
+               [](const QJsonValue &data) { return data.isArray(); },
                [this, projectId, folderId, operation, storage = disk.id, root = disk.root, offset](QJsonValue data) {
         auto current = m_projectDisks.find(projectId);
         if (current == m_projectDisks.end() || current->id != storage || current->root != root) {
             emit failed(operation, QStringLiteral("Папка больше недоступна"));
-            return;
-        }
-        if (!data.isArray()) {
-            emit failed(operation, QStringLiteral("Не удалось получить файлы проекта"));
             return;
         }
         const auto expectedParent = folderId.isEmpty() ? root : folderId;
@@ -3272,7 +3396,7 @@ void CloudBackend::loadProjectDiskItems(const QString &projectId, const QString 
         }
         const auto next = rows.size() >= 50 ? offset + 50 : -1;
         emit projectFilesLoaded(projectId, folderId, items, next);
-    });
+    }));
 }
 
 void CloudBackend::setChatPinned(const QString &dialogId, bool pinned)
@@ -3378,10 +3502,10 @@ void CloudBackend::searchProjectTasks(const QString &projectId, const QString &q
     for (const auto *name : {"ID", "TITLE", "GROUP_ID", "STAGE_ID", "DEADLINE", "PRIORITY", "RESPONSIBLE_ID"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
     ajax(QStringLiteral("tasks.task.list"), fields, operation,
-         [this, projectId, query, matchId, operation](QJsonValue data) {
+         Handler::checked(QStringLiteral("Портал вернул неподдерживаемый формат данных"),
+         [](const QJsonValue &data) { return data.toObject().value(QStringLiteral("tasks")).isArray(); },
+         [this, projectId, query, matchId](QJsonValue data) {
         const auto rows = data.toObject().value(QStringLiteral("tasks"));
-        if (!rows.isArray())
-            return failShape(operation);
         QVector<Task> matches;
         for (const auto &row : rows.toArray()) {
             const auto item = row.toObject();
@@ -3400,7 +3524,7 @@ void CloudBackend::searchProjectTasks(const QString &projectId, const QString &q
                 break;
         }
         emit projectTasksFound(projectId, query, matches);
-    }, operation + QLatin1Char(':') + query);
+    }), operation + QLatin1Char(':') + query);
 }
 
 Task CloudBackend::boardTask(const QJsonObject &item, const QString &id, const QString &projectId,
@@ -3694,7 +3818,7 @@ void CloudBackend::boardMutation(const QString &action, const QString &projectId
                                  Handler onData)
 {
     fields.append(boardFields(projectId));
-    if (!onData)
+    if (!onData.onData)
         onData = [this, projectId](QJsonValue) { emit boardUpdated(projectId); };
     componentAction(action, fields, QStringLiteral("board-edit:") + projectId, std::move(onData));
 }
@@ -4777,12 +4901,10 @@ void CloudBackend::requestTaskHistory(const QString &taskId)
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.history.list.json"));
     webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, QStringLiteral("result"),
-               [this, taskId, operation](QJsonValue data) {
+               Handler::checked(QStringLiteral("История задачи недоступна"),
+               [](const QJsonValue &data) { return data.toObject().value(QStringLiteral("list")).isArray(); },
+               [this, taskId](QJsonValue data) {
         const auto list = data.toObject().value(QStringLiteral("list"));
-        if (!list.isArray()) {
-            emit failed(operation, QStringLiteral("История задачи недоступна"));
-            return;
-        }
         static const QHash<QString, QString> eventNames{
             {QStringLiteral("NEW"), QStringLiteral("Задача создана")},
             {QStringLiteral("TITLE"), QStringLiteral("Изменилось название")},
@@ -4824,7 +4946,7 @@ void CloudBackend::requestTaskHistory(const QString &taskId)
                 break;
         }
         emit taskHistoryLoaded(taskId, history, rows.size() >= tunables::kPageSizeChats);
-    });
+    }));
 }
 
 void CloudBackend::requestProjectTimeline(const QString &projectId)
@@ -5727,7 +5849,7 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
     auto notifyTitle = notificationDisplayText(field(params, {"notify_title", "title"}));
     if (notifyTitle.isEmpty())
         notifyTitle = notificationDisplayText(field(notification, {"notify_title", "title"}));
-    const auto title = isMessage ? m_recentTitles.value(dialog, QStringLiteral("Новое сообщение"))
+    const auto title = isMessage ? recentTitle(dialog, QStringLiteral("Новое сообщение"))
         : notifyTitle.isEmpty() ? QStringLiteral("Уведомление Битрикс24") : notifyTitle;
     QString content = field(message, {"text", "message"});
     if (content.isEmpty())
@@ -5923,7 +6045,7 @@ void CloudBackend::reconcileHistoryPopups(const QString &dialog, qint64 chatId, 
         return;
 
     const auto now = QDateTime::currentDateTime();
-    const auto title = m_recentTitles.value(dialog, QStringLiteral("Новое сообщение"));
+    const auto title = recentTitle(dialog, QStringLiteral("Новое сообщение"));
     const auto chat = history.value(QStringLiteral("chat")).toObject();
     const bool taskChat = task || !notificationTaskId(dialog, chat).isEmpty();
     for (const auto &message : messages) {

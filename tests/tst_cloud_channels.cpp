@@ -158,6 +158,8 @@ class TestCloudChannels : public QObject {
     Q_OBJECT
 
 private slots:
+    void evictsLeastRecentlyUsedChatMetadata_data();
+    void evictsLeastRecentlyUsedChatMetadata();
     void searchesOutsideRecentAndLoadedHistory();
     void uploadsChatAndTaskFiles();
     void uploadsChatImagesWithCaption_data();
@@ -181,6 +183,69 @@ private slots:
     void loadsOnlyViewersOfTheExactOutgoingMessage();
     void streamsOriginalPhotoAndCancelsIndependently();
 };
+
+void TestCloudChannels::evictsLeastRecentlyUsedChatMetadata_data()
+{
+    QTest::addColumn<bool>("tasks");
+    QTest::newRow("dismissal status") << false;
+    QTest::newRow("task title") << true;
+}
+
+void TestCloudChannels::evictsLeastRecentlyUsedChatMetadata()
+{
+    QFETCH(bool, tasks);
+    Fixture fixture;
+    QVERIFY(fixture.listen());
+    QJsonArray recent, titles;
+    fixture.responder = [&](const Request &request) {
+        if (request.action() == QLatin1String("im.v2.Recent.load"))
+            return ajax(QJsonDocument(QJsonObject{{"userId", 999}, {"recentItems", recent}}).toJson());
+        if (request.action() == QLatin1String("tasks.task.list"))
+            return ajax(QJsonDocument(QJsonObject{{"tasks", titles}}).toJson());
+        return ajax("{}");
+    };
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy loaded(&backend, tasks ? &Backend::taskChatsLoaded : &Backend::recentChatsLoaded);
+    backend.start();
+
+    const auto load = [&](int first, int count, bool populate) {
+        recent = {};
+        titles = {};
+        for (int id = first; id < first + count; ++id) {
+            QJsonObject row;
+            if (tasks) {
+                row = {{"dialogId", QStringLiteral("chat%1").arg(id)}, {"type", "tasksTask"},
+                       {"entityLink", QJsonObject{{"id", id}, {"type", "TASKS_TASK"}}}};
+                titles.append(QJsonObject{{"id", id}, {"title", QStringLiteral("Task %1").arg(id)}});
+            } else {
+                row = {{"dialogId", QString::number(id)}};
+                if (populate)
+                    row.insert("user", QJsonObject{{"id", id}, {"active", false}});
+            }
+            recent.append(row);
+        }
+        loaded.clear();
+        if (tasks)
+            backend.requestTaskChats();
+        else
+            backend.requestRecentChats();
+        QTRY_VERIFY(loaded.size() >= (tasks && populate ? 2 : 1));
+    };
+
+    constexpr int page = tunables::kPageSizeChats;
+    load(1, page, true);
+    load(page + 1, page, true);
+    load(1, 1, false); // Refresh the oldest entry by reading it.
+    load(2 * page + 1, 2, true);
+    load(1, 4, false);
+    QVERIFY(!loaded.isEmpty());
+    const auto rows = loaded.first().first().value<QVector<Chat>>();
+    QCOMPARE(rows.size(), 4);
+    for (int i = 0; i < rows.size(); ++i) {
+        const bool cached = tasks ? rows[i].title == QStringLiteral("Task %1").arg(i + 1) : rows[i].dismissed;
+        QCOMPARE(cached, i == 0 || i == 3);
+    }
+}
 
 void TestCloudChannels::labelsOnlyVerifiedTaskCreationNotices()
 {

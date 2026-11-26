@@ -9,6 +9,7 @@
 #include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
 #include <QSettings>
@@ -157,10 +158,11 @@ public:
         heldChatResponse.clear();
     }
 
-    void releaseHeldReadResponse()
+    void releaseHeldReadResponse(const QByteArray &extraHeaders = {})
     {
         if (!heldReadSocket)
             return;
+        heldReadResponse.insert(heldReadResponse.indexOf("\r\n") + 2, extraHeaders);
         heldReadSocket->write(heldReadResponse);
         heldReadSocket->disconnectFromHost();
         heldReadSocket.clear();
@@ -227,6 +229,8 @@ public:
     bool holdNextOnlineResponse = false;
     bool holdNextIdentityResponse = false;
     bool rejectDeadline = false;
+    bool rejectTaskSearch = false;
+    bool malformedTaskSearch = false;
     bool extendedStageFixture = false;
     bool boardPagingFixture = false;
     QByteArray kanbanMoveResult = R"({"id":60})";
@@ -921,6 +925,10 @@ private:
                 "auditorsData":)" + legacyTaskAuditors + "}}");
         }
         if (action == QStringLiteral("tasks.task.list")) {
+            if (malformedTaskSearch)
+                return ajaxResult("{}");
+            if (rejectTaskSearch)
+                return R"({"status":"error","errors":[{"code":"TASK_SEARCH_FAILED"}]})";
             const auto selections = request.form.queryItems(QUrl::FullyDecoded);
             if (selections.contains({QStringLiteral("select[]"), QStringLiteral("START_DATE_PLAN")}))
                 return ajaxResult(R"({"tasks":[{"id":42,"title":"План","groupId":17,
@@ -1129,6 +1137,8 @@ private slots:
     void retriesChatHistoryWithTheKnownChatId();
     void recoversLatestHistoryAfterATemporaryFailure_data();
     void recoversLatestHistoryAfterATemporaryFailure();
+    void retriesCoalescedHistoryRead_data();
+    void retriesCoalescedHistoryRead();
     void coalescesManualHistoryRefreshWhileLatestReadIsInFlight();
     void reconcilesUnreadFromScopedActiveHistory();
     void ignoresParticipantCountsInUnreadBadges();
@@ -1138,6 +1148,7 @@ private slots:
     void decodesRichNotificationsFromHistoryAndPush();
     void resolvesNoticeAuthorFromMatchingUserOnly();
     void linksTaskChatEventsAndMarksSyntheticRowsLocally();
+    void evictsLeastRecentlyUsedNotificationTitle();
     void classifiesOrdinaryChatPushesWithoutSuppressingPopups();
     void marksExactNoticeIdsAsReadAfterBatchConfirmation();
     void ignoresNotificationRepliesFromPreviousAccount_data();
@@ -1176,6 +1187,10 @@ private slots:
     void loadsObserverAvatarsWithoutIndividualProfileRequests();
     void loadsObserverAvatarsWithoutIndividualProfileRequests_data();
     void preservesRawTaskDescriptionAndRejectsAStaleEdit();
+    void overlappingTaskChatTitles();
+    void overlappingTaskSearches();
+    void dropsDuplicateSendBeforePosting();
+    void overlappingTaskSearchFailure();
     void findsProjectTasksOutsideInitialBoard();
     void loadsBoardColumnsLazilyWithoutSkippingFirstPage();
     void discardsBoardPagesFromPreviousSnapshots();
@@ -2997,7 +3012,9 @@ void TestCloudBackend::loadsInitialTaskPeopleInPortalRecentOrder()
 
     QSignalSpy failed(&backend, &Backend::failed);
     backend.searchPeople(u"initial-task-people-denied"_s, {});
-    QTRY_COMPARE(failed.size(), 1);
+    backend.searchPeople(u"initial-task-people-denied"_s, {});
+    QTRY_VERIFY(!failed.isEmpty());
+    QCOMPARE(failed.size(), 1);
     QCOMPARE(failed.first().first().toString(), u"search-people:initial-task-people-denied"_s);
     QCOMPARE(results.size(), 2);
 }
@@ -3936,6 +3953,136 @@ void TestCloudBackend::discardsBoardPagesFromPreviousSnapshots()
     QCOMPARE(page.count(), 3);
     QVERIFY(failed.isEmpty());
     QCOMPARE(page.last().at(2).value<QVector<Task>>().first().id, QStringLiteral("43"));
+}
+
+void TestCloudBackend::overlappingTaskChatTitles()
+{
+    using namespace Qt::StringLiterals;
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy loaded(&backend, &Backend::taskChatsLoaded);
+    backend.start();
+    const auto requestTitles = [&](std::initializer_list<int> tasks) {
+        QJsonArray rows;
+        for (const int task : tasks) {
+            rows.append(QJsonObject{{"dialogId", u"chat%1"_s.arg(task)}, {"type", "tasksTask"},
+                {"entityLink", QJsonObject{{"id", task}, {"type", "TASKS_TASK"}}}});
+        }
+        fixture.taskRecentBadgeFixture = QJsonDocument(QJsonObject{{"userId", 11}, {"recentItems", rows}}).toJson();
+        backend.requestTaskChats();
+    };
+    fixture.holdNextReadResponse = u"tasks.task.list"_s;
+    fixture.taskChatTitle = u"Старая версия"_s;
+    requestTitles({42, 43});
+    QTRY_VERIFY(fixture.holdNextReadResponse.isEmpty());
+    fixture.taskChatTitle = u"Новая версия"_s;
+    requestTitles({42});
+    QTRY_COMPARE(fixture.requestsFor(u"tasks.task.list"_s).size(), 2);
+    QTRY_COMPARE(loaded.last().first().value<QVector<Chat>>().value(0).title, fixture.taskChatTitle);
+
+    // Session renewal signals that the backend has processed the delayed HTTP reply.
+    QSignalSpy renewed(&backend, &CloudBackend::sessionUpdated);
+    fixture.releaseHeldReadResponse("Set-Cookie: BITRIX_TEST=rotated; Path=/; HttpOnly\r\n");
+    QTRY_COMPARE(renewed.size(), 1);
+    loaded.clear();
+    requestTitles({42});
+    QTRY_VERIFY(!loaded.isEmpty());
+    QCOMPARE(loaded.first().first().value<QVector<Chat>>().value(0).title, fixture.taskChatTitle);
+    QCOMPARE(fixture.requestsFor(u"tasks.task.list"_s).size(), 2);
+}
+
+void TestCloudBackend::overlappingTaskSearches()
+{
+    using namespace Qt::StringLiterals;
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy found(&backend, &Backend::projectTasksFound);
+    backend.start();
+    backend.searchProjectTasks(u"17"_s, u"#149"_s);
+    backend.searchProjectTasks(u"17"_s, u"#149"_s);
+    backend.searchProjectTasks(u"17"_s, u"#150"_s);
+
+    QTRY_COMPARE(found.size(), 3);
+    QSet<QString> queries;
+    for (const auto &entry : found) {
+        const auto query = entry.at(1).toString();
+        queries.insert(query);
+        const auto tasks = entry.at(2).value<QVector<Task>>();
+        if (query == u"#150") {
+            QVERIFY(tasks.isEmpty());
+        } else {
+            QCOMPARE(tasks.size(), 1);
+            QCOMPARE(tasks.first().id, u"149"_s);
+        }
+    }
+    QCOMPARE(queries, (QSet<QString>{u"#149"_s, u"#150"_s}));
+    const auto requests = fixture.requestsFor(u"tasks.task.list"_s);
+    QCOMPARE(requests.size(), 2);
+    QSet<QString> ids;
+    for (const auto &request : requests)
+        ids.insert(request.field(u"filter[ID]"_s));
+    QCOMPARE(ids, (QSet<QString>{u"149"_s, u"150"_s}));
+}
+
+void TestCloudBackend::dropsDuplicateSendBeforePosting()
+{
+    using namespace Qt::StringLiterals;
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    backend.start();
+    const auto action = u"im.v2.Chat.Message.send"_s;
+    const auto send = [&](const QString &text, int &completed) {
+        backend.ajax(action, {{u"dialogId"_s, u"chat91"_s}, {u"fields[message]"_s, text}},
+                    u"send:chat:chat91"_s, [&completed](QJsonValue) { ++completed; });
+    };
+    int first = 0, duplicates = 0;
+    send(u"Первое"_s, first);
+    send(u"Первое"_s, duplicates);
+    send(u"Второе"_s, duplicates);
+    QTRY_COMPARE(first, 1);
+    QCOMPARE(fixture.requestsFor(action).size(), 1);
+    QCOMPARE(duplicates, 0);
+}
+
+void TestCloudBackend::overlappingTaskSearchFailure()
+{
+    using namespace Qt::StringLiterals;
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    fixture.rejectTaskSearch = true;
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy failures(&backend, &Backend::failed);
+    backend.start();
+    QStringList errors;
+    int successes = 0;
+    const CloudBackend::Handler subscriber{
+        [&](QJsonValue) { ++successes; },
+        [&](const QString &reason) { errors.append(reason); }
+    };
+    const auto operation = u"search-project-tasks:17"_s;
+    backend.ajax(u"tasks.task.list"_s, {}, operation, subscriber);
+    backend.ajax(u"tasks.task.list"_s, {}, operation, subscriber);
+    QTRY_VERIFY(!failures.isEmpty());
+    QCOMPARE(failures.size(), 1);
+    QCOMPARE(failures.first().first().toString(), operation);
+    const auto reason = failures.first().at(1).toString();
+    QVERIFY(!reason.isEmpty());
+    QCOMPARE(errors, (QStringList{reason, reason}));
+    QCOMPARE(successes, 0);
+    QCOMPARE(fixture.requestsFor(u"tasks.task.list"_s).size(), 1);
+
+    fixture.rejectTaskSearch = false;
+    fixture.malformedTaskSearch = true;
+    failures.clear();
+    backend.searchProjectTasks(u"17"_s, u"#149"_s);
+    backend.searchProjectTasks(u"17"_s, u"#149"_s);
+    QTRY_VERIFY(!failures.isEmpty());
+    QCOMPARE(failures.size(), 1);
+    QCOMPARE(failures.first().first().toString(), operation);
+    QCOMPARE(fixture.requestsFor(u"tasks.task.list"_s).size(), 2);
 }
 
 void TestCloudBackend::findsProjectTasksOutsideInitialBoard()
@@ -5037,7 +5184,7 @@ void TestCloudBackend::retriesChatHistoryWithTheKnownChatId()
 void TestCloudBackend::recoversLatestHistoryAfterATemporaryFailure_data()
 {
     QTest::addColumn<QString>("mode");
-    for (const auto *mode : {"snapshot", "fallback", "task", "exhausted", "switch", "background", "account", "malformed"})
+    for (const auto *mode : {"snapshot", "fallback", "task", "exhausted", "switch", "reopen", "background", "account", "malformed"})
         QTest::newRow(mode) << QString::fromLatin1(mode);
 }
 
@@ -5084,6 +5231,17 @@ void TestCloudBackend::recoversLatestHistoryAfterATemporaryFailure()
     else
         backend.requestChatMessages(dialog);
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    if (mode == QLatin1String("reopen")) {
+        auto *original = backend.m_requests.key(operation);
+        QVERIFY(original);
+        connect(original, &QNetworkReply::finished, &backend, [&] {
+            backend.clearOpenHistory(false);
+            backend.requestChatMessages(dialog);
+            // Process the queued refresh while the old retry still occupies this key.
+            backend.m_refresh.stop();
+            backend.refreshDirtyViews();
+        });
+    }
     fixture.releaseHeldNotificationReply(mode != QLatin1String("malformed"));
     if (mode == QLatin1String("switch") || mode == QLatin1String("background") || changeAccount) {
         QTest::qWait(80);
@@ -5099,7 +5257,7 @@ void TestCloudBackend::recoversLatestHistoryAfterATemporaryFailure()
         QTRY_COMPARE(accounts.size(), 2);
     }
 
-    if (mode == QLatin1String("snapshot") || fallback) {
+    if (mode == QLatin1String("snapshot") || mode == QLatin1String("reopen") || fallback) {
         QTRY_COMPARE_WITH_TIMEOUT(history.size(), 1, 2000);
         QCOMPARE(history.first().first().toString(), task ? QStringLiteral("42") : dialog);
         QCOMPARE(fixture.requestsFor(snapshot).size(), 2);
@@ -5118,6 +5276,69 @@ void TestCloudBackend::recoversLatestHistoryAfterATemporaryFailure()
             return request.field(QStringLiteral("dialogId")) == dialog;
         }), 1);
     }
+}
+
+void TestCloudBackend::retriesCoalescedHistoryRead_data()
+{
+    QTest::addColumn<bool>("retryFails");
+    QTest::newRow("success") << false;
+    QTest::newRow("exhausted") << true;
+}
+
+void TestCloudBackend::retriesCoalescedHistoryRead()
+{
+    QFETCH(bool, retryFails);
+    using namespace Qt::StringLiterals;
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy online(&backend, &Backend::connectionChanged);
+    QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
+    QSignalSpy failed(&backend, &Backend::failed);
+    backend.start();
+    QTRY_VERIFY(!online.isEmpty());
+
+    const auto action = u"im.v2.Chat.load"_s;
+    const auto dialog = u"999"_s;
+    const auto key = u"chat:"_s + dialog;
+    if (retryFails)
+        fixture.chatResponseStatus = "503 Service Unavailable";
+    fixture.holdNotificationReply = action;
+    backend.requestChatMessages(dialog);
+    QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+
+    // Subscribe at the request layer. The public refresh API separately queues a newer snapshot.
+    QList<QJsonValue> results;
+    QStringList errors;
+    const auto subscribe = [&] {
+        backend.ajax(action, {{u"dialogId"_s, dialog}, {u"messageLimit"_s, u"25"_s}},
+                     u"chat-history-read:"_s + key, {
+                         [&](QJsonValue data) { results.append(data); },
+                         [&](const QString &error) { errors.append(error); }
+                     }, key);
+    };
+    subscribe();
+    auto *original = backend.m_requests.key(key);
+    QVERIFY(original);
+    // Qt runs this after the backend's finished handler has scheduled the retry.
+    connect(original, &QNetworkReply::finished, &backend, subscribe);
+    fixture.releaseHeldNotificationReply(true);
+    if (retryFails) {
+        QTRY_COMPARE(errors.size(), 2);
+        QCOMPARE(errors.first(), errors.last());
+        QCOMPARE(failed.size(), 1);
+        QCOMPARE(failed.first().first().toString(), key);
+        QCOMPARE(failed.first().last().toString(), errors.first());
+        QVERIFY(results.isEmpty());
+        QVERIFY(history.isEmpty());
+    } else {
+        QTRY_COMPARE(history.size(), 1);
+        QCOMPARE(results.size(), 2);
+        QCOMPARE(results.first(), results.last());
+        QVERIFY(!results.first().toObject().value(u"messages"_s).toArray().isEmpty());
+        QVERIFY(errors.isEmpty());
+    }
+    QCOMPARE(fixture.requestsFor(action).size(), 2);
 }
 
 void TestCloudBackend::coalescesManualHistoryRefreshWhileLatestReadIsInFlight()
@@ -5958,6 +6179,51 @@ void TestCloudBackend::linksTaskChatEventsAndMarksSyntheticRowsLocally()
     QCOMPARE(unconfirmed.id, QStringLiteral("message:903"));
     QCOMPARE(unconfirmed.targets.size(), 1);
     QCOMPARE(unconfirmed.targets.first().kind, NotificationTargetKind::Chat);
+}
+
+void TestCloudBackend::evictsLeastRecentlyUsedNotificationTitle()
+{
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy online(&backend, &Backend::connectionChanged);
+    QSignalSpy recent(&backend, &Backend::recentChatsLoaded);
+    QSignalSpy notices(&backend, &Backend::notificationsLoaded);
+    backend.start();
+    QTRY_COMPARE(online.size(), 1);
+
+    const auto load = [&](int first, int count) {
+        QJsonArray rows;
+        for (int id = first; id < first + count; ++id) {
+            rows.append(QJsonObject{{"dialogId", QStringLiteral("chat%1").arg(id)}, {"type", "chat"},
+                                    {"title", QStringLiteral("Chat %1").arg(id)}});
+        }
+        fixture.ordinaryRecentBadgeFixture = QJsonDocument(QJsonObject{{"userId", 11}, {"recentItems", rows}}).toJson();
+        recent.clear();
+        backend.requestRecentChats();
+        QTRY_VERIFY(!recent.isEmpty());
+        QCOMPARE(recent.last().first().value<QVector<Chat>>().size(), count);
+    };
+    int messageId = 900;
+    const auto checkTitle = [&](int id, const QString &title) {
+        const QString message = QString::number(++messageId);
+        notices.clear();
+        fixture.pushMessage(message, message, id);
+        QTRY_VERIFY(!notices.isEmpty());
+        const auto notice = notices.last().first().value<QVector<Notification>>().first();
+        QCOMPARE(notice.id, QStringLiteral("message:") + message);
+        QCOMPARE(notice.title, title);
+    };
+
+    constexpr int page = tunables::kPageSizeChats;
+    load(1, page);
+    load(1 + page, page);
+    checkTitle(1, QStringLiteral("Chat 1")); // Reading the oldest title protects it from eviction.
+    load(1 + 2 * page, 2);
+    checkTitle(1, QStringLiteral("Chat 1"));
+    checkTitle(2, QStringLiteral("Новое сообщение"));
+    checkTitle(3, QStringLiteral("Новое сообщение"));
+    checkTitle(4, QStringLiteral("Chat 4"));
 }
 
 void TestCloudBackend::classifiesOrdinaryChatPushesWithoutSuppressingPopups()

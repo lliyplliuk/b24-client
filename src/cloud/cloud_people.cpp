@@ -157,14 +157,12 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
     }
     if (trimmed.isEmpty()) {
         dialog.insert(u"recentItemsLimit"_s, peopleLimit);
-        ajaxJson(url, {{u"dialog"_s, dialog}}, operation, [this, deliver, operation](QJsonValue data) {
-            const auto loaded = data.toObject().value(u"dialog"_s);
-            if (!loaded.isObject()) {
-                emit failed(operation, u"Не удалось загрузить недавних сотрудников."_s);
-                return;
-            }
-            deliver(recentTaskPeople(loaded.toObject()), true, false);
-        });
+        ajaxJson(url, {{u"dialog"_s, dialog}}, operation,
+                Handler::checked(u"Не удалось загрузить недавних сотрудников."_s,
+                [](const QJsonValue &data) { return data.toObject().value(u"dialog"_s).isObject(); },
+                [deliver](QJsonValue data) {
+            deliver(recentTaskPeople(data.toObject().value(u"dialog"_s).toObject()), true, false);
+        }));
         return;
     }
 

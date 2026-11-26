@@ -418,7 +418,8 @@ void CloudBackend::queryWorkday(const QString &action, Fields fields, bool allow
         emit failed(operation, u"Не удалось выполнить запрос рабочего дня."_s);
         return;
     }
-    m_inflightOperations.insert(operation);
+    if (!m_inflightOperations.contains(operation))
+        m_inflightOperations.insert(operation, nullptr);
     m_workdayReply = reply;
     m_workday = {};
     const auto revision = m_worktimeRevision;
@@ -438,7 +439,8 @@ void CloudBackend::queryWorkday(const QString &action, Fields fields, bool allow
                     : u"Состояние рабочего дня недоступно. Обновите его вручную."_s);
                 return;
             }
-            m_inflightOperations.insert(operation);
+            if (!m_inflightOperations.contains(operation))
+                m_inflightOperations.insert(operation, nullptr);
             confirmSession(sessionRevision, [this, operation, revision, sessionRevision](bool accepted) {
                 if (!m_started || revision != m_worktimeRevision)
                     return;
