@@ -53,6 +53,9 @@ add_library(bxwidgets STATIC
     src/ui/notifications_panel.h
     src/ui/notifications_panel.cpp
     src/ui/main_window.cpp
+    src/ui/task_dialogs.cpp
+    src/ui/chat_widgets.cpp
+    src/ui/workspace_style.cpp
     src/ui/composer_send_controller.cpp
     src/ui/chat_action_ui.cpp
     src/ui/chat_video_previews.cpp
@@ -103,6 +106,7 @@ endforeach()
 if(Qt6Test_FOUND)
     enable_testing()
     add_subdirectory(tests)
+    target_link_libraries(tst_message_markup PRIVATE bxwidgets)
     add_executable(tst_signin_session src/signin/session_capture_test.cpp)
     target_link_libraries(tst_signin_session PRIVATE bxchromesignin Qt6::Test)
     add_test(NAME tst_signin_session COMMAND tst_signin_session)
