@@ -15,6 +15,7 @@ add_library(bxcore STATIC
     src/core/operations.h
     src/core/operations.cpp
     src/core/models.h
+    src/core/message_markup.cpp
     src/core/worktime.h
     src/core/backend.h
     src/core/session.h
@@ -51,7 +52,6 @@ add_library(bxwidgets STATIC
     src/ui/composer_send_controller.cpp
     src/ui/chat_action_ui.cpp
     src/ui/chat_video_previews.cpp
-    src/ui/message_markup.cpp
     src/ui/message_menu_window.cpp
     src/ui/public_link_preview.cpp
     src/ui/board_widget.h

@@ -1,4 +1,4 @@
-#include "ui/message_markup.h"
+#include "core/message_markup.h"
 #include "core/notification_targets.h"
 
 #include <QDateTime>
@@ -7,8 +7,9 @@
 #include <QRegularExpression>
 
 #include <algorithm>
+#include <utility>
 
-namespace bx::workspace {
+namespace bx::markup {
 namespace {
 
 using namespace Qt::StringLiterals;
@@ -265,7 +266,7 @@ public:
                 return token.tag == Tag::Quote || token.tag == Tag::Arrow || token.name == u"quote";
             }))
             return std::nullopt;
-        const auto author = markupPlainText(header.match.captured(2).left(512)).simplified();
+        const auto author = plainText(header.match.captured(2).left(512)).simplified();
         auto excerpt = range(header.first, close, header.begin, m_tokens[close].begin, 1).plain.simplified();
         constexpr qsizetype maxExcerpt = 240;
         if (excerpt.size() > maxExcerpt)
@@ -613,9 +614,97 @@ std::optional<AttributedMessageQuote> leadingAttributedMessageQuote(const QStrin
     return Parser(source).leadingAttributedQuote();
 }
 
-QString markupPlainText(const QString &source)
+QString visibleHtml(QString text)
 {
-    return parseMessageMarkup(source).plain;
+    static const QRegularExpression hidden(QString::fromLatin1(
+        R"hidden(<!--.*?(?:-->|$)|<(script|style)(?=\s|>)[^>]*>.*?(?:</\1\s*>|$))hidden"),
+        QRegularExpression::CaseInsensitiveOption | QRegularExpression::DotMatchesEverythingOption);
+    return text.remove(hidden);
+}
+
+QString decodeHtmlEntities(const QString &text)
+{
+    static const QRegularExpression entity(
+        QStringLiteral("&(amp|lt|gt|quot|apos|nbsp|#[0-9]{1,8}|#[Xx][0-9A-Fa-f]{1,8});"));
+    QString result;
+    qsizetype offset = 0;
+    auto matches = entity.globalMatch(text);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        const auto name = match.capturedView(1);
+        result += text.sliced(offset, match.capturedStart() - offset);
+        if (name == QLatin1String("amp"))
+            result += QLatin1Char('&');
+        else if (name == QLatin1String("lt"))
+            result += QLatin1Char('<');
+        else if (name == QLatin1String("gt"))
+            result += QLatin1Char('>');
+        else if (name == QLatin1String("quot"))
+            result += QLatin1Char('"');
+        else if (name == QLatin1String("apos"))
+            result += QLatin1Char('\'');
+        else if (name == QLatin1String("nbsp"))
+            result += QLatin1Char(' ');
+        else {
+            const bool hex = name.size() > 1 && name.at(1).toLower() == QLatin1Char('x');
+            const char32_t cp = name.sliced(hex ? 2 : 1).toUInt(nullptr, hex ? 16 : 10);
+            if (cp > 0 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff))
+                result += QString::fromUcs4(&cp, 1);
+        }
+        offset = match.capturedEnd();
+    }
+    return result + text.sliced(offset);
+}
+
+std::optional<HtmlTag> nextHtmlTag(const QString &markup, qsizetype &cursor)
+{
+    static const QRegularExpression begin(QString::fromLatin1(
+        R"tag(<(/?)([A-Za-z][A-Za-z0-9:_-]*)(?=[\s/>]))tag"));
+    const auto match = begin.match(markup, cursor);
+    if (!match.hasMatch())
+        return std::nullopt;
+
+    QChar quote;
+    for (cursor = match.capturedEnd(); cursor < markup.size(); ++cursor) {
+        const auto ch = markup.at(cursor);
+        if (!quote.isNull()) {
+            if (ch == quote)
+                quote = {};
+        } else if (ch == QLatin1Char('"') || ch == QLatin1Char('\'')) {
+            quote = ch;
+        } else if (ch == QLatin1Char('>')) {
+            return HtmlTag{match.capturedView(2), match.capturedStart(), match.capturedEnd(),
+                           ++cursor, !match.capturedView(1).isEmpty(), true};
+        }
+    }
+    // An unterminated tag consumes the rest of the source. Its quoted attributes are not text.
+    return HtmlTag{match.capturedView(2), match.capturedStart(), match.capturedEnd(),
+                   cursor, !match.capturedView(1).isEmpty(), false};
+}
+
+QString plainText(const QString &source, TextFormat format)
+{
+    if (format == TextFormat::Message)
+        return parseMessageMarkup(source).plain;
+
+    // Raw portal notifications can mix HTML and BBCode. Remove wire-format tags
+    // before decoding entities so escaped brackets remain literal at this stage.
+    QString text = source;
+    static const QRegularExpression bbTags(QStringLiteral("\\[/?[a-zA-Z]+(?:=[^\\]]*)?\\]"));
+    static const QRegularExpression invisible(QStringLiteral("[<>\\p{Cc}\\p{Cf}]"));
+    if (text.contains(QLatin1Char('<'))) {
+        QString stripped;
+        qsizetype cursor = 0;
+        qsizetype previousEnd = 0;
+        while (const auto tag = nextHtmlTag(text, cursor)) {
+            stripped += QStringView(text).sliced(previousEnd, tag->start - previousEnd);
+            previousEnd = tag->end;
+        }
+        stripped += QStringView(text).sliced(previousEnd);
+        text = std::move(stripped);
+    }
+    text.remove(bbTags);
+    return decodeHtmlEntities(text).remove(invisible).simplified();
 }
 
 QUrl messageWebLink(const QString &address)
@@ -649,4 +738,4 @@ QString messageLinkTarget(const QString &address)
     return url.toString(QUrl::FullyEncoded);
 }
 
-} // namespace bx::workspace
+} // namespace bx::markup

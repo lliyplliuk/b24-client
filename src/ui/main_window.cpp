@@ -10,8 +10,10 @@
 #include "ui/project_tools.h"
 #include "ui/reaction_catalog.h"
 #include "ui/saved_file_offer.h"
+#include "ui/typography.h"
 #include "ui/workspace_style.h"
 #include "ui/worktime_panel.h"
+#include "cloud/cloud_notification_links.h"
 #include "core/download_target.h"
 #include "core/notification_targets.h"
 #include "core/origin_guard.h"
@@ -212,14 +214,13 @@ QImage readMessagePhoto(const QString &path)
     return reader.read();
 }
 
-QString tooltip(const QString &text)
-{
-    return QStringLiteral("<qt>%1</qt>").arg(text.toHtmlEscaped());
-}
-
 QVector<Notification> listedNotifications(QVector<Notification> notifications)
 {
     notifications.removeIf([](const Notification &notice) { return notice.ordinaryChatMessage; });
+    for (auto &notice : notifications) {
+        if (notice.displayTitle.isNull() && notice.excerpt.isNull())
+            prepareNotificationDisplay(notice);
+    }
     return notifications;
 }
 
@@ -452,7 +453,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     nav->addWidget(m_sections, 1);
     m_mode = label(m_backend->isDemo() ? QStringLiteral("Демо") : QStringLiteral("Связь…"), "mode", rail);
     m_mode->setAlignment(Qt::AlignCenter);
-    m_mode->setToolTip(tooltip(m_backend->displayName()));
+    m_mode->setToolTip(ui::plainTooltip(m_backend->displayName()));
     nav->addWidget(m_mode);
     rail->setStyleSheet(QStringLiteral(R"(
         QPushButton[railAction="true"] {
@@ -538,7 +539,16 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     connect(m_backend, &Backend::accountScopeChanged, this, [this] {
         const auto scope = m_backend->settingsScope();
         if (scope != m_reactionAccountScope) {
+            m_pendingMessageProject = {};
+            m_noticeProjectId.clear();
             if (!m_reactionAccountScope.isEmpty()) {
+                m_projectDirectory.clear();
+                m_projectDirectoryLoaded = false;
+                m_projectsMoreAvailable = false;
+                m_projectsPagePending = false;
+                m_projectsPageFailed = false;
+                m_pendingProjectId.clear();
+                updateProjectsRailPagination();
                 m_chatImagePreviews.clear();
                 m_pendingPastedChatImage = {};
                 resetNotificationAccount();
@@ -861,7 +871,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
         m_messageDownloadUrl.clear();
         m_messageDownloadPath.clear();
         auto parent = std::exchange(m_messageDownloadParent, {});
-        const auto notice = QStringLiteral("<qt>Файл сохранён: %1</qt>").arg(QFileInfo(path).fileName().toHtmlEscaped());
+        const auto notice = ui::plainTooltip(QStringLiteral("Файл сохранён: %1").arg(QFileInfo(path).fileName()));
         if (m_card && parent == m_card)
             m_card->setStatus(notice);
         setStatus(notice);
@@ -917,6 +927,9 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
             }
         }
         updateProjectsRailPagination();
+        const auto link = std::exchange(m_pendingMessageProject, {});
+        if (!link.url.isEmpty())
+            openPortalTarget(link.target, nullptr, link.url);
     });
     connect(m_backend, &Backend::projectsMoreAvailable, this, [this](bool available) {
         m_projectsMoreAvailable = available;
@@ -1529,7 +1542,10 @@ QWidget *MainWindow::buildProjectsPanel()
     root->addWidget(splitter);
     auto *side = directory(QStringLiteral("Проекты"), &m_projects, splitter, &m_projectDirectoryTitle);
     side->setMinimumWidth(132);
-    connect(m_projects, &QListWidget::currentItemChanged, this, &MainWindow::onProjectSelected);
+    connect(m_projects, &QListWidget::currentItemChanged, this, [this] {
+        m_pendingMessageProject = {};
+        onProjectSelected();
+    });
     m_projects->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_projects, &QWidget::customContextMenuRequested, this,
             [this](const QPoint &point) { showPinMenu(m_projects, point, true); });
@@ -2094,6 +2110,7 @@ void MainWindow::changeEvent(QEvent *event)
 
 void MainWindow::onSectionChanged(int index)
 {
+    m_pendingMessageProject = {};
     if (index == 2) {
         m_failedNoticeRead.clear();
         m_noticeOlderFailed = false;
@@ -2103,6 +2120,7 @@ void MainWindow::onSectionChanged(int index)
         m_noticeExpandedId.clear();
     }
     if (m_lastSection == 1 && index != 1) {
+        m_noticeProjectId.clear();
         m_projectSearchTimer->stop();
         ui::setStatusLabel(m_projectTaskSearchStatus, {});
         closeProjectTaskChats();
@@ -2282,7 +2300,7 @@ void MainWindow::updateChatContactPresentation()
         details.append(m_chatContactPosition.simplified());
     const auto text = details.join(QStringLiteral(" · "));
     ui::setStatusLabel(m_chatContactInfo, text);
-    m_chatContactInfo->setToolTip(tooltip(text));
+    m_chatContactInfo->setToolTip(ui::plainTooltip(text));
     m_chatAvatar->setOnline(online);
     m_chats->viewport()->update();
     m_chatContactTimer->stop();
@@ -2303,7 +2321,7 @@ void MainWindow::openChatRow(const QListWidgetItem &item)
         return;
     const auto name = item.data(workspace::Title).toString();
     m_chatTitle->setText(name);
-    m_chatTitle->setToolTip(tooltip(name));
+    m_chatTitle->setToolTip(ui::plainTooltip(name));
     const auto avatar = workspace::AvatarKind(item.data(workspace::AvatarType).toInt());
     m_chatAvatar->setTitle(name, avatar);
     m_chatContactIsPerson = m_chatScope == 0 && avatar == workspace::AvatarKind::Person;
@@ -2324,6 +2342,7 @@ void MainWindow::openChatRow(const QListWidgetItem &item)
             scheduleLinkPreviewLayout();
         return;
     }
+    m_pendingMessageProject = {};
     resetLinkPreviews();
     m_chatComposer->dismissEmoji();
     switchDraft(m_chatComposer, m_chatDrafts, m_currentChatId, chatId);
@@ -2370,7 +2389,7 @@ void MainWindow::onProjectSelected()
     }
     const auto name = item->data(workspace::Title).toString();
     m_projectTitle->setText(name);
-    m_projectTitle->setToolTip(tooltip(name));
+    m_projectTitle->setToolTip(ui::plainTooltip(name));
     m_projectAvatar->setTitle(name, workspace::AvatarKind::Project,
                              item->data(workspace::ProjectAvatarColor).value<QColor>(),
                              item->data(workspace::ProjectAvatarVariant).toString(),
@@ -2882,7 +2901,11 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
             showEmpty(m_chatMessages, m_chatEmpty, QStringLiteral("Выберите чат"));
         break;
     case OperationKind::Projects:
-    case OperationKind::ProjectPageFallback:
+    case OperationKind::ProjectPageFallback: {
+        const auto link = std::exchange(m_pendingMessageProject, {});
+        if (!link.url.isEmpty())
+            QDesktopServices::openUrl(link.url);
+        m_noticeProjectId.clear();
         m_cardRequestedProjectDirectory = false;
         if (m_projectsPagePending) {
             m_projectsPagePending = false;
@@ -2894,6 +2917,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
             workspace::emptyRow(m_projects, QStringLiteral("Не удалось загрузить проекты"));
         }
         break;
+    }
     default:
         break;
     }
@@ -3171,32 +3195,13 @@ void MainWindow::openMessageLink(const QString &href, QWidget *source)
     const auto url = messageLinkDestination(href);
     if (url.isEmpty())
         return;
-    const auto origin = m_backend->portalOrigin();
-    if (origin.isValid() && url.scheme() == QStringLiteral("https") && url.scheme() == origin.scheme()
-        && url.host().compare(origin.host(), Qt::CaseInsensitive) == 0
-        && url.port(443) == origin.port(443)) {
-        const auto reference = ui::taskReference(url);
-        if (!reference.taskId.isEmpty()) {
-            openTaskCardForProject(reference.taskId, reference.projectId);
-            return;
-        }
-        const auto person = portalPersonPath(url.path(QUrl::FullyDecoded));
-        if (!person.isEmpty()) {
-            openPerson(person, source);
-            return;
-        }
-        const auto chat = portalLinkTarget(origin, url);
-        if (chat && chat->kind == NotificationTargetKind::Chat) {
-            if (m_card && m_card->taskChatDialogId() == chat->id) {
-                m_card->activateWindow();
-                if (!chat->messageId.isEmpty())
-                    openPinnedTaskMessage(chat->messageId);
-            } else if (clearTask()) {
-                openNotificationChat(*chat);
-            }
+    if (url.scheme() == QStringLiteral("https")) {
+        if (const auto target = portalLinkTarget(m_backend->portalOrigin(), url)) {
+            openPortalTarget(*target, source, url);
             return;
         }
     }
+    m_pendingMessageProject = {};
     QDesktopServices::openUrl(url);
 }
 
@@ -3416,6 +3421,7 @@ void MainWindow::openTaskCardForProject(const QString &taskId, const QString &pr
     connect(card, &QDialog::finished, this, [this, card] {
         if (m_card != card)
             return;
+        m_pendingMessageProject = {};
         switchDraft(card->composer(), m_taskDrafts, card->taskId(), {});
         m_card = nullptr;
         resetLinkPreviews();
@@ -3718,6 +3724,7 @@ void ClientUpdateFeed::publish(const QString &tag, const QUrl &downloadUrl)
     m_notice.title = QStringLiteral("Доступно обновление Битрикс24 %1 для Windows").arg(tag);
     m_notice.text = QStringLiteral("Скачать ZIP");
     m_notice.markup = QStringLiteral("[URL=%1]%2[/URL]").arg(downloadUrl.toString(), m_notice.text);
+    prepareNotificationDisplay(m_notice);
     m_notice.createdAt = QDateTime::currentDateTimeUtc();
     emit changed();
 }
@@ -4488,6 +4495,7 @@ void MainWindow::showProjects()
         const QSignalBlocker blocker(m_projects);
         m_projects->clear();
         QListWidgetItem *selected = nullptr;
+        QListWidgetItem *linked = nullptr;
         for (const auto &project : ordered) {
             auto *item = workspace::addRow(m_projects, project.name, project.group, {}, project.id);
             item->setData(workspace::AvatarType, int(workspace::AvatarKind::Project));
@@ -4499,10 +4507,12 @@ void MainWindow::showProjects()
             ui::setProjectRowUnreadCount(item, m_projectUnreadCounts.value(project.id), !m_projectUnreadCountsComplete);
             if (project.id == m_currentProjectId)
                 selected = item;
-            if (project.id == m_noticeProjectId) {
-                selected = item;
-                m_noticeProjectId.clear();
-            }
+            if (project.id == m_noticeProjectId)
+                linked = item;
+        }
+        if (linked) {
+            selected = linked;
+            m_noticeProjectId.clear();
         }
         for (int i = 0; i < m_projects->count() && !m_pendingProjectId.isEmpty(); ++i) {
             auto *item = m_projects->item(i);
@@ -4684,7 +4694,7 @@ bool MainWindow::isCurrentTaskLink(const QListWidget *history, const QUrl &url) 
     else if (history == m_chatMessages)
         taskId = m_openChatTaskId;
     const auto currentTaskId = portalTaskIdentifier(taskId);
-    return !currentTaskId.isEmpty() && ui::taskReference(url).taskId == currentTaskId;
+    return !currentTaskId.isEmpty() && portalTaskUrl(url).taskId == currentTaskId;
 }
 
 void MainWindow::refreshChatMediaRows()
@@ -5114,17 +5124,10 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
     QListWidgetItem *selected = nullptr;
     QDate previousDay;
     const auto yesterday = QDate::currentDate().addDays(-1);
-    static const QRegularExpression quotedReply(QStringLiteral(R"(-{8,}[^\n]*\[.+?\]\s*#chat\d+/\d+.*?-{8,}\s*(?=\S))"),
-        QRegularExpression::DotMatchesEverythingOption);
-    static const QRegularExpression taskPrefix(QStringLiteral(R"(^Задача #\d+\s+)"));
     for (const auto &notice : notices) {
         const auto &content = notice.markup.isEmpty() ? notice.text : notice.markup;
-        auto title = workspace::markupPlainText(notice.title);
-        if (!content.trimmed().isEmpty() &&
-            (title == QStringLiteral("Уведомление Битрикс24") || title == notice.text.trimmed()))
-            title.clear();
-        auto *item = workspace::addMarkupRow(m_notifications, title, content,
-                                            clockLabel(notice.createdAt), notice.id);
+        auto *item = workspace::addMarkupRow(m_notifications, notice.displayTitle, content,
+                                             clockLabel(notice.createdAt), notice.id);
         item->setData(workspace::Count, !notice.read);
         item->setData(workspace::NoticeTargets, QVariant::fromValue(notice.targets));
         workspace::NoticeRow row;
@@ -5132,20 +5135,10 @@ void MainWindow::showNotifications(bool markVisible, bool preserveScroll)
         if (day.isValid() && day != previousDay)
             row.day = day == yesterday ? QStringLiteral("Вчера") : ui::messageDayLabel(day);
         previousDay = day;
-        row.excerpt = item->data(workspace::Detail).toString();
-        const auto quote = quotedReply.match(row.excerpt);
-        if (quote.hasMatch())
-            row.excerpt.remove(quote.capturedStart(), quote.capturedLength());
+        row.excerpt = notice.excerpt;
         const auto message = std::find_if(notice.targets.cbegin(), notice.targets.cend(), [](const auto &target) {
             return target.kind == NotificationTargetKind::Chat && !target.messageId.isEmpty();
         });
-        const bool taskChatMessage = message != notice.targets.cend() && message->taskChat;
-        if (taskChatMessage || (!title.isEmpty() && title != QStringLiteral("Новое сообщение")))
-            row.excerpt.remove(taskPrefix);
-        row.excerpt = row.excerpt.simplified();
-        if (taskChatMessage)
-            row.excerpt.prepend(QStringLiteral("Сообщение в чате задачи: "));
-        row.excerpt.truncate(512);
         const auto task = std::find_if(notice.targets.cbegin(), notice.targets.cend(), [](const auto &target) {
             return target.kind == NotificationTargetKind::Task;
         });
@@ -5327,8 +5320,8 @@ void MainWindow::showNoticeMenu(QListWidgetItem *item, const QPoint &position)
     const auto notice = item->data(workspace::NoticePresentation).value<workspace::NoticeRow>();
     const auto addTarget = [this, menu, id](const QString &label, const NotificationTarget &target) {
         connect(menu->addAction(label), &QAction::triggered, menu, [this, id, target] {
-            if (noticeItem(id))
-                openNotificationTarget(target);
+            if (m_lastSection == 2 && noticeItem(id))
+                openPortalTarget(target);
         });
     };
     if (notice.primaryTarget >= 0 && notice.primaryTarget < targets.size())
@@ -5384,29 +5377,55 @@ void MainWindow::openNotificationTarget(const QListWidgetItem *item, int action)
         return;
     const auto targets = item->data(workspace::NoticeTargets).value<QVector<NotificationTarget>>();
     if (action >= 0 && action < targets.size())
-        openNotificationTarget(targets[action]);
+        openPortalTarget(targets[action]);
 }
 
-void MainWindow::openNotificationTarget(NotificationTarget target)
+void MainWindow::openPortalTarget(NotificationTarget target, QWidget *source, const QUrl &messageUrl)
 {
-    if (m_lastSection != 2 || target.id.isEmpty())
+    if (target.id.isEmpty())
         return;
+    m_pendingMessageProject = {};
     switch (target.kind) {
     case NotificationTargetKind::Chat:
-        openNotificationChat(target);
+        if (m_card && m_card->taskChatDialogId() == target.id) {
+            m_card->activateWindow();
+            if (!target.messageId.isEmpty())
+                openPinnedTaskMessage(target.messageId);
+        } else if (clearTask()) {
+            openNotificationChat(target);
+        }
         break;
     case NotificationTargetKind::Task:
         openTaskCardForProject(target.id, target.projectId);
         break;
     case NotificationTargetKind::Person:
-        openPerson(target.id);
+        openPerson(target.id, source);
         break;
     case NotificationTargetKind::Project: {
+        if (!messageUrl.isEmpty() && std::none_of(m_projectDirectory.cbegin(), m_projectDirectory.cend(),
+                [&target](const Project &project) { return project.id == target.id; })) {
+            if (m_projectDirectoryLoaded && (!m_projectsMoreAvailable || m_projectsPageFailed)) {
+                QDesktopServices::openUrl(messageUrl);
+            } else {
+                m_pendingMessageProject = {target, messageUrl};
+                if (!m_projectDirectoryLoaded)
+                    m_backend->requestProjects();
+                else
+                    requestNextProjectsPage();
+            }
+            return;
+        }
+        if (!clearTask())
+            return;
         const QSignalBlocker blocker(m_projectNameSearch);
         m_projectNameSearch->clear();
         m_projectNameQuery.clear();
+        m_pendingProjectId.clear();
         m_noticeProjectId = target.id;
-        m_sections->setCurrentRow(1);
+        if (m_lastSection == 1)
+            refreshCurrentSection(false);
+        else
+            m_sections->setCurrentRow(1);
         break;
     }
     }

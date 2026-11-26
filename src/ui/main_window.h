@@ -71,8 +71,7 @@ public:
     // Открытие карточки задачи (окно-модальный диалог).
     void openTaskCard(const QString &taskId);
     QString taskLinkFor(const QString &taskId) const;
-    // Opens a clicked message link: own-portal task links open the native task card,
-    // other safe http(s) links keep the browser behaviour.
+    // Opens supported portal links in the workspace and other web links in the browser.
     void openMessageLink(const QString &href, QWidget *source = nullptr);
     void setClientUpdateFeed(ClientUpdateFeed *feed);
     void setLogoutAvailable(bool available);
@@ -207,7 +206,7 @@ private:
     void loadMessageLinkPreview(const QString &href);
     void updateAvatarRows();
     void openNotificationTarget(const QListWidgetItem *item, int target);
-    void openNotificationTarget(NotificationTarget target);
+    void openPortalTarget(NotificationTarget target, QWidget *source = nullptr, const QUrl &messageUrl = {});
     QListWidgetItem *noticeItem(const QString &id) const;
     void toggleNoticeDetails(QListWidgetItem *item);
     void showNoticeMenu(QListWidgetItem *item, const QPoint &position);
@@ -456,6 +455,10 @@ private:
     bool m_noticePageCheckQueued = false;
     bool m_noticeSearchPending = false;
     QString m_noticeProjectId;
+    struct {
+        NotificationTarget target;
+        QUrl url;
+    } m_pendingMessageProject;
     QPointer<QDialog> m_personDialog;
     QLabel *m_personName = nullptr;
     QLabel *m_personPosition = nullptr;

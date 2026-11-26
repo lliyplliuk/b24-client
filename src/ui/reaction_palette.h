@@ -2,6 +2,7 @@
 
 #include "ui/reaction_catalog.h"
 #include "ui/workspace_style.h"
+#include "ui/typography.h"
 
 #include <QKeyEvent>
 #include <QListWidget>
@@ -79,7 +80,7 @@ public:
                                          : QStringLiteral("Поставить реакцию «%1»").arg(caption);
             item->setData(Qt::UserRole, code);
             item->setData(Qt::AccessibleTextRole, action);
-            item->setToolTip(QStringLiteral("<qt>%1</qt>").arg(action.toHtmlEscaped()));
+            item->setToolTip(plainTooltip(action));
             item->setTextAlignment(Qt::AlignCenter);
             if (selected)
                 item->setBackground(QColor("#e0e1fa"));

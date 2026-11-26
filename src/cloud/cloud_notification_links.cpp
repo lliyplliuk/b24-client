@@ -1,7 +1,9 @@
 #include "cloud/cloud_backend.h"
+#include "cloud/cloud_notification_links.h"
 
 #include "core/notification_targets.h"
 #include "core/origin_guard.h"
+#include "core/message_markup.h"
 
 #include <QDir>
 #include <QJsonArray>
@@ -43,102 +45,6 @@ QString jsonString(const QJsonObject &object, const QString &key, const QString 
 {
     const auto value = object.value(key).toString();
     return value.isEmpty() && !alias.isEmpty() ? object.value(alias).toString() : value;
-}
-
-QString decodeEntities(const QString &text)
-{
-    static const QRegularExpression entity(
-        QStringLiteral("&(amp|lt|gt|quot|apos|nbsp|#[0-9]{1,8}|#[Xx][0-9A-Fa-f]{1,8});"));
-    QString result;
-    qsizetype offset = 0;
-    auto matches = entity.globalMatch(text);
-    while (matches.hasNext()) {
-        const auto match = matches.next();
-        const auto name = match.capturedView(1);
-        result += text.sliced(offset, match.capturedStart() - offset);
-        if (name == QLatin1String("amp"))
-            result += QLatin1Char('&');
-        else if (name == QLatin1String("lt"))
-            result += QLatin1Char('<');
-        else if (name == QLatin1String("gt"))
-            result += QLatin1Char('>');
-        else if (name == QLatin1String("quot"))
-            result += QLatin1Char('"');
-        else if (name == QLatin1String("apos"))
-            result += QLatin1Char('\'');
-        else if (name == QLatin1String("nbsp"))
-            result += QLatin1Char(' ');
-        else {
-            const bool hex = name.size() > 1 && name.at(1).toLower() == QLatin1Char('x');
-            const char32_t cp = name.sliced(hex ? 2 : 1).toUInt(nullptr, hex ? 16 : 10);
-            if (cp > 0 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff))
-                result += QString::fromUcs4(&cp, 1);
-        }
-        offset = match.capturedEnd();
-    }
-    return result + text.sliced(offset);
-}
-
-QString visibleMarkup(QString text)
-{
-    static const QRegularExpression hidden(QString::fromLatin1(
-        R"hidden(<!--.*?(?:-->|$)|<(script|style)(?=\s|>)[^>]*>.*?(?:</\1\s*>|$))hidden"),
-        QRegularExpression::CaseInsensitiveOption | QRegularExpression::DotMatchesEverythingOption);
-    return text.remove(hidden);
-}
-
-struct HtmlTag {
-    QStringView name;
-    qsizetype start;
-    qsizetype attributesStart;
-    qsizetype end;
-    bool closing;
-    bool complete;
-};
-
-std::optional<HtmlTag> nextHtmlTag(const QString &markup, qsizetype &cursor)
-{
-    static const QRegularExpression begin(QString::fromLatin1(
-        R"tag(<(/?)([A-Za-z][A-Za-z0-9:_-]*)(?=[\s/>]))tag"));
-    const auto match = begin.match(markup, cursor);
-    if (!match.hasMatch())
-        return std::nullopt;
-
-    QChar quote;
-    for (cursor = match.capturedEnd(); cursor < markup.size(); ++cursor) {
-        const auto ch = markup.at(cursor);
-        if (!quote.isNull()) {
-            if (ch == quote)
-                quote = {};
-        } else if (ch == QLatin1Char('"') || ch == QLatin1Char('\'')) {
-            quote = ch;
-        } else if (ch == QLatin1Char('>')) {
-            return HtmlTag{match.capturedView(2), match.capturedStart(), match.capturedEnd(),
-                           ++cursor, !match.capturedView(1).isEmpty(), true};
-        }
-    }
-    // An unterminated tag consumes the rest of the source. Its quoted attributes are not text.
-    return HtmlTag{match.capturedView(2), match.capturedStart(), match.capturedEnd(),
-                   cursor, !match.capturedView(1).isEmpty(), false};
-}
-
-QString plainText(QString text)
-{
-    static const QRegularExpression bbTags(QStringLiteral("\\[/?[a-zA-Z]+(?:=[^\\]]*)?\\]"));
-    static const QRegularExpression invisible(QStringLiteral("[<>\\p{Cc}\\p{Cf}]"));
-    if (text.contains(QLatin1Char('<'))) {
-        QString stripped;
-        qsizetype cursor = 0;
-        qsizetype previousEnd = 0;
-        while (const auto tag = nextHtmlTag(text, cursor)) {
-            stripped += QStringView(text).sliced(previousEnd, tag->start - previousEnd);
-            previousEnd = tag->end;
-        }
-        stripped += QStringView(text).sliced(previousEnd);
-        text = std::move(stripped);
-    }
-    text.remove(bbTags);
-    return decodeEntities(text).remove(invisible).simplified();
 }
 
 struct RawLink {
@@ -184,7 +90,7 @@ QVector<RawLink> anchors(const QString &markup)
     qsizetype anchorStart = -1;
     qsizetype anchorBodyStart = 0;
     QString href;
-    while (const auto tag = nextHtmlTag(markup, cursor)) {
+    while (const auto tag = markup::nextHtmlTag(markup, cursor)) {
         if (hasBbCode) {
             const auto length = tag->end - tag->start;
             bbMarkup.replace(tag->start, length, QString(length, QLatin1Char(' ')));
@@ -245,7 +151,7 @@ std::optional<NotificationTarget> onlineTarget(const QUrl &url)
 
 QUrl linkFromMarkup(QString address)
 {
-    address = decodeEntities(address.trimmed());
+    address = markup::decodeHtmlEntities(address.trimmed());
     if (address.size() >= 2 && ((address.front() == QLatin1Char('"') && address.back() == QLatin1Char('"'))
         || (address.front() == QLatin1Char('\'') && address.back() == QLatin1Char('\'')))) {
         address = address.mid(1, address.size() - 2).trimmed();
@@ -291,14 +197,14 @@ QString noticeLineMarkup(const QUrl &portal, const QString &source, const QStrin
 {
     if (source.isEmpty())
         return {};
-    const auto visible = visibleMarkup(source.left(maxMarkup));
+    const auto visible = markup::visibleHtml(source.left(maxMarkup));
     QStringList parts;
     const auto append = [&parts](QString part) {
         if (!part.isEmpty())
             parts.append(std::move(part));
     };
     const auto appendText = [&append, &authorLink](const QString &text) {
-        auto plain = literalNoticeText(plainText(text));
+        auto plain = literalNoticeText(markup::plainText(text, markup::TextFormat::PortalNotification));
         if (plain.contains(authorPlaceholder))
             plain = plain.replace(authorPlaceholder, authorLink).trimmed();
         append(std::move(plain));
@@ -308,7 +214,7 @@ QString noticeLineMarkup(const QUrl &portal, const QString &source, const QStrin
         if (link.offset < cursor)
             continue;
         appendText(visible.mid(cursor, link.offset - cursor));
-        auto label = plainText(link.label);
+        auto label = markup::plainText(link.label, markup::TextFormat::PortalNotification);
         if (label.contains(authorPlaceholder))
             appendText(label);
         else if (link.url.contains(authorPlaceholder))
@@ -330,7 +236,7 @@ std::optional<NotificationTarget> portalLinkTarget(const QUrl &portal, const QUr
 
     const OriginGuard guard(portal);
     const auto url = guard.resolve(QStringLiteral("/")).resolved(supplied);
-    if (!guard.isSameOrigin(url) || !url.userInfo().isEmpty()
+    if (!guard.isSameOrigin(url) || url.port() == 0 || portal.port() == 0 || !url.userInfo().isEmpty()
         || (url.scheme() != QLatin1String("https") && url.scheme() != QLatin1String("http")))
         return std::nullopt;
 
@@ -362,13 +268,13 @@ QVector<NotificationTarget> notificationTargets(const QUrl &portal, const QStrin
     if (!portal.isValid() || (!notificationMarkup.contains(QLatin1Char('<')) && !notificationMarkup.contains(QLatin1Char('['))))
         return targets;
 
-    for (const auto &link : anchors(visibleMarkup(notificationMarkup.left(maxMarkup)))) {
+    for (const auto &link : anchors(markup::visibleHtml(notificationMarkup.left(maxMarkup)))) {
         auto target = portalLinkTarget(portal, linkFromMarkup(link.url));
         if (!target || std::any_of(targets.cbegin(), targets.cend(), [&](const auto &previous) {
             return sameObject(previous, *target);
         }))
             continue;
-        if (const auto label = plainText(link.label).left(96); !label.isEmpty())
+        if (const auto label = markup::plainText(link.label, markup::TextFormat::PortalNotification).left(96); !label.isEmpty())
             target->label = label;
         targets.append(std::move(*target));
         if (targets.size() == maxTargets)
@@ -388,7 +294,36 @@ std::optional<NotificationTarget> portalLinkPreviewTarget(const QUrl &portal, co
 
 QString notificationDisplayText(const QString &notificationMarkup)
 {
-    return plainText(visibleMarkup(notificationMarkup.left(maxMarkup))).left(2000);
+    const auto visible = markup::visibleHtml(notificationMarkup.left(maxMarkup));
+    return markup::plainText(visible, markup::TextFormat::PortalNotification).left(2000);
+}
+
+void prepareNotificationDisplay(Notification &notice)
+{
+    const auto &content = notice.markup.isEmpty() ? notice.text : notice.markup;
+    auto plainTitle = markup::plainText(notice.title);
+    auto plainBody = markup::plainText(content);
+    if (!content.trimmed().isEmpty()
+        && (plainTitle == QStringLiteral("Уведомление Битрикс24") || plainTitle == notice.text.trimmed()))
+        plainTitle.clear();
+    notice.displayTitle = std::move(plainTitle);
+
+    static const QRegularExpression quotedReply(QStringLiteral(R"(-{8,}[^\n]*\[.+?\]\s*#chat\d+/\d+.*?-{8,}\s*(?=\S))"),
+                                               QRegularExpression::DotMatchesEverythingOption);
+    const auto quote = quotedReply.match(plainBody);
+    if (quote.hasMatch())
+        plainBody.remove(quote.capturedStart(), quote.capturedLength());
+    const auto message = std::find_if(notice.targets.cbegin(), notice.targets.cend(), [](const auto &target) {
+        return target.kind == NotificationTargetKind::Chat && !target.messageId.isEmpty();
+    });
+    const bool taskChat = message != notice.targets.cend() && message->taskChat;
+    static const QRegularExpression taskPrefix(QStringLiteral(R"(^Задача #\d+\s+)"));
+    if (taskChat || (!notice.displayTitle.isEmpty() && notice.displayTitle != QStringLiteral("Новое сообщение")))
+        plainBody.remove(taskPrefix);
+    notice.excerpt = plainBody.simplified();
+    if (taskChat)
+        notice.excerpt.prepend(QStringLiteral("Сообщение в чате задачи: "));
+    notice.excerpt.truncate(512);
 }
 
 void decodeNotificationContent(Notification &notification, const QUrl &portal, const QString &text,
@@ -461,19 +396,20 @@ void decodeNotificationContent(Notification &notification, const QUrl &portal, c
         }))
             notification.targets.append(target);
     }
-    if (notification.type != QLatin1String("tasks") ||
-        (!notification.title.isEmpty() && notification.title != QStringLiteral("Уведомление Битрикс24")))
-        return;
-    static const QRegularExpression createdTask(QStringLiteral("(?:\\A|\\s)создал(?:а|\\(а\\))?\\s+задачу\\s*:?\\s*\\z"),
-        QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
-    for (const auto &link : anchors(markup)) {
-        const auto target = portalLinkTarget(portal, linkFromMarkup(link.url));
-        if (!target || target->kind != NotificationTargetKind::Task)
-            continue;
-        if (createdTask.match(notificationDisplayText(markup.left(link.offset))).hasMatch())
-            notification.title = QStringLiteral("Новая задача");
-        break;
+    if (notification.type == QLatin1String("tasks") &&
+        (notification.title.isEmpty() || notification.title == QStringLiteral("Уведомление Битрикс24"))) {
+        static const QRegularExpression createdTask(QStringLiteral("(?:\\A|\\s)создал(?:а|\\(а\\))?\\s+задачу\\s*:?\\s*\\z"),
+            QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
+        for (const auto &link : anchors(markup)) {
+            const auto target = portalLinkTarget(portal, linkFromMarkup(link.url));
+            if (!target || target->kind != NotificationTargetKind::Task)
+                continue;
+            if (createdTask.match(notificationDisplayText(markup.left(link.offset))).hasMatch())
+                notification.title = QStringLiteral("Новая задача");
+            break;
+        }
     }
+    prepareNotificationDisplay(notification);
 }
 
 std::optional<NotificationTarget> incomingMessageTarget(const QJsonObject &params, bool groupEvent,
@@ -582,12 +518,13 @@ void CloudBackend::loadPerson(const QString &id, const QString &operation, Perso
             name = (jsonString(profile, QStringLiteral("first_name"), QStringLiteral("firstName")) + QLatin1Char(' ')
                     + jsonString(profile, QStringLiteral("last_name"), QStringLiteral("lastName"))).trimmed();
         }
-        name = plainText(name).left(96);
+        name = markup::plainText(name, markup::TextFormat::PortalNotification).left(96);
         if (requireName && name.isEmpty())
             return onPerson({});
         if (name.isEmpty())
             name = QStringLiteral("Пользователь №%1").arg(expected);
-        const auto position = plainText(jsonString(profile, QStringLiteral("work_position"), QStringLiteral("workPosition"))).left(160);
+        const auto rawPosition = jsonString(profile, QStringLiteral("work_position"), QStringLiteral("workPosition"));
+        const auto position = markup::plainText(rawPosition, markup::TextFormat::PortalNotification).left(160);
         const auto avatar = avatarUrlFromPortal(jsonString(profile, QStringLiteral("avatar"), QStringLiteral("avatarUrl")));
         onPerson({expected, name, position, avatar});
     });

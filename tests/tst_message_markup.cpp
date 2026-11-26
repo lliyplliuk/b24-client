@@ -927,26 +927,26 @@ void MessageMarkupTest::clicksRelativeTaskLink()
     QCOMPARE(clicked.size(), 1);
     QCOMPARE(clicked.constFirst(), href);
 
-    const auto reference = bx::ui::taskReference(QUrl(u"https://example.bitrix24.ru%1"_s.arg(href)));
+    const auto reference = bx::portalTaskUrl(QUrl(u"https://example.bitrix24.ru%1"_s.arg(href)));
     QCOMPARE(reference.projectId, u"7"_s);
     QCOMPARE(reference.taskId, u"501"_s);
-    const auto legacy = bx::ui::taskReference(QUrl(u"https://example.bitrix24.ru/tasks/?task_id=502"_s));
+    const auto legacy = bx::portalTaskUrl(QUrl(u"https://example.bitrix24.ru/tasks/?task_id=502"_s));
     QCOMPARE(legacy.taskId, u"502"_s);
     QVERIFY(legacy.projectId.isEmpty());
     for (const auto &path : {u"/tasks/task/view/501/"_s,
                             u"/company/personal/user/19/tasks/task/view/501/"_s,
                             u"/extranet/tasks/task/view/501/"_s,
                             u"/extranet/company/personal/user/19/tasks/task/view/501/"_s}) {
-        const auto personal = bx::ui::taskReference(QUrl(u"https://example.bitrix24.ru%1"_s.arg(path)));
+        const auto personal = bx::portalTaskUrl(QUrl(u"https://example.bitrix24.ru%1"_s.arg(path)));
         QCOMPARE(personal.taskId, u"501"_s);
         QVERIFY(personal.projectId.isEmpty());
     }
-    const auto extranet = bx::ui::taskReference(QUrl(u"https://example.bitrix24.ru/extranet%1"_s.arg(href)));
+    const auto extranet = bx::portalTaskUrl(QUrl(u"https://example.bitrix24.ru/extranet%1"_s.arg(href)));
     QCOMPARE(extranet.taskId, u"501"_s);
     QCOMPARE(extranet.projectId, u"7"_s);
-    QVERIFY(bx::ui::taskReference(QUrl(u"https://example.bitrix24.ru/x%1"_s.arg(href))).taskId.isEmpty());
-    QVERIFY(bx::ui::taskReference(QUrl(u"https://example.bitrix24.ru/tasks-extra/?task_id=502"_s)).taskId.isEmpty());
-    QVERIFY(bx::ui::taskReference(QUrl(u"https://example.bitrix24.ru/tasks/?task_id=0"_s)).taskId.isEmpty());
+    QVERIFY(bx::portalTaskUrl(QUrl(u"https://example.bitrix24.ru/x%1"_s.arg(href))).taskId.isEmpty());
+    QVERIFY(bx::portalTaskUrl(QUrl(u"https://example.bitrix24.ru/tasks-extra/?task_id=502"_s)).taskId.isEmpty());
+    QVERIFY(bx::portalTaskUrl(QUrl(u"https://example.bitrix24.ru/tasks/?task_id=0"_s)).taskId.isEmpty());
 }
 
 QTEST_MAIN(MessageMarkupTest)

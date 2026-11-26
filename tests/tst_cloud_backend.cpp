@@ -6158,6 +6158,7 @@ void TestCloudBackend::linksTaskChatEventsAndMarksSyntheticRowsLocally()
     QCOMPARE(notice.targets.first().id, QStringLiteral("chat86761"));
     QCOMPARE(notice.targets.first().messageId, QStringLiteral("901"));
     QVERIFY(notice.targets.first().taskChat);
+    QCOMPARE(notice.excerpt, QStringLiteral("Сообщение в чате задачи: Готово"));
     QCOMPARE(notice.targets.last().kind, NotificationTargetKind::Task);
     QCOMPARE(notice.targets.last().id, QStringLiteral("123511"));
     QVERIFY(notice.markup.contains(QStringLiteral("/tasks/task/view/123511/")));

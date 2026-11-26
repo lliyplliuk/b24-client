@@ -9731,6 +9731,111 @@ private slots:
         QVERIFY(card && card->isVisible());
     }
 
+    void projectMessageLinksOpenNativeProject()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        Project linked;
+        linked.id = QStringLiteral("5");
+        linked.name = QStringLiteral("Проект по ссылке");
+        backend->moreProjects = {linked};
+        LocalFileOpener browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "open");
+        QDesktopServices::setUrlHandler(QStringLiteral("http"), &browser, "open");
+        QDesktopServices::setUrlHandler(QStringLiteral("javascript"), &browser, "open");
+        const auto restore = qScopeGuard([] {
+            QDesktopServices::unsetUrlHandler(QStringLiteral("https"));
+            QDesktopServices::unsetUrlHandler(QStringLiteral("http"));
+            QDesktopServices::unsetUrlHandler(QStringLiteral("javascript"));
+        });
+        MainWindow window(backend.get());
+        window.show();
+        auto *projects = findAccessible<QListWidget>(&window, QStringLiteral("Проекты"));
+        QVERIFY(projects);
+        const auto external = QUrl(QStringLiteral("http://example.bitrix24.ru/workgroups/group/5/"));
+        window.openMessageLink(external.toString());
+        const auto zeroPort = QUrl(QStringLiteral("https://example.bitrix24.ru:0/workgroups/group/5/"));
+        window.openMessageLink(zeroPort.toString());
+        const QList<QUrl> externalLinks{external, zeroPort};
+        QCOMPARE(browser.opened, externalLinks);
+        window.openMessageLink(QStringLiteral("javascript:alert(1)"));
+        window.openMessageLink(QStringLiteral("/workgroups/group/5/"));
+        QCOMPARE(browser.opened, externalLinks);
+        QVERIFY(projects->isVisible() && projects->currentItem());
+        QCOMPARE(backend->projectMoreRequests, 1);
+        QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), linked.id);
+
+        window.openMessageLink(QStringLiteral("/workgroups/group/101/"));
+        QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), QStringLiteral("101"));
+        window.openMessageLink(QStringLiteral("/workgroups/group/5/"));
+        QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), linked.id);
+    }
+
+    void missingProjectMessageLinkFallsBackToOriginalUrl_data()
+    {
+        QTest::addColumn<bool>("pageError");
+        QTest::newRow("missing") << false;
+        QTest::newRow("page-error") << true;
+    }
+
+    void projectMessageLinkUsesCurrentAccountDirectory()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        backend->accountScope = QStringLiteral("fixture/project-links-first");
+        LocalFileOpener browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "open");
+        const auto restore = qScopeGuard([] { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); });
+        MainWindow window(backend.get());
+        window.show();
+        backend->requestProjects();
+
+        backend->accountScope = QStringLiteral("fixture/project-links-second");
+        Project project;
+        project.id = QStringLiteral("72");
+        project.name = QStringLiteral("Проект второго аккаунта");
+        backend->projects = {project};
+        emit backend->accountScopeChanged();
+        window.openMessageLink(QStringLiteral("/workgroups/group/72/"));
+        QVERIFY(browser.opened.isEmpty());
+        auto *projects = findAccessible<QListWidget>(&window, QStringLiteral("Проекты"));
+        QVERIFY(projects && projects->isVisible() && projects->currentItem());
+        QCOMPARE(projects->currentItem()->data(workspace::Id).toString(), project.id);
+    }
+
+    void missingProjectMessageLinkFallsBackToOriginalUrl()
+    {
+        QFETCH(bool, pageError);
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        Project later;
+        later.id = QStringLiteral("5");
+        later.name = QStringLiteral("Дальняя страница");
+        backend->moreProjects = {later};
+        backend->holdProjectMore = true;
+        LocalFileOpener browser;
+        QDesktopServices::setUrlHandler(QStringLiteral("https"), &browser, "open");
+        const auto restore = qScopeGuard([] { QDesktopServices::unsetUrlHandler(QStringLiteral("https")); });
+        MainWindow window(backend.get());
+        window.show();
+        const auto href = QStringLiteral("/extranet/workgroups/group/5/?view=details#activity");
+        const auto url = backend->portalOrigin().resolved(QUrl(href));
+        window.openMessageLink(href);
+        QVERIFY(browser.opened.isEmpty());
+        QCOMPARE(backend->projectMoreRequests, 1);
+        if (pageError) {
+            emit backend->failed(QStringLiteral("projects"), QStringLiteral("Страница недоступна"));
+        } else {
+            emit backend->projectsMoreAvailable(false);
+            emit backend->projectsLoaded(backend->projects);
+        }
+        QCOMPARE(browser.opened, QList<QUrl>{url});
+        auto *sections = findAccessible<QListWidget>(&window, QStringLiteral("Разделы"));
+        QVERIFY(sections);
+        QCOMPARE(sections->currentRow(), 0);
+        emit backend->projectsMoreAvailable(false);
+        emit backend->projectsLoaded(backend->projects + backend->moreProjects);
+        QCOMPARE(browser.opened, QList<QUrl>{url});
+        QCOMPARE(sections->currentRow(), 0);
+    }
+
     void samePortalChatMessageLinksOpenNativeContext()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());

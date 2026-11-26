@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ui/typography.h"
+
 #include <QEvent>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -117,7 +119,7 @@ private:
         const auto visible = !wordWrap() && width > 0 ? fontMetrics().elidedText(line, Qt::ElideRight, width) : line;
         setText(visible);
         setToolTip(visible == line ? QString()
-            : QStringLiteral("<qt>%1</qt>").arg(m_fullText.toHtmlEscaped()));
+            : plainTooltip(m_fullText));
     }
 
     QString m_fullText;

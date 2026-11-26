@@ -1,4 +1,5 @@
 #include "cloud/cloud_backend.h"
+#include "cloud/cloud_notification_links.h"
 
 #include "core/origin_guard.h"
 #include "core/notification_targets.h"
@@ -5962,6 +5963,7 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
                 duplicate->taskChat = true;
             }
         }
+        prepareNotificationDisplay(entry);
     } else {
         auto noticeParams = notification.value(QStringLiteral("params")).toObject();
         if (noticeParams.isEmpty())
@@ -5980,8 +5982,10 @@ void CloudBackend::handlePullEvent(const QJsonObject &event)
                 break;
         }
         decodeNotificationContent(entry, m_session.origin, content, noticeParams, authorId, authorName);
-        if (entry.text.isEmpty())
+        if (entry.text.isEmpty()) {
             entry.text = entry.title;
+            prepareNotificationDisplay(entry);
+        }
     }
     m_notifications.prepend(entry);
     trimNotificationHistory(m_notifications, m_notificationOlderPages);
@@ -6081,6 +6085,7 @@ void CloudBackend::reconcileHistoryPopups(const QString &dialog, qint64 chatId, 
         Notification entry{QStringLiteral("message:%1").arg(id), QStringLiteral("im"), title, text, message.createdAt};
         entry.ordinaryChatMessage = !taskChat;
         entry.targets.append({NotificationTargetKind::Chat, dialog, QString::number(id), {}, title, taskChat});
+        prepareNotificationDisplay(entry);
         queueChatPopup({std::move(entry), dialog, QString::number(*author), {}, true});
     }
 }

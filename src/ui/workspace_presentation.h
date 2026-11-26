@@ -39,12 +39,6 @@ inline QString taskLink(const QUrl &origin, const QString &projectId, const QStr
     return url.toString(QUrl::FullyEncoded);
 }
 
-// Extracts the task (and project when the link carries it) from a task link of the portal.
-inline PortalTaskReference taskReference(const QUrl &url)
-{
-    return portalTaskUrl(url);
-}
-
 inline QPersistentModelIndex messageIndex(const QAbstractItemModel *model, const QString &id)
 {
     if (!model || id.isEmpty())

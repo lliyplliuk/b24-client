@@ -5,6 +5,7 @@
 #include "ui/task_description_editor.h"
 #include "ui/task_detail_editor.h"
 #include "ui/task_relations.h"
+#include "ui/typography.h"
 
 #include <QAction>
 #include <QCheckBox>
@@ -465,7 +466,7 @@ public:
         m_stage->clear();
         m_stage->addItem(QStringLiteral("Не удалось загрузить"));
         m_stagesLoading = false;
-        m_retryStages->setToolTip(QStringLiteral("<qt>%1</qt>").arg(reason.toHtmlEscaped()));
+        m_retryStages->setToolTip(plainTooltip(reason));
         m_retryStages->show();
         refreshRequisites();
     }
@@ -550,7 +551,7 @@ private:
             auto caption = value;
             caption.replace(QLatin1Char('&'), QStringLiteral("&&"));
             button->setText(caption);
-            button->setToolTip(QStringLiteral("<qt>%1</qt>").arg(value.toHtmlEscaped()));
+            button->setToolTip(plainTooltip(value));
             button->setEnabled(m_detailEditor->canStart(field));
         };
         setChoice(m_assignee, Field::Assignee, m_draft.assignee.isEmpty() ? profileStatus : m_draft.assignee);
@@ -563,7 +564,7 @@ private:
             : people.size() == 1 ? people.first() : QStringLiteral("%1 и ещё %2").arg(people.first()).arg(people.size() - 1);
         setChoice(m_observers, Field::Observers, observers);
         if (!people.isEmpty())
-            m_observers->setToolTip(QStringLiteral("<qt>%1</qt>").arg(people.join(QStringLiteral(", ")).toHtmlEscaped()));
+            m_observers->setToolTip(plainTooltip(people.join(QStringLiteral(", "))));
         const bool editable = m_writable && m_createdTask.isEmpty();
         m_stage->setEnabled(editable && m_stage->currentData().isValid());
         m_retryStages->setEnabled(editable);

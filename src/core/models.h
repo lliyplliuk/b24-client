@@ -278,6 +278,8 @@ struct Notification {
     QVector<NotificationTarget> targets{};
     QString markup{};
     bool ordinaryChatMessage = false;
+    QString displayTitle{};
+    QString excerpt{};
 };
 
 } // namespace bx

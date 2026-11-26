@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ui/task_picker_choices.h"
+#include "ui/typography.h"
 
 #include <QLineEdit>
 #include <QPushButton>
@@ -83,7 +84,7 @@ public:
             value->setAccessibleName(entry.name);
             value->setFullText(entry.name);
             value->setAccessibleDescription(entry.pending ? QStringLiteral("Новый выбор") : QStringLiteral("Текущий выбор"));
-            value->setToolTip(QStringLiteral("<qt>%1</qt>").arg(entry.name.toHtmlEscaped()));
+            value->setToolTip(plainTooltip(entry.name));
             parts->addWidget(value, 1);
             if (entry.pending) {
                 auto *mark = new QWidget(pill);

@@ -5,6 +5,7 @@
 #include "ui/workspace_style.h"
 #include "ui/saved_file_offer.h"
 #include "ui/task_dialogs.h"
+#include "ui/typography.h"
 
 #include <QAbstractTableModel>
 #include <QDateEdit>
@@ -108,7 +109,7 @@ public:
         if (role == Qt::DisplayRole)
             return entry && !entry->value.isEmpty() ? entry->value : QStringLiteral("—");
         if (role == Qt::ToolTipRole && entry && !entry->details.isEmpty())
-            return QStringLiteral("<qt>%1</qt>").arg(entry->details.toHtmlEscaped());
+            return plainTooltip(entry->details);
         return {};
     }
 
@@ -120,7 +121,7 @@ public:
                 if (role == Qt::DisplayRole)
                     return name;
                 if (role == Qt::ToolTipRole)
-                    return QStringLiteral("<qt>%1</qt>").arg(name.toHtmlEscaped());
+                    return plainTooltip(name);
             }
             return {};
         }

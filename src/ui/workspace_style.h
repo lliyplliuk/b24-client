@@ -313,8 +313,7 @@ inline QListWidgetItem *addRow(QListWidget *list, const QString &title, const QS
     item->setData(Detail, detail);
     item->setData(Meta, meta);
     if (showTextToolTip)
-        item->setToolTip(QStringLiteral("<qt>%1</qt>").arg(item->text().toHtmlEscaped().replace(
-            QLatin1Char('\n'), QStringLiteral("<br>"))));
+        item->setToolTip(ui::plainTooltip(item->text()).replace(QLatin1Char('\n'), QStringLiteral("<br>")));
     return item;
 }
 
@@ -824,7 +823,7 @@ public:
                 const auto title = reaction ? QString::fromUtf8(reaction->caption) : target.code;
                 const auto hint = (target.own ? QStringLiteral("Снять реакцию «%1»")
                                                : QStringLiteral("Поставить реакцию «%1»")).arg(title);
-                QToolTip::showText(event->globalPos(), QStringLiteral("<qt>%1</qt>").arg(hint.toHtmlEscaped()),
+                QToolTip::showText(event->globalPos(), ui::plainTooltip(hint),
                                    view->viewport(), target.rect);
                 return true;
             }

@@ -1,4 +1,5 @@
 #include "cloud/cloud_backend.h"
+#include "cloud/cloud_notification_links.h"
 #include "core/notification_targets.h"
 
 #include <QHostAddress>
@@ -113,6 +114,8 @@ class TestCloudNotificationLinks : public QObject {
 private slots:
     void parsesExplicitObjectLinksWithoutHtmlRendering();
     void rejectsUnsafeAndAmbiguousLinks();
+    void normalizesNotificationPresentation();
+    void preservesPortalTextWhenPreparingExcerpts();
     void verifiedPullScope();
     void loadsRemoteContextAndPersonAfterScopeChecks();
     void loadsNamedProfileForConfirmedCurrentAccount();
@@ -178,6 +181,71 @@ void TestCloudNotificationLinks::rejectsUnsafeAndAmbiguousLinks()
     for (int i = 1; i <= 20; ++i)
         longBody += QStringLiteral("[url=/online/?IM_DIALOG=chat%1]item[/url]").arg(i);
     QCOMPARE(notificationTargets(portal, longBody).size(), 8);
+}
+
+void TestCloudNotificationLinks::preservesPortalTextWhenPreparingExcerpts()
+{
+    const QString wireText = QStringLiteral(
+        "<!--private--><style>hidden</style><script>hidden</script>"
+        "<b title='do > not show'>[custom]Привет[/custom]</b> &amp; &#91;b&#93;мир&#91;/b&#93;!");
+    const QString decoded = notificationDisplayText(wireText);
+    QCOMPARE(decoded, QStringLiteral("Привет & [b]мир[/b]!"));
+
+    Notification notice;
+    notice.title = decoded;
+    decodeNotificationContent(notice, QUrl(QStringLiteral("https://portal.test")),
+                              QStringLiteral("/me [i]ответил[/i] &amp;amp;"), {});
+    QCOMPARE(notice.displayTitle, QStringLiteral("Привет & мир!"));
+    QCOMPARE(notice.text, QStringLiteral("/me ответил &amp;"));
+    QCOMPARE(notice.excerpt, QStringLiteral("ответил &amp;"));
+}
+
+void TestCloudNotificationLinks::normalizesNotificationPresentation()
+{
+    const QUrl portal(QStringLiteral("https://tenant.bitrix24.ru"));
+    Notification notice;
+    notice.title = QStringLiteral("Уведомление Битрикс24");
+    decodeNotificationContent(notice, portal, QStringLiteral("[URL=/tasks/task/view/5/]Задача #5[/URL] ожидает ответа"), {});
+    QCOMPARE(notice.displayTitle, QString());
+    QCOMPARE(notice.excerpt, QStringLiteral("Задача #5 ожидает ответа"));
+
+    notice = {};
+    notice.title = QStringLiteral("Моя задача");
+    decodeNotificationContent(notice, portal, QStringLiteral("[URL=/tasks/task/view/5/]Задача #5[/URL] ожидает ответа"), {});
+    QCOMPARE(notice.displayTitle, QStringLiteral("Моя задача"));
+    QCOMPARE(notice.excerpt, QStringLiteral("ожидает ответа"));
+
+    notice = {};
+    notice.title = notificationDisplayText(QStringLiteral("&#91;b&#93;Смена&#91;/b&#93;"));
+    decodeNotificationContent(notice, portal, QStringLiteral("/me закончил смену"), {});
+    QCOMPARE(notice.displayTitle, QStringLiteral("Смена"));
+    QCOMPARE(notice.excerpt, QStringLiteral("закончил смену"));
+
+    notice = {};
+    notice.title = QStringLiteral("Новое сообщение");
+    notice.text = QStringLiteral("Задача #5 -------- Иван [12:30] #chat42/80\nцитата\n--------  Новый  ответ");
+    prepareNotificationDisplay(notice);
+    QCOMPARE(notice.displayTitle, notice.title);
+    QCOMPARE(notice.excerpt, QStringLiteral("Задача #5 Новый ответ"));
+    notice.targets = {{NotificationTargetKind::Chat, QStringLiteral("chat42"), QStringLiteral("81"), {}, {}, true}};
+    prepareNotificationDisplay(notice);
+    QCOMPARE(notice.excerpt, QStringLiteral("Сообщение в чате задачи: Новый ответ"));
+
+    notice = {};
+    notice.title = QStringLiteral("2 < 3 &amp; [word]");
+    notice.text = notice.title;
+    prepareNotificationDisplay(notice);
+    QVERIFY(notice.displayTitle.isEmpty());
+    QCOMPARE(notice.excerpt, notice.text);
+
+    notice.text.clear();
+    prepareNotificationDisplay(notice);
+    QCOMPARE(notice.displayTitle, notice.title);
+    QVERIFY(notice.excerpt.isEmpty());
+
+    notice.markup = QStringLiteral("[URL=https://example.test/]Один[/URL]\nДва ") + QString(512, u'я');
+    prepareNotificationDisplay(notice);
+    QCOMPARE(notice.excerpt, (QStringLiteral("Один Два ") + QString(512, u'я')).left(512));
 }
 
 void TestCloudNotificationLinks::verifiedPullScope()

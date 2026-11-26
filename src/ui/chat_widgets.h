@@ -9,6 +9,7 @@
 #include "ui/people_suggestions.h"
 #include "ui/workspace_style.h"
 #include "ui/workspace_presentation.h"
+#include "ui/typography.h"
 
 #include <QBuffer>
 #include <QButtonGroup>
@@ -269,7 +270,7 @@ private:
             : QStringLiteral("Закреплённые сообщения · %1 · %2").arg(m_messages.size()).arg(preview(m_messages.front()));
         const int reserve = m_selector->isHidden() ? 0 : m_selector->width() + 2;
         m_body->setText(m_body->fontMetrics().elidedText(title, Qt::ElideRight, qMax(1, width() - reserve - 26)));
-        m_body->setToolTip(QStringLiteral("<qt>%1</qt>").arg(title.toHtmlEscaped()));
+        m_body->setToolTip(plainTooltip(title));
         m_body->setAccessibleDescription(preview(m_messages.front()));
     }
     void choosePinned()
@@ -2074,7 +2075,7 @@ public:
         m_quoteText->setText(summary);
         setLoadingIndicator(m_quoteText, false);
         m_quoteText->setAccessibleName(QStringLiteral("Цитата в черновике"));
-        m_quoteText->setToolTip(QStringLiteral("<qt>%1</qt>").arg(summary.toHtmlEscaped()));
+        m_quoteText->setToolTip(plainTooltip(summary));
         m_quote->setVisible(!reply.id.isEmpty());
     }
     void setMentionSearchHandler(std::function<void(const QString &, const QString &)> handler)
