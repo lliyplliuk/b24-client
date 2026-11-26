@@ -301,6 +301,7 @@ inline QListWidgetItem *addChatRow(QListWidget *list, const Chat &chat)
 {
     auto *item = workspace::addRow(list, chat.title, workspace::markupPlainText(chat.lastMessage),
                                    clockLabel(chat.updated), chat.id);
+    item->setData(workspace::ChatMessagePreview, true);
     item->setData(workspace::AvatarUrl, chat.avatarUrl);
     item->setData(workspace::AvatarType, int(!chat.taskChat && chat.kind == QStringLiteral("im")
         ? workspace::AvatarKind::Person : workspace::AvatarKind::Chat));

@@ -85,6 +85,7 @@ constexpr int MessageUnread = Qt::UserRole + 41;
 constexpr int MessageCalendarDay = Qt::UserRole + 42;
 constexpr int MessageLinks = Qt::UserRole + 43;
 constexpr int CountPartial = Qt::UserRole + 44;
+constexpr int ChatMessagePreview = Qt::UserRole + 45;
 
 struct NoticeRow {
     QString day;
@@ -417,18 +418,6 @@ public:
         m_previewPending = std::move(source);
     }
 
-    const QPixmap *preview(const MessageFile &file) const
-    {
-        if (file.isVideo)
-            return m_videoPreview ? m_videoPreview(file) : nullptr;
-        if (!m_messagePreview)
-            return nullptr;
-        const auto *photo = m_messagePreview(file.previewUrl);
-        if (!photo || photo->isNull())
-            photo = m_messagePreview(file.originalPreviewUrl);
-        return photo && !photo->isNull() ? photo : nullptr;
-    }
-
     void setPreviewAnimation(bool active)
     {
         if (m_previewViewport && (m_previewAnimation || active)) {
@@ -442,7 +431,7 @@ public:
     {
         bool pending = false;
         visitFileGeometry(index, row, [&](const MessageFile &file, const FileGeometry &geometry) {
-            if (!previewPending(file) || (!geometry.thumbnail.isEmpty() && preview(file)))
+            if (!previewPending(file) || (!geometry.thumbnail.isEmpty() && filePreview(file)))
                 return false;
             const auto ring = geometry.thumbnail.isEmpty() ? cardLoadingRing(geometry.control)
                 : mediaLoadingRing(geometry.thumbnail, file, false);
@@ -452,13 +441,25 @@ public:
         if (pending)
             return true;
         const auto representative = visibleQuoteMedia(index, row, visible);
-        return representative && previewPending(*representative) && !preview(*representative)
+        return representative && previewPending(*representative) && !filePreview(*representative)
             && mediaLoadingRing(quoteMediaRect(replyHeaderRect(row, index)), *representative, true).intersects(visible);
     }
 
     void setVideoPreviewSource(std::function<const QPixmap *(const MessageFile &)> source)
     {
         m_videoPreview = std::move(source);
+    }
+
+    const QPixmap *filePreview(const MessageFile &file) const
+    {
+        if (file.isVideo)
+            return m_videoPreview ? m_videoPreview(file) : nullptr;
+        if (!m_messagePreview)
+            return nullptr;
+        const auto *photo = file.previewUrl.isEmpty() ? nullptr : m_messagePreview(file.previewUrl);
+        if ((!photo || photo->isNull()) && !file.originalPreviewUrl.isEmpty())
+            photo = m_messagePreview(file.originalPreviewUrl);
+        return photo && !photo->isNull() ? photo : nullptr;
     }
 
     void setLinkThumbnailSource(std::function<const QImage *(const QUrl &)> source)
@@ -521,7 +522,7 @@ public:
     {
         QVector<MessageFile> result;
         for (const auto &file : files(index, MessageFiles)) {
-            if (!file.isVideo && preview(file) && downloadable(file) && !matchesOriginal(result, file))
+            if (!file.isVideo && filePreview(file) && downloadable(file) && !matchesOriginal(result, file))
                 result.append(file);
         }
         return result;
@@ -842,7 +843,7 @@ public:
                 m_messageVideo(index, file);
                 return true;
             }
-            if (!file.isVideo && m_messagePhoto && (preview(file) || (file.isImage && downloadable(file)))) {
+            if (!file.isVideo && m_messagePhoto && (filePreview(file) || (file.isImage && downloadable(file)))) {
                 m_messagePhoto(file);
                 return true;
             }
@@ -1442,7 +1443,7 @@ private:
                     return [this, index, file = file] { m_messageVideo(index, file); };
                 }
                 const bool originalControl = file.isImage && titleControl && downloadable(file);
-                const bool opensThumbnail = geometry.thumbnail.contains(point) && (preview(file) || downloadable(file));
+                const bool opensThumbnail = geometry.thumbnail.contains(point) && (filePreview(file) || downloadable(file));
                 if (!file.isVideo && m_messagePhoto && (opensThumbnail || originalControl))
                     return [this, file = file] { m_messagePhoto(file); };
                 if (m_messageDownload && geometry.control.contains(point) && downloadable(file))
@@ -1638,7 +1639,7 @@ private:
 
     FileGeometry fileGeometry(const QRect &card, const MessageFile &file) const
     {
-        const auto *photo = preview(file);
+        const auto *photo = filePreview(file);
         if (!photo)
             return {{}, card};
         const auto source = file.previewSize.isEmpty() ? photo->size() : file.previewSize;
@@ -1660,13 +1661,13 @@ private:
             return current.downloadUrl == file.downloadUrl && current.id == file.id
                 && current.diskObjectId == file.diskObjectId && current.name == file.name
                 && (!preview || (current.previewUrl == file.previewUrl
-                                 && current.originalPreviewUrl == file.originalPreviewUrl));
+                    && current.originalPreviewUrl == file.originalPreviewUrl));
         });
     }
 
     QRect photoMenuRect(const QRect &thumbnail, const MessageFile &file) const
     {
-        if (thumbnail.width() < 32 || !m_messagePhotoMenu || (!downloadable(file) && !preview(file)))
+        if (thumbnail.width() < 32 || !m_messagePhotoMenu || (!downloadable(file) && !filePreview(file)))
             return {};
         return QRect(thumbnail.right() - 28, thumbnail.top() + 5, 24, 24);
     }
@@ -1683,7 +1684,7 @@ private:
     void paintMediaFrame(QPainter &p, const QRect &frame, const MessageFile &file, bool crop = false) const
     {
         fill(p, frame, QColor("#e2ede8"), QColor("#bbd3ca"), 6);
-        if (const auto *photo = preview(file)) {
+        if (const auto *photo = filePreview(file)) {
             const auto aspect = crop ? Qt::KeepAspectRatioByExpanding : Qt::KeepAspectRatio;
             QRect image(QPoint{}, photo->size().scaled(frame.size(), aspect));
             image.moveCenter(frame.center());
@@ -1783,7 +1784,7 @@ private:
             line(p, text, media, ui::secondaryTextPixels, Ink, true);
             if (!attachmentsOnly) {
                 text.translate(0, messageQuoteLineHeight);
-                quotePreview(p, text, excerpt, ConversationMetaInk);
+                messagePreviewLine(p, text, excerpt, ConversationMetaInk);
             }
         } else {
             auto caption = excerpt;
@@ -2002,7 +2003,7 @@ private:
         p.restore();
     }
 
-    static void quotePreview(QPainter &painter, const QRect &rect, const QString &text, const QColor &color)
+    static void messagePreviewLine(QPainter &painter, const QRect &rect, const QString &text, const QColor &color)
     {
         const auto formats = messageEmojiFormats(text);
         if (formats.isEmpty()) {
@@ -2128,8 +2129,11 @@ private:
         line(p, QRect(right - metaWidth, r.top() + 5, metaWidth, 21), meta, ui::secondaryTextPixels, Muted, false,
              Qt::AlignRight | Qt::AlignVCenter);
         const int badgesWidth = unreadWidth + anchorWidth + (pinned && !projectPin ? 15 : 0);
-        line(p, QRect(textLeft, r.top() + 26, qMax(1, right - textLeft - badgesWidth), 20),
-             detail.simplified(), ui::secondaryTextPixels, Muted);
+        const QRect preview(textLeft, r.top() + 26, qMax(1, right - textLeft - badgesWidth), 20);
+        if (index.data(ChatMessagePreview).toBool())
+            messagePreviewLine(p, preview, detail.simplified(), Muted);
+        else
+            line(p, preview, detail.simplified(), ui::secondaryTextPixels, Muted);
         int anchorRight = right - unreadWidth;
         const auto paintAnchor = [&](const QString &symbol, const QColor &color) {
             const QRect badge(anchorRight - 16, r.top() + 27, 16, 18);

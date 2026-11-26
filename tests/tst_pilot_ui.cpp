@@ -30,6 +30,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFileDialog>
+#include <QFontDatabase>
 #include <QGuiApplication>
 #include <QInputMethodEvent>
 #include <QLabel>
@@ -7763,16 +7764,19 @@ private slots:
     {
         QTest::addColumn<bool>("viewer");
         QTest::addColumn<bool>("hasOriginal");
-        QTest::newRow("inline original") << false << true;
-        QTest::newRow("original viewer") << true << true;
-        QTest::newRow("inline preview only") << false << false;
-        QTest::newRow("preview only viewer") << true << false;
+        QTest::addColumn<bool>("brokenPreview");
+        QTest::newRow("inline original") << false << true << false;
+        QTest::newRow("original viewer") << true << true << false;
+        QTest::newRow("inline preview only") << false << false << false;
+        QTest::newRow("preview only viewer") << true << false << false;
+        QTest::newRow("inline original after broken preview") << false << true << true;
     }
 
     void imageContextMenuUsesTheClickedPhoto()
     {
         QFETCH(bool, viewer);
         QFETCH(bool, hasOriginal);
+        QFETCH(bool, brokenPreview);
         std::unique_ptr<FixtureBackend> backend(makeFixture());
         auto &message = backend->messages.first();
         message.id = QStringLiteral("92");
@@ -7787,6 +7791,7 @@ private slots:
             file.previewUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/preview/%1").arg(id));
             if (id == 1 || hasOriginal)
                 file.downloadUrl = QUrl(QStringLiteral("https://example.bitrix24.ru/download/%1").arg(id));
+            file.originalPreviewUrl = file.downloadUrl;
             file.previewSize = previewSize;
             file.isImage = true;
             message.files.append(file);
@@ -7796,7 +7801,12 @@ private slots:
             QImage image(previewSize, QImage::Format_RGB32);
             image.fill(id == 1 ? QColor("#87593b") : previewColor);
             QVERIFY(image.save(&buffer, "PNG"));
-            backend->messageImages.insert(file.previewUrl, bytes);
+            if (id == 2 && brokenPreview)
+                backend->messageImages.insert(file.previewUrl, QByteArray::fromHex("89504e470d0a1a0a0000000d49484452"));
+            else
+                backend->messageImages.insert(file.previewUrl, bytes);
+            if (!file.downloadUrl.isEmpty())
+                backend->messageImages.insert(file.downloadUrl, bytes);
         }
         const auto photo = message.files.last();
         MainWindow window(backend.get());
@@ -7806,6 +7816,8 @@ private slots:
         auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
         QVERIFY(history);
         QTRY_COMPARE(backend->imageRequests.count(photo.previewUrl), 1);
+        if (brokenPreview)
+            QTRY_COMPARE_WITH_TIMEOUT(backend->imageRequests.count(photo.downloadUrl), 1, 1200);
         const auto pointInPreview = [&] {
             const auto pixels = history->viewport()->grab().toImage();
             for (int y = 0; y < pixels.height(); ++y)
@@ -7815,6 +7827,7 @@ private slots:
             return QPoint();
         };
         QTRY_VERIFY(!pointInPreview().isNull());
+        QCOMPARE(backend->imageRequests.count(photo.downloadUrl), brokenPreview ? 1 : 0);
         QWidget *target = history->viewport();
         auto point = pointInPreview();
         const auto openContext = [](QWidget *widget, const QPoint &pos) {
@@ -9626,6 +9639,46 @@ private slots:
         QVERIFY(fileButton->isEnabled());
         QVERIFY(backend->sentChat.isEmpty());
         QCOMPARE(composer->toPlainText(), QStringLiteral("Черновик"));
+    }
+
+    void paintsEmojiInChatListPreviews()
+    {
+        if (!QFontDatabase::hasFamily(QStringLiteral("Noto Color Emoji")))
+            QSKIP("Noto Color Emoji is required for the color rendering check");
+        const auto applicationFont = QApplication::font();
+        const auto restoreFont = qScopeGuard([applicationFont] { QApplication::setFont(applicationFont); });
+        auto textFont = applicationFont;
+        textFont.setStyleStrategy(QFont::NoFontMerging);
+        QApplication::setFont(textFont);
+
+        QListWidget chats;
+        auto *delegate = workspace::configureRows(&chats, workspace::Row::Directory);
+        const auto smile = QString::fromUtf8("😀");
+        Chat chat;
+        chat.title = QStringLiteral("Messages");
+        chat.lastMessage = smile;
+        ui::addChatRow(&chats, chat);
+        chat.taskChat = true;
+        ui::addChatRow(&chats, chat);
+
+        for (int row = 0; row < chats.count(); ++row) {
+            QImage pixels(220, 56, QImage::Format_RGB32);
+            pixels.fill(Qt::white);
+            QStyleOptionViewItem option;
+            option.rect = pixels.rect();
+            QPainter painter(&pixels);
+            delegate->paint(&painter, option, chats.model()->index(row, 0));
+            painter.end();
+
+            bool hasYellow = false;
+            for (int y = 29; y < 46; ++y) {
+                for (int x = 54; x < 85; ++x) {
+                    const auto pixel = pixels.pixelColor(x, y);
+                    hasYellow |= pixel.red() > 200 && pixel.green() > 130 && pixel.blue() < 110;
+                }
+            }
+            QVERIFY2(hasYellow, row == 0 ? "Ordinary chat preview" : "Task chat preview");
+        }
     }
 
     void exposesDistinctBadgesInChatRows()

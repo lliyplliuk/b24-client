@@ -5886,9 +5886,9 @@ void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
     const auto open = [this, list](const MessageFile &file) { saveMessageFile(file, list->window()); };
     delegate->setMessageDownloadHandler(open);
     delegate->setMessagePhotoMenuHandler([this, list, delegate](const QModelIndex &index, const MessageFile &file,
-                                                                const QRect &anchor) {
-        const auto *thumb = file.isVideo ? nullptr : delegate->preview(file);
-        const auto pixels = thumb ? thumb->toImage() : QImage();
+                                                      const QRect &anchor) {
+        const auto *thumb = delegate->filePreview(file);
+        const auto pixels = thumb && !file.isVideo ? thumb->toImage() : QImage();
         const auto samePhoto = [this, list, current = QPersistentModelIndex(index), file,
                                 account = m_backend->settingsScope()] {
             return account == m_backend->settingsScope() && list->isVisible() && current.isValid()
