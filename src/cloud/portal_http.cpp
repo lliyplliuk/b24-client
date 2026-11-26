@@ -1,6 +1,5 @@
 #include "cloud/portal_http.h"
 
-#include "cloud/cloud_backend.h"
 #include "core/origin_guard.h"
 #include "signin/session_capture.h"
 #include "signin/session_restore.h"
@@ -9,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QPointer>
 #include <QTimer>
@@ -93,8 +93,8 @@ bool safeHeader(const QByteArray &header)
 
 } // namespace
 
-PortalHttp::PortalHttp(CloudBackend &backend)
-    : QObject(&backend), m_backend(backend)
+PortalHttp::PortalHttp(PortalSession &session, QNetworkAccessManager &network, QObject *parent)
+    : QObject(parent), m_session(session), m_network(network)
 {
 }
 
@@ -121,7 +121,7 @@ void PortalHttp::webRequest(QUrl url, const Fields &fields, const QString &opera
         encoded += '=';
         encoded += QUrl::toPercentEncoding(value);
     };
-    appendField(QStringLiteral("sessid"), QString::fromLatin1(candidate ? candidate->csrf : m_backend.m_session.csrf));
+    appendField(QStringLiteral("sessid"), QString::fromLatin1(candidate ? candidate->csrf : m_session.currentSession().csrf));
     for (const auto &field : fields)
         appendField(field.first, field.second);
     auto *buffer = new QBuffer;
@@ -135,7 +135,7 @@ void PortalHttp::webRequest(QUrl url, const Fields &fields, const QString &opera
 QString PortalHttp::scopedRequestKey(const QString &operation, RequestPolicy policy, const QString &requestKey) const
 {
     if (policy == RequestPolicy::AccountScoped)
-        return operation + QLatin1Char(':') + QString::number(m_backend.m_accountScopeRevision);
+        return operation + QLatin1Char(':') + QString::number(m_session.accountScopeRevision());
     return requestKey.isEmpty() ? operation : requestKey;
 }
 
@@ -157,7 +157,7 @@ struct PortalHttp::InflightRequest {
     {
         QPointer<PortalHttp> alive(http);
         for (const auto &handler : handlers) {
-            if (!alive || !http->m_backend.m_started || scope != http->m_backend.m_accountScopeRevision)
+            if (!alive || !http->m_session.started() || scope != http->m_session.accountScopeRevision())
                 return;
             if (error.isEmpty())
                 handler.onData(value);
@@ -173,7 +173,7 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
                                bool includeResponseMeta, std::optional<RequestPolicy> policyOverride)
 {
     std::unique_ptr<QIODevice> ownedBody(body);
-    const auto accountScope = m_backend.m_accountScopeRevision;
+    const auto accountScope = m_session.accountScopeRevision();
     const auto kind = parseOperation(operation).kind;
     const auto policy = policyOverride.value_or(defaultRequestPolicy(kind));
     const auto key = scopedRequestKey(operation, policy, requestKey);
@@ -187,12 +187,12 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
         QPointer<PortalHttp> alive(this);
         const auto detail = optional && onData.accepts ? onData.invalidMessage : reason;
         if (!optional || onData.accepts)
-            emit failed(failedOperation, detail);
-        if (alive && accountScope == m_backend.m_accountScopeRevision)
+            m_session.portalRequestFailed(failedOperation, detail);
+        if (alive && accountScope == m_session.accountScopeRevision())
             onData.reject(detail, optional);
     };
     auto *buffer = qobject_cast<QBuffer *>(body);
-    const auto revision = m_backend.m_sessionRevision;
+    const auto revision = m_session.sessionRevision();
     if (m_inflightOperations.contains(key)) {
         const auto pending = m_inflightOperations.value(key);
         if (buffer && pending && shareableRead(kind) && pending->scope == accountScope
@@ -203,20 +203,20 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
             pending->handlers.append(std::move(onData));
         return;
     }
-    const auto &credentials = candidate ? *candidate : m_backend.m_session;
-    if (m_backend.m_authExpired && !candidate) {
+    const auto &credentials = candidate ? *candidate : m_session.currentSession();
+    if (m_session.authExpired() && !candidate) {
         rejectRequest(QStringLiteral("Вход в портал истёк. Обновите подключение."));
         return;
     }
-    if (!sessionUsable(credentials, m_backend.m_allowLoopback) || credentials.origin != m_backend.m_session.origin
-        || !url.userInfo().isEmpty() || url.hasFragment() || !OriginGuard(m_backend.m_session.origin).isSameOrigin(url)) {
+    if (!sessionUsable(credentials, m_session.allowLoopback()) || credentials.origin != m_session.currentSession().origin
+        || !url.userInfo().isEmpty() || url.hasFragment() || !OriginGuard(m_session.currentSession().origin).isSameOrigin(url)) {
         rejectRequest(QStringLiteral("Импортируйте действующую веб-сессию портала"));
         return;
     }
     if (atCapacity()) {
         rejectRequest(QStringLiteral("Дождитесь завершения текущих запросов"));
         if (kind == OperationKind::Push)
-            m_backend.scheduleReconnect();
+            m_session.reconnectPortal();
         return;
     }
     if (!body || !body->isReadable()) {
@@ -244,11 +244,11 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
     request.setRawHeader("Accept", "application/json");
     request.setRawHeader("X-Requested-With", "XMLHttpRequest");
     request.setRawHeader("BX-Ajax", "true");
-    const auto online = OriginGuard(m_backend.m_session.origin).resolve(QStringLiteral("/online/"));
+    const auto online = OriginGuard(m_session.currentSession().origin).resolve(QStringLiteral("/online/"));
     request.setRawHeader("Origin", online.toEncoded(QUrl::RemovePath));
     request.setRawHeader("Referer", online.toEncoded());
 
-    auto *reply = m_backend.m_http.post(request, body);
+    auto *reply = m_network.post(request, body);
     ownedBody.release()->setParent(reply);
     m_requests.insert(reply, key);
     auto pending = std::make_shared<InflightRequest>(InflightRequest{
@@ -277,16 +277,16 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
             m_sessionRecoveryReply = nullptr;
         }
         m_inflightOperations.remove(key, pending);
-        if (!m_backend.m_started)
+        if (!m_session.started())
             return;
-        if (accountScope != m_backend.m_accountScopeRevision) {
+        if (accountScope != m_session.accountScopeRevision()) {
             // These operations leave controls busy until they receive a terminal signal.
             if (key == operation && policy == RequestPolicy::NotifyAccountChange)
-                emit failed(operation, QStringLiteral("Аккаунт изменился. Результат запроса не подтверждён."));
+                m_session.portalRequestFailed(operation, QStringLiteral("Аккаунт изменился. Результат запроса не подтверждён."));
             return;
         }
-        m_backend.scheduleRefresh();
-        if (!m_backend.isCurrentResponse(kind, key, operation))
+        m_session.scheduleRefresh();
+        if (!m_session.isCurrentResponse(kind, key, operation))
             return;
 
         const QPointer<PortalHttp> alive(this);
@@ -312,7 +312,7 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
                     || error == QNetworkReply::RemoteHostClosedError || error == QNetworkReply::TemporaryNetworkFailureError
                     || error == QNetworkReply::ConnectionRefusedError || error == QNetworkReply::NetworkSessionFailedError);
             const bool temporary = transientConnection || (status >= 500 && status < 600);
-            if (historySnapshot && !denied && !m_backend.m_authExpired
+            if (historySnapshot && !denied && !m_session.authExpired()
                 && (temporary || (status >= 200 && status < 300))) {
                 // The separate message list can still be usable if the full chat snapshot fails.
                 pending->notify(this, {});
@@ -321,28 +321,28 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
             if (latestHistory && !denied && temporary && scheduleHistoryRetry(key, historyRevision, pending))
                 return;
             if (kind == OperationKind::CsrfRefresh) {
-                if (denied && revision == m_backend.m_sessionRevision)
-                    m_backend.rejectSession();
+                if (denied && revision == m_session.sessionRevision())
+                    m_session.rejectSession();
                 return;
             }
             // Some optional endpoints may deny access while the main routes are still usable.
             const bool lookup = policy == RequestPolicy::Optional;
             bool refreshing = false;
             if (denied && (!lookup || kind == OperationKind::SessionKeepalive)
-                && !candidate && revision == m_backend.m_sessionRevision) {
-                auto retry = signin::csrfRetrySession(m_backend.m_session, *reply, object);
-                refreshing = retry.isValid() && m_backend.refreshCsrf(std::move(retry), revision);
+                && !candidate && revision == m_session.sessionRevision()) {
+                auto retry = signin::csrfRetrySession(m_session.currentSession(), *reply, object);
+                refreshing = retry.isValid() && m_session.refreshCsrf(std::move(retry), revision);
                 if (!refreshing) {
                     if (kind == OperationKind::SessionKeepalive) {
-                        m_backend.rejectSession();
+                        m_session.rejectSession();
                     } else {
-                        m_backend.confirmSession(revision);
+                        m_session.confirmPortalSession(revision);
                         refreshing = true;
                     }
                 }
             }
             QString detail = refreshing ? QStringLiteral("Клиент проверяет вход в портал. Повторите действие после проверки")
-                : denied && revision != m_backend.m_sessionRevision && !m_backend.m_authExpired
+                : denied && revision != m_session.sessionRevision() && !m_session.authExpired()
                     ? QStringLiteral("Параметры входа обновлены. Повторите действие")
                 : denied ? QStringLiteral("Действие требует новой веб-сессии портала")
                 : status == 403 ? QStringLiteral("Портал запретил действие")
@@ -353,31 +353,24 @@ void PortalHttp::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers
             if (lookup && first.accepts)
                 detail = first.invalidMessage;
             if (!lookup || first.accepts)
-                emit this->failed(failedOperation, detail);
+                m_session.portalRequestFailed(failedOperation, detail);
             if (alive)
                 pending->notify(this, {}, detail);
-            if (kind == OperationKind::Push && alive && !m_backend.m_authExpired)
-                m_backend.scheduleReconnect();
+            if (kind == OperationKind::Push && alive && !m_session.authExpired())
+                m_session.reconnectPortal();
             return;
         }
         if (candidate) {
             *candidate = signin::updatedSession(*candidate, *reply);
-        } else if (revision == m_backend.m_sessionRevision) {
-            const auto renewed = signin::updatedSession(m_backend.m_session, *reply);
-            if (!renewed.isValid()) {
-                m_backend.rejectSession();
-            } else if (renewed.cookie != m_backend.m_session.cookie || renewed.csrf != m_backend.m_session.csrf) {
-                m_backend.m_session = renewed;
-                ++m_backend.m_sessionRevision;
-                emit m_backend.sessionUpdated(m_backend.m_session);
-            }
+        } else if (revision == m_session.sessionRevision()) {
+            m_session.applyRenewedSession(signin::updatedSession(m_session.currentSession(), *reply));
         }
-        if (!alive || !m_backend.m_started || accountScope != m_backend.m_accountScopeRevision)
+        if (!alive || !m_session.started() || accountScope != m_session.accountScopeRevision())
             return;
         const auto value = includeResponseMeta ? QJsonValue(object) : result;
         const auto &first = pending->handlers.first();
         if (first.accepts && !first.accepts(value)) {
-            emit this->failed(failedOperation, first.invalidMessage);
+            m_session.portalRequestFailed(failedOperation, first.invalidMessage);
             if (alive)
                 pending->notify(this, {}, first.invalidMessage);
             return;
@@ -404,10 +397,10 @@ bool PortalHttp::scheduleHistoryRetry(const QString &operation, quint64 revision
     const auto key = parsed.ids.value(0);
     auto &attempt = task ? m_taskHistoryRetry : m_chatHistoryRetry;
     const auto dialog = attempt.dialog;
-    const auto scope = m_backend.m_accountScopeRevision;
+    const auto scope = m_session.accountScopeRevision();
     const auto current = [this, task, key, dialog, revision, scope] {
-        return m_backend.m_started && !m_backend.m_authExpired && scope == m_backend.m_accountScopeRevision
-            && m_backend.isCurrentHistory(task, key, dialog)
+        return m_session.started() && !m_session.authExpired() && scope == m_session.accountScopeRevision()
+            && m_session.isCurrentHistory(task, key, dialog)
             && (task ? m_taskHistoryRetry : m_chatHistoryRetry).revision == revision;
     };
     if (attempt.used || !current())
@@ -419,13 +412,13 @@ bool PortalHttp::scheduleHistoryRetry(const QString &operation, quint64 revision
         m_inflightOperations.remove(operation, pending);
         if (!current()) {
             // A newer view may have deferred its refresh while this key was occupied.
-            if (pending->scope == m_backend.m_accountScopeRevision)
-                m_backend.scheduleRefresh();
+            if (pending->scope == m_session.accountScopeRevision())
+                m_session.scheduleRefresh();
             pending->notify(this, {}, QStringLiteral("Чтение истории больше не актуально"));
             return;
         }
         if (pending->handlers.size() == 1) {
-            m_backend.loadMessages(key, dialog, task, true);
+            m_session.retryHistory(key, dialog, task);
             return;
         }
         // Subscribers need the failed stage's response. A fresh chat snapshot could
@@ -466,7 +459,7 @@ void PortalHttp::reset(const Requests &pending)
     for (const auto &[reply, key] : pending.asKeyValueRange()) {
         // The pending clipboard upload owns the staged file, which a new upload may still open.
         // Its account-specific key allows the new request, and its stale response cannot advance the upload.
-        if (m_backend.m_started && parseOperation(key).kind == OperationKind::ChatImageUpload)
+        if (m_session.started() && parseOperation(key).kind == OperationKind::ChatImageUpload)
             continue;
         if (m_requests.contains(reply))
             reply->abort();

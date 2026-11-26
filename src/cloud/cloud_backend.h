@@ -26,7 +26,7 @@ namespace bx {
 
 namespace signin { class SessionRestore; }
 
-class CloudBackend final : public Backend {
+class CloudBackend final : public Backend, private PortalSession {
     Q_OBJECT
 
 public:
@@ -143,13 +143,24 @@ signals:
 
 private:
     friend class ::TestCloudBackend;
-    friend class PortalHttp;
+
+    const Session &currentSession() const override { return m_session; }
+    quint64 sessionRevision() const override { return m_sessionRevision; }
+    quint64 accountScopeRevision() const override { return m_accountScopeRevision; }
+    bool started() const override { return m_started; }
+    bool authExpired() const override { return m_authExpired; }
+    bool allowLoopback() const override { return m_allowLoopback; }
+    void confirmPortalSession(quint64 revision) override { confirmSession(revision); }
+    void reconnectPortal() override { scheduleReconnect(); }
+    void retryHistory(const QString &key, const QString &dialog, bool task) override { loadMessages(key, dialog, task, true); }
+    void applyRenewedSession(const Session &renewed) override;
+    void portalRequestFailed(const QString &operation, const QString &detail) override { emit failed(operation, detail); }
     using Fields = PortalHttp::Fields;
     using Headers = PortalHttp::Headers;
     using Handler = PortalHttp::Handler;
 
-    bool isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const;
-    bool isCurrentHistory(bool task, const QString &key, const QString &dialog) const;
+    bool isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const override;
+    bool isCurrentHistory(bool task, const QString &key, const QString &dialog) const override;
 
     struct WorktimeExport;
     void resetWorktime();
@@ -280,11 +291,11 @@ private:
     void updateHistoryCatchup(bool restart = false);
     bool canAutoRefreshChats() const { return m_foreground || m_workspaceVisible; }
     void updateChatViewActivity(bool wasWatching);
-    void rejectSession();
+    void rejectSession() override;
     void confirmSession(quint64 revision, std::function<void(bool)> onConfirmed = {});
     void cancelSessionConfirmation();
-    bool refreshCsrf(Session candidate, quint64 revision);
-    void scheduleRefresh();
+    bool refreshCsrf(Session candidate, quint64 revision) override;
+    void scheduleRefresh() override;
     void refreshDirtyViews();
     void invalidateTaskChat(const QString &taskId);
     void setOnline(bool online);

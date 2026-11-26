@@ -737,9 +737,8 @@ bool trustedSocket(const QUrl &url, const QUrl &portal, bool allowLoopback)
 
 CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     : Backend(parent), m_session(std::move(session)), m_allowLoopback(allowLoopback),
-      m_portalHttp(*this), m_socket(OriginGuard(m_session.origin).resolve(QStringLiteral("/")).toString(QUrl::RemovePath))
+      m_portalHttp(*this, m_http, this), m_socket(OriginGuard(m_session.origin).resolve(QStringLiteral("/")).toString(QUrl::RemovePath))
 {
-    connect(&m_portalHttp, &PortalHttp::failed, this, &CloudBackend::failed);
     m_http.setProxy(QNetworkProxy::NoProxy);
     m_socket.setProxy(QNetworkProxy::NoProxy);
     m_socket.setMaxAllowedIncomingFrameSize(PortalHttp::maxResponse);
@@ -1056,6 +1055,17 @@ void CloudBackend::updateHistoryCatchup(bool restart)
         m_historyCatchup.start();
     else if (!shouldRun)
         m_historyCatchup.stop();
+}
+
+void CloudBackend::applyRenewedSession(const Session &renewed)
+{
+    if (!renewed.isValid()) {
+        rejectSession();
+    } else if (renewed.cookie != m_session.cookie || renewed.csrf != m_session.csrf) {
+        m_session = renewed;
+        ++m_sessionRevision;
+        emit sessionUpdated(m_session);
+    }
 }
 
 void CloudBackend::rejectSession()

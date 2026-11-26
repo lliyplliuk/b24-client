@@ -11,18 +11,38 @@
 #include <optional>
 
 class QIODevice;
+class QNetworkAccessManager;
 class QNetworkReply;
 class TestCloudBackend;
 
 namespace bx {
 
-class CloudBackend;
+class PortalSession {
+public:
+    virtual ~PortalSession() = default;
+    virtual const Session &currentSession() const = 0;
+    virtual quint64 sessionRevision() const = 0;
+    virtual quint64 accountScopeRevision() const = 0;
+    virtual bool started() const = 0;
+    virtual bool authExpired() const = 0;
+    virtual bool allowLoopback() const = 0;
+    virtual bool isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const = 0;
+    virtual bool isCurrentHistory(bool task, const QString &key, const QString &dialog) const = 0;
+    virtual void rejectSession() = 0;
+    virtual bool refreshCsrf(Session candidate, quint64 revision) = 0;
+    virtual void scheduleRefresh() = 0;
+    virtual void confirmPortalSession(quint64 revision) = 0;
+    virtual void reconnectPortal() = 0;
+    virtual void retryHistory(const QString &key, const QString &dialog, bool task) = 0;
+    virtual void applyRenewedSession(const Session &renewed) = 0;
+    virtual void portalRequestFailed(const QString &operation, const QString &detail) = 0;
+};
 
 class PortalHttp final : public QObject {
     Q_OBJECT
 
 public:
-    explicit PortalHttp(CloudBackend &backend);
+    PortalHttp(PortalSession &session, QNetworkAccessManager &network, QObject *parent);
     using Fields = QList<QPair<QString, QString>>;
     using Headers = QList<QPair<QByteArray, QByteArray>>;
     struct Handler {
@@ -73,7 +93,8 @@ public:
 
     static bool sessionUsable(const Session &session, bool allowLoopback);
     static constexpr qsizetype maxResponse = 2 * 1024 * 1024;
-    bool atCapacity() const { return m_requests.size() >= 12; }
+    static constexpr qsizetype maxRequests = 12;
+    bool atCapacity() const { return m_requests.size() >= maxRequests; }
     bool contains(const QString &key) const { return m_inflightOperations.contains(key); }
     void reserve(const QString &key) { m_inflightOperations.insert(key, nullptr); }
     void release(const QString &key) { m_inflightOperations.remove(key); }
@@ -89,12 +110,10 @@ public:
     void invalidateHistory(bool task);
     void beginHistory(const QString &dialog, bool task, bool retry);
 
-signals:
-    void failed(const QString &operation, const QString &detail);
-
 private:
     friend class ::TestCloudBackend;
-    CloudBackend &m_backend;
+    PortalSession &m_session;
+    QNetworkAccessManager &m_network;
     struct InflightRequest;
     bool scheduleHistoryRetry(const QString &operation, quint64 revision, const std::shared_ptr<InflightRequest> &pending);
     QHash<QNetworkReply *, QString> m_requests;

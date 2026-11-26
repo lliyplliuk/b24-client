@@ -6783,13 +6783,18 @@ void TestCloudBackend::learnsRotatedCredentialsFromAcceptedPortalReplies()
 
     CloudBackend backend(fixture.session(), true);
     QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
+    QSignalSpy updated(&backend, &CloudBackend::sessionUpdated);
     backend.start();
+    const auto revision = backend.m_sessionRevision;
     backend.requestChatMessages(QStringLiteral("chat91"));
     QTRY_COMPARE(history.size(), 1);
 
-    fixture.chatResponseHeaders.clear();
+    QCOMPARE(updated.size(), 1);
+    QCOMPARE(backend.m_sessionRevision, revision + 1);
     backend.requestChatMessages(QStringLiteral("chat91"));
     QTRY_COMPARE(history.size(), 2);
+    QCOMPARE(updated.size(), 1);
+    QCOMPARE(backend.m_sessionRevision, revision + 1);
 
     const auto requests = fixture.requestsFor(QStringLiteral("im.v2.Chat.load"));
     QCOMPARE(requests.size(), 2);
