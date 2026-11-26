@@ -1,5 +1,7 @@
 #include "cloud_backend.h"
 
+#include "cloud_badge_data.h"
+
 #include "core/origin_guard.h"
 #include "core/tunables.h"
 
@@ -16,38 +18,15 @@ namespace bx {
 namespace {
 
 constexpr qint64 badgeRefreshIntervalMs = 15 * 1000;
-constexpr qsizetype maxBadgeEntries = 4096;
+using badge_data::maxBadgeEntries;
+using badge_data::positiveId;
 constexpr qsizetype maxPendingAnchorEvents = 64;
 constexpr qsizetype maxVisibleReadIds = 25;
-constexpr qsizetype projectUnreadBatchSize = 50;
-constexpr qsizetype projectUnreadAttemptLimit = 100;
 const QString snapshotOperation = operationKey(OperationKind::ChatBadgesSnapshot);
 
 int visibleUnreadCount(int unread, bool marked)
 {
     return std::max(unread, static_cast<int>(marked));
-}
-
-qint64 positiveId(const QJsonValue &value)
-{
-    bool ok = false;
-    const auto id = value.isString() ? value.toString().toLongLong(&ok) : value.toInteger();
-    return id > 0 && (!value.isString() || ok) ? id : 0;
-}
-
-std::optional<qint64> nonnegativeId(const QJsonValue &value)
-{
-    bool parsed = true;
-    const auto id = value.isString() ? value.toString().toLongLong(&parsed) : value.toInteger(-1);
-    return parsed && id >= 0 ? std::optional<qint64>(id) : std::nullopt;
-}
-
-std::optional<qint64> matchingIds(const QJsonValue &first, const QJsonValue &second)
-{
-    if (first.isUndefined())
-        return nonnegativeId(second);
-    const auto id = nonnegativeId(first);
-    return second.isUndefined() || id == nonnegativeId(second) ? id : std::nullopt;
 }
 
 QJsonObject launchConfig(QStringView source)
@@ -200,8 +179,7 @@ void CloudBackend::applyChatCounterSnapshot(const QJsonArray &rows, quint64 revi
     for (const auto &badge : std::as_const(counters))
         m_chatCounterSnapshotTotal += visibleUnreadCount(badge.unread, badge.marked);
     m_chatCounterBadges = std::move(counters);
-    m_projectUnreadParentsByChat = std::move(taskParents);
-    m_projectUnreadNonTaskChats = std::move(nonTaskChats);
+    m_projects.setChatClassification(std::move(taskParents), std::move(nonTaskChats));
     for (auto it = m_recentOverlays.begin(); it != m_recentOverlays.end(); ++it) {
         if (it->counterRevision <= revision) {
             it->counter.reset();
@@ -269,19 +247,18 @@ void CloudBackend::publishUnreadChatCount()
         m_unreadChatCount = total;
         emit unreadChatCountChanged(total);
     }
-    publishProjectUnreadCounts();
+    m_projects.publishProjectUnreadCounts();
 }
 
-QHash<qint64, int> CloudBackend::projectUnreadCandidates() const
+QHash<qint64, int> CloudBackend::chatMessageCounters() const
 {
     QHash<qint64, int> candidates;
     for (auto it = m_chatCounterBadges.cbegin(); it != m_chatCounterBadges.cend(); ++it) {
-        if (it->messageCount > 0 && !m_projectUnreadNonTaskChats.contains(it.key()))
+        if (it->messageCount > 0)
             candidates.insert(it.key(), it->messageCount);
     }
     for (auto it = m_recentOverlays.cbegin(); it != m_recentOverlays.cend(); ++it) {
-        if (!it->counter || it->chatId <= 0 || it.key() != QStringLiteral("chat") + QString::number(it->chatId)
-            || m_projectUnreadNonTaskChats.contains(it->chatId))
+        if (!it->counter || it->chatId <= 0 || it.key() != QStringLiteral("chat") + QString::number(it->chatId))
             continue;
         if (*it->counter > 0)
             candidates.insert(it->chatId, *it->counter);
@@ -291,231 +268,8 @@ QHash<qint64, int> CloudBackend::projectUnreadCandidates() const
     return candidates;
 }
 
-void CloudBackend::publishProjectUnreadCounts(bool force)
-{
-    if (!force && (m_activeSection != 1 || !m_foreground))
-        return;
-    const auto candidates = projectUnreadCandidates();
-    QHash<QString, qint64> counts;
-    bool complete = m_haveCounterSnapshot;
-    for (auto it = candidates.cbegin(); it != candidates.cend(); ++it) {
-        const auto direct = m_projectUnreadTasksByChat.value(it.key());
-        const auto project = direct.project >= 0 ? direct.project
-            : m_projectUnreadGroupsByParent.value(m_projectUnreadParentsByChat.value(it.key()), -1);
-        if (project > 0)
-            counts[QString::number(project)] += it.value();
-        else if (project < 0)
-            complete = false;
-    }
-    if (force || counts != m_projectUnreadCounts || complete != m_projectUnreadComplete) {
-        m_projectUnreadCounts = std::move(counts);
-        m_projectUnreadComplete = complete;
-        emit projectUnreadCountsChanged(m_projectUnreadCounts, m_projectUnreadComplete);
-    }
-    if ((!complete || !m_projectUnreadMovedTasks.isEmpty()) && m_haveCounterSnapshot && m_started && m_foreground && !m_authExpired
-        && m_activeSection == 1 && !m_projectUnreadPending)
-        resolveProjectUnreadChats(candidates);
-}
-
-void CloudBackend::rememberProjectUnreadTask(qint64 chat, qint64 task, qint64 project)
-{
-    if (chat <= 0 || task <= 0 || project < -1 || m_projectUnreadNonTaskChats.contains(chat))
-        return;
-    if (m_projectUnreadTasksByChat.size() >= maxBadgeEntries && !m_projectUnreadTasksByChat.contains(chat))
-        return;
-    auto &known = m_projectUnreadTasksByChat[chat];
-    if (known.task > 0 && known.task != task)
-        return;
-    known.task = task;
-    if (project >= 0)
-        known.project = project;
-}
-
-void CloudBackend::rememberProjectUnreadTaskChat(const Chat &chat)
-{
-    if (chat.taskChat && chat.serverChatId > 0 && chat.id == QStringLiteral("chat") + QString::number(chat.serverChatId))
-        rememberProjectUnreadTask(chat.serverChatId, chat.taskId.toLongLong(), -1);
-}
-
-void CloudBackend::updateProjectUnreadTask(qint64 task, qint64 chat, qint64 project)
-{
-    if (task <= 0 || project < 0)
-        return;
-    ++m_projectUnreadBindingRevision;
-    if (chat <= 0) {
-        for (auto it = m_projectUnreadTasksByChat.cbegin(); it != m_projectUnreadTasksByChat.cend(); ++it) {
-            if (it->task == task) {
-                chat = it.key();
-                break;
-            }
-        }
-    }
-    if (chat > 0) {
-        m_projectUnreadMovedTasks.remove(task);
-        rememberProjectUnreadTask(chat, task, project);
-    } else if (m_haveCounterSnapshot && (m_projectUnreadMovedTasks.contains(task)
-               || (!m_projectUnreadMoveAttempts.contains(task)
-                   && m_projectUnreadMoveAttempts.size() + m_projectUnreadMovedTasks.size() < projectUnreadBatchSize))) {
-        m_projectUnreadMovedTasks.insert(task, project);
-    }
-    publishProjectUnreadCounts();
-}
-
-void CloudBackend::resolveProjectUnreadChats(const QHash<qint64, int> &candidates)
-{
-    if (!m_projectUnreadMovedTasks.isEmpty()) {
-        QHash<qint64, qint64> changes;
-        for (auto it = m_projectUnreadMovedTasks.cbegin(); it != m_projectUnreadMovedTasks.cend(); ++it) {
-            if (!m_projectUnreadMoveAttempts.contains(it.key())) {
-                m_projectUnreadMoveAttempts.insert(it.key());
-                changes.insert(it.key(), 0);
-            }
-        }
-        if (!changes.isEmpty()) {
-            resolveProjectUnreadTasks(changes);
-            return;
-        }
-    }
-    auto ids = candidates.keys();
-    std::sort(ids.begin(), ids.end());
-    QSet<qint64> parents, directChats;
-    QHash<qint64, qint64> tasks;
-    for (const auto chat : ids) {
-        if (parents.size() + directChats.size() + tasks.size() >= projectUnreadBatchSize
-            || m_projectUnreadParentAttempts.size() + m_projectUnreadTaskChatAttempts.size() >= projectUnreadAttemptLimit)
-            break;
-        const auto known = m_projectUnreadTasksByChat.value(chat);
-        if (known.project >= 0)
-            continue;
-        const auto parent = m_projectUnreadParentsByChat.value(chat);
-        if (m_projectUnreadGroupsByParent.contains(parent) || parents.contains(parent))
-            continue;
-        if (parent > 0 && !m_projectUnreadParentAttempts.contains(parent)) {
-            parents.insert(parent);
-            m_projectUnreadParentAttempts.insert(parent);
-        } else if (!m_projectUnreadTaskChatAttempts.contains(chat)) {
-            m_projectUnreadTaskChatAttempts.insert(chat);
-            if (known.task > 0)
-                tasks.insert(known.task, chat);
-            else
-                directChats.insert(chat);
-        }
-    }
-    if (parents.isEmpty() && directChats.isEmpty()) {
-        if (!tasks.isEmpty())
-            resolveProjectUnreadTasks(tasks);
-        return;
-    }
-    const auto commandKey = [](qint64 chat) { return QStringLiteral("lookup_") + QString::number(chat); };
-    Fields fields{{QStringLiteral("halt"), QStringLiteral("0")}};
-    auto lookups = parents + directChats;
-    for (const auto chat : std::as_const(lookups)) {
-        fields.append({QStringLiteral("cmd[%1]").arg(commandKey(chat)),
-                       QStringLiteral("im.dialog.get?DIALOG_ID=chat%1").arg(chat)});
-    }
-    const auto scope = m_accountScopeRevision;
-    const auto operation = operationKey(OperationKind::ProjectUnreadDialogs);
-    m_projectUnreadPending = true;
-    const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
-    m_portalHttp.webRequest(url, std::move(fields), operation, QStringLiteral("result"),
-        [this, scope, parents, directChats, tasks = std::move(tasks), commandKey](QJsonValue response) mutable {
-        if (scope != m_accountScopeRevision)
-            return;
-        m_projectUnreadPending = false;
-        const auto rows = response.toObject().value(QStringLiteral("result")).toObject();
-        const auto read = [&rows, &commandKey](qint64 id) {
-            const auto row = rows.value(commandKey(id)).toObject();
-            if (positiveId(row.value(QStringLiteral("id"))) != id
-                || row.value(QStringLiteral("dialog_id")).toString() != QStringLiteral("chat") + QString::number(id))
-                return QJsonObject{};
-            return row;
-        };
-        for (const auto parent : parents) {
-            const auto row = read(parent);
-            const auto link = row.value(QStringLiteral("entity_link")).toObject();
-            const auto project = positiveId(row.value(QStringLiteral("entity_id")));
-            if (m_projectUnreadGroupsByParent.size() < maxBadgeEntries
-                && row.value(QStringLiteral("type")) == QLatin1String("collab")
-                && row.value(QStringLiteral("entity_type")) == QLatin1String("SONET_GROUP")
-                && link.value(QStringLiteral("type")) == QLatin1String("SONET_GROUP")
-                && project > 0 && positiveId(link.value(QStringLiteral("id"))) == project)
-                m_projectUnreadGroupsByParent.insert(parent, project);
-        }
-        for (const auto chat : directChats) {
-            const auto row = read(chat);
-            const auto link = row.value(QStringLiteral("entity_link")).toObject();
-            const auto type = row.value(QStringLiteral("entity_type"));
-            const auto linkType = link.value(QStringLiteral("type")).toString();
-            const auto task = positiveId(row.value(QStringLiteral("entity_id")));
-            if ((type == QLatin1String("TASKS_TASK") || type == QLatin1String("TASKS"))
-                && (linkType.isEmpty() || linkType == QLatin1String("TASKS_TASK") || linkType == QLatin1String("TASKS"))
-                && task > 0 && positiveId(link.value(QStringLiteral("id"))) == task) {
-                rememberProjectUnreadTask(chat, task, -1);
-                if (m_projectUnreadTasksByChat.value(chat).task == task)
-                    tasks.insert(task, chat);
-            } else if (type == QLatin1String("SONET_GROUP") && !m_projectUnreadParentsByChat.contains(chat)
-                       && !m_projectUnreadTasksByChat.contains(chat)) {
-                // A typeless counter can only be excluded after its exact chat metadata is seen.
-                m_projectUnreadNonTaskChats.insert(chat);
-            }
-        }
-        if (!tasks.isEmpty() && m_activeSection == 1 && m_foreground && !m_authExpired)
-            resolveProjectUnreadTasks(tasks);
-        publishProjectUnreadCounts();
-    }, operation + QLatin1Char(':') + QString::number(scope));
-}
-
-void CloudBackend::resolveProjectUnreadTasks(const QHash<qint64, qint64> &tasks)
-{
-    Fields fields;
-    int index = 0;
-    for (auto it = tasks.cbegin(); it != tasks.cend(); ++it)
-        fields.append({QStringLiteral("filter[ID][%1]").arg(index++), QString::number(it.key())});
-    for (const auto *name : {"ID", "GROUP_ID", "CHAT_ID"})
-        fields.append({QStringLiteral("select[]"), QLatin1String(name)});
-    const auto scope = m_accountScopeRevision;
-    const auto operation = operationKey(OperationKind::ProjectUnreadTasks);
-    m_projectUnreadPending = true;
-    const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.list.json"));
-    m_portalHttp.webRequest(url, std::move(fields), operation, QStringLiteral("result"), [this, scope, tasks](QJsonValue response) {
-        if (scope != m_accountScopeRevision)
-            return;
-        m_projectUnreadPending = false;
-        const auto rows = response.toObject().value(QStringLiteral("tasks")).toArray();
-        if (rows.size() <= projectUnreadBatchSize) {
-            for (const auto &value : rows) {
-                const auto row = value.toObject();
-                const auto task = matchingIds(row.value(QStringLiteral("id")), row.value(QStringLiteral("ID")));
-                const auto chat = matchingIds(row.value(QStringLiteral("chatId")), row.value(QStringLiteral("CHAT_ID")));
-                const auto group = matchingIds(row.value(QStringLiteral("groupId")), row.value(QStringLiteral("GROUP_ID")));
-                const auto groupObject = row.value(QStringLiteral("group")).toObject();
-                const auto nestedGroup = matchingIds(groupObject.value(QStringLiteral("id")), groupObject.value(QStringLiteral("ID")));
-                if (!task || !chat || *task <= 0 || *chat <= 0 || !tasks.contains(*task)
-                    || !group || (!groupObject.isEmpty() && group != nestedGroup))
-                    continue;
-                const auto expected = tasks.value(*task);
-                const auto known = m_projectUnreadTasksByChat.value(*chat);
-                if (expected == 0 && known.project < 0
-                    && (m_projectUnreadParentsByChat.contains(*chat) || known.task == *task)) {
-                    const auto move = m_projectUnreadMovedTasks.constFind(*task);
-                    if (move != m_projectUnreadMovedTasks.cend())
-                        rememberProjectUnreadTask(*chat, *task, move.value());
-                } else if (expected == *chat && known.project < 0) {
-                    rememberProjectUnreadTask(*chat, *task, *group);
-                }
-            }
-        }
-        for (auto it = tasks.cbegin(); it != tasks.cend(); ++it) {
-            if (it.value() == 0)
-                m_projectUnreadMovedTasks.remove(it.key());
-        }
-        publishProjectUnreadCounts();
-    }, operation + QLatin1Char(':') + QString::number(scope));
-}
-
 void CloudBackend::resetChatCounters()
 {
-    resetProjectTaskChats();
     ++m_recentStatusGeneration;
     m_chatBadgeRevision = 0;
     m_chatCounterSnapshotRevision = 0;
@@ -525,25 +279,10 @@ void CloudBackend::resetChatCounters()
     m_haveCounterSnapshot = false;
     m_chatCounterSnapshotTotal = 0;
     m_chatCounterBadges.clear();
-    m_projectUnreadParentsByChat.clear();
-    m_projectUnreadNonTaskChats.clear();
-    m_projectUnreadTasksByChat.clear();
-    m_projectUnreadGroupsByParent.clear();
-    m_projectUnreadParentAttempts.clear();
-    m_projectUnreadTaskChatAttempts.clear();
-    m_projectUnreadMovedTasks.clear();
-    m_projectUnreadMoveAttempts.clear();
-    m_projectUnreadPending = false;
     m_recentOverlays.clear();
     m_recentChatItems.clear();
     m_recentTaskChatItems.clear();
     m_legacyTaskChats.clear();
-    if (!m_projectUnreadCounts.isEmpty() || m_projectUnreadComplete) {
-        m_projectUnreadCounts.clear();
-        m_projectUnreadComplete = false;
-        emit projectUnreadCountsChanged({}, false);
-    }
-    publishUnreadChatCount();
 }
 
 qint64 CloudBackend::badgeChatId(const QString &dialog) const
@@ -701,16 +440,7 @@ void CloudBackend::republishChatBadges(qint64 changedChatId)
         publishRecentChats(m_recentChatItems, false);
     if (affected(m_recentTaskChatItems))
         publishRecentChats(m_recentTaskChatItems, true);
-    publishProjectTaskChatBadges(changedChatId);
-}
-
-void CloudBackend::resetProjectTaskChats()
-{
-    m_projectTaskChatsProject.clear();
-    m_projectTaskChatsRequest.clear();
-    m_projectTaskChatsNext = -1;
-    m_projectTaskIds.clear();
-    m_projectTaskChatIds.clear();
+    m_projects.publishProjectTaskChatBadges(changedChatId);
 }
 
 void CloudBackend::decorateProjectTaskChat(Chat &chat) const
@@ -723,27 +453,6 @@ void CloudBackend::decorateProjectTaskChat(Chat &chat) const
         chat.unread = *live->counter;
     if (live->markedUnread)
         chat.markedUnread = *live->markedUnread;
-}
-
-void CloudBackend::publishProjectTaskChatBadges(qint64 chatId)
-{
-    if (m_projectTaskChatsProject.isEmpty() || m_projectTaskChatIds.isEmpty()
-        || (chatId > 0 && !m_projectTaskChatIds.contains(chatId)))
-        return;
-    QVector<Chat> badges;
-    const auto append = [this, &badges](qint64 id) {
-        Chat chat;
-        chat.id = QStringLiteral("chat") + QString::number(id);
-        chat.serverChatId = id;
-        decorateProjectTaskChat(chat);
-        badges.append(std::move(chat));
-    };
-    if (chatId > 0)
-        append(chatId);
-    else
-        for (auto id : std::as_const(m_projectTaskChatIds))
-            append(id);
-    emit projectTaskChatBadgesChanged(m_projectTaskChatsProject, badges);
 }
 
 void CloudBackend::readChatMessages(const QString &dialog, const QStringList &incoming, const QStringList &visible)

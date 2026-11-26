@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cloud/portal_http.h"
+#include "cloud/projects_service.h"
 #include "core/backend.h"
 #include "core/session.h"
 #include "core/tunables.h"
@@ -26,7 +26,7 @@ namespace bx {
 
 namespace signin { class SessionRestore; }
 
-class CloudBackend final : public Backend, private PortalSession {
+class CloudBackend final : public Backend, private PortalSession, private ProjectsHost {
     Q_OBJECT
 
 public:
@@ -155,6 +155,12 @@ private:
     void retryHistory(const QString &key, const QString &dialog, bool task) override { loadMessages(key, dialog, task, true); }
     void applyRenewedSession(const Session &renewed) override;
     void portalRequestFailed(const QString &operation, const QString &detail) override { emit failed(operation, detail); }
+    QString currentUserId() const override { return m_userId; }
+    QUrl projectFileUrl(const QString &value, qint64 size) const override { return registerMessageFileUrl(value, size, false); }
+    bool projectsVisible() const override { return m_activeSection == 1 && m_foreground; }
+    bool hasCounterSnapshot() const override { return m_haveCounterSnapshot; }
+    QHash<qint64, int> chatMessageCounters() const override;
+
     using Fields = PortalHttp::Fields;
     using Headers = PortalHttp::Headers;
     using Handler = PortalHttp::Handler;
@@ -187,16 +193,11 @@ private:
     void componentAction(const QString &action, const Fields &fields, const QString &operation, Handler onData,
                          const QString &component = QStringLiteral("bitrix:tasks.kanban"), const QString &requestKey = {});
     QUrl actionUrl(const QString &action) const;
-    void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser);
+    void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser) override;
     void requestCurrentUser(const QString &operation, std::function<void(const QString &)> onUser,
                             const std::shared_ptr<Session> &candidate = {});
     void resetAccountScopedState();
     void rememberCurrentUser(const QString &id);
-    Fields boardFields(const QString &projectId) const;
-    Task boardTask(const QJsonObject &item, const QString &id, const QString &projectId,
-                   const QString &stageId, const QString &stageName) const;
-    void boardMutation(const QString &action, const QString &projectId, Fields fields,
-                       Handler onData = {});
     void updateTaskFields(const QString &taskId, QQueue<QPair<QString, QJsonObject>> writes,
                           const QString &requestKey = {});
     void updateTaskRequisite(const QString &taskId, const TaskEdit &edit);
@@ -204,24 +205,11 @@ private:
                   std::function<void(QJsonObject)> onTask, const QString &requestKey = {}, bool remember = true);
     void finishTaskCardRead(const QString &taskId);
     void loadPerson(const QString &id, const QString &operation, PersonHandler onPerson, bool requireName = false);
-    Project projectFromApiRow(const QJsonObject &row) const;
-    void loadLinkProject(const QString &id, const QString &operation,
-                         std::function<void(Project, QString)> complete);
-    using ProjectStagesHandler = std::function<void(std::optional<QVector<Stage>>)>;
-    void loadProjectStages(const QString &projectId, const QString &operation, ProjectStagesHandler complete);
-    void loadLinkStage(const QString &projectId, const QString &stageId, std::function<void(Stage)> complete);
     QUrl taskRoleAvatar(const QJsonObject &current, const QJsonObject &legacy, const QString &personId) const;
-    struct LinkStageSnapshot {
-        QVector<Stage> stages;
-        qint64 expiresAt = 0;
-    };
-    QCache<QString, LinkStageSnapshot> m_linkStageSnapshots{tunables::kPageSizeProjects};
-    QHash<QString, QVector<std::function<void(const QVector<Stage> &)>>> m_pendingLinkStages;
     void createTaskRequest(const QString &projectId, const QString &parentId, const TaskEdit &edit);
     void loadTaskChecklist(const QString &taskId, const QString &operation,
                            std::function<void(QJsonArray, QJsonValue)> handler);
     void updateTaskChecklist(const QString &taskId, const QString &action, QJsonObject payload);
-    void loadProjectTimeline(const QString &projectId, int offset, QVector<Task> tasks);
     void loadMessages(const QString &key, const QString &dialogId, bool task, bool retry = false);
     void resumeHistoriesWithIdentity();
     void loadRecentChats(bool task, bool badgesOnly = false);
@@ -240,24 +228,7 @@ private:
     QString recentTitle(const QString &dialog, const QString &fallback) const;
     Chat chatFromMetadata(const QString &dialog, const QJsonObject &row, const QJsonObject &chat,
                           const QJsonObject &user);
-    QString projectPinSettingsKey() const;
     void fetchPortalHtml(const QUrl &url, std::function<void(QString)> handler);
-    void loadProjectGrid(const QUrl &url, bool discovery);
-    void loadProjectFallback(qint64 offset);
-    void publishProjectPage(QVector<Project> rows);
-    void loadProjectDiskItems(const QString &projectId, const QString &folderId, int offset);
-    struct ProjectDisk {
-        QString id;
-        QString root;
-        QSet<QString> folders;
-    };
-    QHash<QString, ProjectDisk> m_projectDisks;
-    QVector<Project> m_loadedProjects;
-    QUrl m_nextProjectGridPage;
-    qint64 m_nextProjectOffset = -1;
-    bool m_loadingProjects = false;
-    bool m_taskProjectScope = false;
-    int m_emptyProjectPages = 0;
     void sendMessage(const QString &key, const QString &dialogId, const QString &text, bool task,
                      const QString &replyId = {});
     void sendTaskMessage(const QString &taskId, const QString &text, const QString &replyId);
@@ -299,10 +270,10 @@ private:
     void refreshDirtyViews();
     void invalidateTaskChat(const QString &taskId);
     void setOnline(bool online);
-    void failShape(const QString &operation);
+    void failShape(const QString &operation) override;
 
     enum class RasterRegistration { Primary, Standby };
-    QUrl avatarUrlFromPortal(const QString &value) const;
+    QUrl avatarUrlFromPortal(const QString &value) const override;
     QUrl messageImageUrlFromPortal(const QString &value, const QString &fileId, bool previewField,
                                   RasterRegistration registration = RasterRegistration::Primary) const;
     QUrl taskImageUrlFromPortal(const QString &value, const QString &attachmentId, const QString &objectId,
@@ -468,11 +439,11 @@ private:
     bool m_recentDirty = false;
     bool m_chatDirty = false;
     bool m_taskMessagesDirty = false;
-    bool m_boardDirty = false;
     bool m_notificationsDirty = false;
     int m_attempt = 0;
     QNetworkAccessManager m_http;
     PortalHttp m_portalHttp;
+    ProjectsService m_projects;
     QWebSocket m_socket;
     QTimer m_retry;
     QTimer m_watchdog;
@@ -519,20 +490,11 @@ private:
         }
     };
     struct PendingAnchorEvent { QString command; QJsonObject params; quint64 revision; };
-    void loadChatBadges();
+    void loadChatBadges() override;
     void applyChatCounterSnapshot(const QJsonArray &rows, quint64 revision);
     void publishUnreadChatCount();
-    QHash<qint64, int> projectUnreadCandidates() const;
-    void publishProjectUnreadCounts(bool force = false);
-    void resolveProjectUnreadChats(const QHash<qint64, int> &candidates);
-    void resolveProjectUnreadTasks(const QHash<qint64, qint64> &tasks);
-    void rememberProjectUnreadTask(qint64 chat, qint64 task, qint64 project);
-    void rememberProjectUnreadTaskChat(const Chat &chat);
-    void updateProjectUnreadTask(qint64 task, qint64 chat, qint64 project);
     void resetChatCounters();
-    void resetProjectTaskChats();
-    void decorateProjectTaskChat(Chat &chat) const;
-    void publishProjectTaskChatBadges(qint64 chatId = 0);
+    void decorateProjectTaskChat(Chat &chat) const override;
     qint64 badgeChatId(const QString &dialog) const;
     void decorateChatBadges(Chat &chat) const;
     bool updateAnchors(const QString &command, const QJsonObject &params, quint64 revision);
@@ -557,25 +519,6 @@ private:
     qint64 m_chatCounterSnapshotTotal = 0;
     std::optional<qint64> m_unreadChatCount;
     QHash<qint64, ChatCounterBadge> m_chatCounterBadges;
-    QHash<qint64, qint64> m_projectUnreadParentsByChat;
-    QSet<qint64> m_projectUnreadNonTaskChats;
-    struct ProjectUnreadTask { qint64 task = 0; qint64 project = -1; };
-    QHash<qint64, ProjectUnreadTask> m_projectUnreadTasksByChat;
-    QHash<qint64, qint64> m_projectUnreadGroupsByParent;
-    QSet<qint64> m_projectUnreadParentAttempts;
-    QSet<qint64> m_projectUnreadTaskChatAttempts;
-    QHash<qint64, qint64> m_projectUnreadMovedTasks;
-    QSet<qint64> m_projectUnreadMoveAttempts;
-    QHash<QString, qint64> m_projectUnreadCounts;
-    bool m_projectUnreadComplete = false;
-    bool m_projectUnreadPending = false;
-    quint64 m_projectUnreadBindingRevision = 0;
-    QString m_projectTaskChatsProject;
-    QString m_projectTaskChatsRequest;
-    quint64 m_projectTaskChatsSerial = 0;
-    int m_projectTaskChatsNext = -1;
-    QSet<QString> m_projectTaskIds;
-    QSet<qint64> m_projectTaskChatIds;
     QHash<qint64, QVector<ChatBadgeAnchor>> m_chatAnchors;
     QVector<PendingAnchorEvent> m_pendingAnchorEvents;
     struct PendingRecentPull { QString command; QString dialog; QString chatId; QJsonObject params; QJsonObject extra; };
@@ -623,22 +566,6 @@ private:
     QString m_time;
     QString m_openDialog;
     QString m_openTask;
-    QString m_openBoard;
-    struct BoardColumnCursor {
-        QString stageName;
-        QString stageColor;
-        std::optional<qsizetype> total;
-        QSet<QString> seen;
-        QJsonArray deferred;
-        qsizetype deferredOffset = 0;
-        int nextPage = 2;
-        bool serverExhausted = false;
-
-        bool hasMore() const { return !deferred.isEmpty() || (!serverExhausted && total && *total > seen.size()); }
-    };
-    void publishDeferredBoardTasks(const QString &projectId, const QString &stageId, BoardColumnCursor &cursor);
-    QHash<QString, BoardColumnCursor> m_boardColumnCursors;
-    quint64 m_boardPageGeneration = 0;
     QString m_userId;
 
 };

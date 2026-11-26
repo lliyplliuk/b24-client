@@ -75,6 +75,17 @@ public:
         }
     };
 
+    void ajax(const QString &action, Fields fields, const QString &operation, Handler onData,
+              const QString &requestKey = {});
+    void ajaxJson(const QString &action, const QJsonObject &body, const QString &operation, Handler onData,
+                  const QString &requestKey = {});
+    void ajaxJson(QUrl url, const QJsonObject &body, const QString &operation, Handler onData,
+                  const QString &requestKey = {});
+    void componentAction(const QString &action, const Fields &fields, const QString &operation, Handler onData,
+                         const QString &component = QStringLiteral("bitrix:tasks.kanban"), const QString &requestKey = {});
+    QUrl actionUrl(const QString &action) const;
+    void fetchPortalHtml(const QUrl &url, std::function<void(QString)> handler);
+
     // An occupied key admits only matching subscribers to an idempotent buffered read.
     // Other duplicates, including mutations and uploads, are dropped without another POST.
     // Use distinct keys for distinct parameters that must run concurrently. A shared read

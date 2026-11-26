@@ -98,6 +98,95 @@ PortalHttp::PortalHttp(PortalSession &session, QNetworkAccessManager &network, Q
 {
 }
 
+void PortalHttp::ajax(const QString &action, Fields fields, const QString &operation, Handler handler,
+                      const QString &requestKey)
+{
+    webRequest(actionUrl(action), fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
+}
+
+QUrl PortalHttp::actionUrl(const QString &action) const
+{
+    QUrl url = OriginGuard(m_session.currentSession().origin).resolve(QStringLiteral("/bitrix/services/main/ajax.php"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("action"), action);
+    url.setQuery(query);
+    return url;
+}
+
+void PortalHttp::ajaxJson(const QString &action, const QJsonObject &body, const QString &operation,
+                          Handler handler, const QString &requestKey)
+{
+    ajaxJson(actionUrl(action), body, operation, std::move(handler), requestKey);
+}
+
+void PortalHttp::ajaxJson(QUrl url, const QJsonObject &body, const QString &operation,
+                          Handler handler, const QString &requestKey)
+{
+    auto *buffer = new QBuffer;
+    buffer->setData(QJsonDocument(body).toJson(QJsonDocument::Compact));
+    buffer->open(QIODevice::ReadOnly);
+    webRequestRaw(std::move(url), buffer, {{"Content-Type", "application/json"}}, operation,
+                  QStringLiteral("data"), std::move(handler), requestKey);
+}
+
+void PortalHttp::componentAction(const QString &action, const Fields &fields,
+                                 const QString &operation, Handler handler, const QString &component,
+                                 const QString &requestKey)
+{
+    QUrl url = OriginGuard(m_session.currentSession().origin).resolve(QStringLiteral("/bitrix/services/main/ajax.php"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("mode"), QStringLiteral("class"));
+    query.addQueryItem(QStringLiteral("c"), component);
+    query.addQueryItem(QStringLiteral("action"), action);
+    url.setQuery(query);
+    webRequest(url, fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
+}
+
+void PortalHttp::fetchPortalHtml(const QUrl &url, std::function<void(QString)> handler)
+{
+    const auto &credentials = m_session.currentSession();
+    if (!m_session.started() || m_session.authExpired() || !sessionUsable(credentials, m_session.allowLoopback())
+        || !OriginGuard(credentials.origin).isSameOrigin(url) || !url.userInfo().isEmpty() || url.hasFragment()
+        || atCapacity()) {
+        handler({});
+        return;
+    }
+    QNetworkRequest request(url);
+    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
+    request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
+    request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
+    request.setAttribute(QNetworkRequest::AuthenticationReuseAttribute, QNetworkRequest::Manual);
+    request.setRawHeader("Cookie", credentials.cookie);
+    request.setRawHeader("Accept", "text/html");
+    request.setTransferTimeout(8000);
+    auto *reply = m_network.get(request);
+    track(reply);
+    reply->setReadBufferSize(maxResponse + 1);
+    QTimer::singleShot(8000, reply, [reply] {
+        if (!reply->isFinished())
+            reply->abort();
+    });
+    connect(reply, &QIODevice::readyRead, this, [reply] {
+        if (reply->bytesAvailable() > maxResponse)
+            reply->abort();
+    });
+    connect(reply, &QNetworkReply::finished, this, [this, reply, scope = m_session.accountScopeRevision(), handler = std::move(handler)] {
+        untrack(reply);
+        reply->deleteLater();
+        if (!m_session.started() || scope != m_session.accountScopeRevision())
+            return;
+        m_session.scheduleRefresh();
+        const auto contentType = reply->rawHeader("Content-Type").split(';').first().trimmed().toLower();
+        if (reply->error() != QNetworkReply::NoError
+            || reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200
+            || contentType != "text/html" || reply->bytesAvailable() > maxResponse) {
+            handler({});
+            return;
+        }
+        handler(QString::fromUtf8(reply->readAll()));
+    });
+}
+
 bool PortalHttp::sessionUsable(const Session &session, bool allowLoopback)
 {
     if (!session.isValid() || !session.origin.userInfo().isEmpty()

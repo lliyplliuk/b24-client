@@ -1197,6 +1197,7 @@ private slots:
     void findsProjectTasksOutsideInitialBoard();
     void loadsBoardColumnsLazilyWithoutSkippingFirstPage();
     void discardsBoardPagesFromPreviousSnapshots();
+    void accountChangeDiscardsDeferredBoardTasksAndKnownProjectFolders();
     void refusesToDeleteStageWithoutConfirmedEmptyTotal();
     void resolvesCurrentCreationOwnerWithoutRecentIdentity();
     void createsTasksWithSelectedRequisites();
@@ -3956,6 +3957,58 @@ void TestCloudBackend::discardsBoardPagesFromPreviousSnapshots()
     QCOMPARE(page.count(), 3);
     QVERIFY(failed.isEmpty());
     QCOMPARE(page.last().at(2).value<QVector<Task>>().first().id, QStringLiteral("43"));
+}
+
+void TestCloudBackend::accountChangeDiscardsDeferredBoardTasksAndKnownProjectFolders()
+{
+    using namespace Qt::StringLiterals;
+    CloudFixture fixture;
+    fixture.boardPagingFixture = true;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,"recentItems":[],"chats":[]})";
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy accounts(&backend, &Backend::accountScopeChanged);
+    QSignalSpy boards(&backend, &Backend::boardLoaded);
+    QSignalSpy pages(&backend, &Backend::boardTasksPageLoaded);
+    QSignalSpy files(&backend, &Backend::projectFilesLoaded);
+    QSignalSpy failures(&backend, &Backend::failed);
+    backend.setForeground(false);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 1);
+
+    const auto project = u"17"_s;
+    const auto stage = u"60"_s;
+    const auto folder = u"77"_s;
+    backend.requestProjectBoard(project);
+    backend.requestProjectFiles(project, {}, 0);
+    QTRY_COMPARE(boards.size(), 1);
+    QTRY_COMPARE(files.size(), 1);
+    backend.requestProjectFiles(project, folder, 0);
+    QTRY_COMPARE(files.size(), 2);
+
+    fixture.currentUserId = 22;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 2);
+    failures.clear();
+    backend.requestMoreBoardTasks(project, stage);
+    backend.requestProjectFiles(project, folder, 0);
+    QCOMPARE(failures.size(), 2);
+    QCOMPARE(failures.at(0).first().toString(), operationKey(OperationKind::BoardColumn, project, stage));
+    QCOMPARE(failures.at(1).first().toString(), operationKey(OperationKind::ProjectFiles, project, folder));
+    QVERIFY(pages.isEmpty());
+    QCOMPARE(files.size(), 2);
+
+    backend.requestProjectBoard(project);
+    backend.requestProjectFiles(project, {}, 0);
+    QTRY_COMPARE(boards.size(), 2);
+    QTRY_COMPARE(files.size(), 3);
+    backend.requestMoreBoardTasks(project, stage);
+    backend.requestProjectFiles(project, folder, 0);
+    QTRY_COMPARE(pages.size(), 1);
+    QTRY_COMPARE(files.size(), 4);
+    QCOMPARE(failures.size(), 2);
 }
 
 void TestCloudBackend::overlappingTaskChatTitles()
