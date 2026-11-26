@@ -56,8 +56,6 @@ const QString notifyOnComputer = QStringLiteral("notifySchemeSendSite");
 const QString simpleNotifyScheme = QStringLiteral("simple");
 const QStringList simpleChannels{notifyOnComputer, QStringLiteral("notifySchemeSendEmail"),
                                  QStringLiteral("notifySchemeSendPush")};
-constexpr qsizetype maxResponse = 2 * 1024 * 1024;
-constexpr int maxRequests = 12;
 constexpr int maxSeenEvents = 256;
 constexpr int maxNotifications = 100;
 constexpr int notificationPageSize = 50;
@@ -232,69 +230,6 @@ bool mutedListContains(const QJsonValue &list, const QString &user)
         return std::any_of(entries.cbegin(), entries.cend(), [&user](const QJsonValue &entry) { return string(entry) == user; });
     }
     return list.toObject().value(user).toBool();
-}
-
-bool shareableRead(OperationKind kind)
-{
-    // A read step inside a mutation still belongs to that mutation.
-    switch (kind) {
-    case OperationKind::Chats:
-    case OperationKind::TaskChats:
-    case OperationKind::ProjectPageFallback:
-    case OperationKind::ProjectPinIdentity:
-    case OperationKind::SettingsIdentity:
-    case OperationKind::RecentUserStatus:
-    case OperationKind::ChatSoundSettings:
-    case OperationKind::ChatHistoryIdentity:
-    case OperationKind::SessionKeepalive:
-    case OperationKind::Notifications:
-    case OperationKind::NotificationsOlder:
-    case OperationKind::ChatHistoryRead:
-    case OperationKind::ChatHistorySnapshot:
-    case OperationKind::TaskMessages:
-    case OperationKind::TaskChatTitles:
-    case OperationKind::TaskChatTitlesRequest:
-    case OperationKind::ProjectTaskChats:
-    case OperationKind::ChatBadgesSnapshot:
-    case OperationKind::ProjectUnreadDialogs:
-    case OperationKind::ProjectUnreadTasks:
-    case OperationKind::PortalStatus:
-    case OperationKind::PortalStatusBootstrap:
-    case OperationKind::Person:
-    case OperationKind::CurrentPerson:
-    case OperationKind::SearchPeople:
-    case OperationKind::ProjectFiles:
-    case OperationKind::ProjectMembers:
-    case OperationKind::ProjectStages:
-    case OperationKind::Board:
-    case OperationKind::BoardColumn:
-    case OperationKind::SearchProjectTasks:
-    case OperationKind::Task:
-    case OperationKind::TaskDetails:
-    case OperationKind::TaskFiles:
-    case OperationKind::Checklist:
-    case OperationKind::Subtasks:
-    case OperationKind::GanttLinks:
-    case OperationKind::TaskHistory:
-    case OperationKind::Timeline:
-    case OperationKind::LinkPreview:
-    case OperationKind::LinkPreviewStage:
-    case OperationKind::LinkPreviewChatAssets:
-    case OperationKind::MessageContext:
-    case OperationKind::MessageViewers:
-    case OperationKind::Pins:
-    case OperationKind::ChatAssets:
-    case OperationKind::OlderChat:
-    case OperationKind::SearchChat:
-    case OperationKind::SearchTaskChat:
-    case OperationKind::SearchChats:
-    case OperationKind::SearchTaskChats:
-    case OperationKind::SearchNotifications:
-    case OperationKind::NotificationSettings:
-        return true;
-    default:
-        return false;
-    }
 }
 
 std::optional<bool> dismissedPersonalUser(const QString &dialog, const QJsonObject &row, const QJsonObject &user)
@@ -783,15 +718,6 @@ QString noticeAuthorName(const QString &id, const QJsonValue &users)
     return matchedName(object.contains(id) ? object.value(id).toObject() : object);
 }
 
-bool safeHeader(const QByteArray &header)
-{
-    return !header.isEmpty() && header.size() < 16384
-        && std::none_of(header.cbegin(), header.cend(), [](char character) {
-            const auto byte = static_cast<unsigned char>(character);
-            return byte < 32 || byte == 127;
-        });
-}
-
 bool trustedSocket(const QUrl &url, const QUrl &portal, bool allowLoopback)
 {
     if (!url.isValid() || !url.userInfo().isEmpty() || url.hasFragment() || url.hasQuery()
@@ -807,26 +733,17 @@ bool trustedSocket(const QUrl &url, const QUrl &portal, bool allowLoopback)
         || host.endsWith(QLatin1String(".bitrix24.com")) || host.endsWith(QLatin1String(".bitrix.info"));
 }
 
-bool sessionUsable(const Session &session, bool allowLoopback)
-{
-    if (!session.isValid() || !session.origin.userInfo().isEmpty()
-        || !safeHeader(session.cookie) || !safeHeader(session.csrf))
-        return false;
-    return session.origin.scheme() == QLatin1String("https")
-        || (allowLoopback && OriginGuard::isLoopback(session.origin)
-            && session.origin.scheme() == QLatin1String("http"));
-}
-
 } // namespace
 
 CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     : Backend(parent), m_session(std::move(session)), m_allowLoopback(allowLoopback),
-      m_socket(OriginGuard(m_session.origin).resolve(QStringLiteral("/")).toString(QUrl::RemovePath))
+      m_portalHttp(*this), m_socket(OriginGuard(m_session.origin).resolve(QStringLiteral("/")).toString(QUrl::RemovePath))
 {
+    connect(&m_portalHttp, &PortalHttp::failed, this, &CloudBackend::failed);
     m_http.setProxy(QNetworkProxy::NoProxy);
     m_socket.setProxy(QNetworkProxy::NoProxy);
-    m_socket.setMaxAllowedIncomingFrameSize(maxResponse);
-    m_socket.setMaxAllowedIncomingMessageSize(maxResponse);
+    m_socket.setMaxAllowedIncomingFrameSize(PortalHttp::maxResponse);
+    m_socket.setMaxAllowedIncomingMessageSize(PortalHttp::maxResponse);
     for (auto timer : {&m_retry, &m_watchdog, &m_heartbeat, &m_refresh, &m_configExpiry})
         timer->setSingleShot(true);
 
@@ -887,7 +804,7 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
         m_attempt = 0;
         m_watchdog.stop();
         m_heartbeat.start(heartbeatIntervalMs);
-        const bool refreshPopupSettings = m_resumed && (!m_chatPopupSettings.isEmpty() || m_inflightOperations.contains(soundsOp));
+        const bool refreshPopupSettings = m_resumed && (!m_chatPopupSettings.isEmpty() || m_portalHttp.contains(soundsOp));
         if (m_resumed) {
             for (auto &state : m_dialogMessageStates)
                 state.muteFromPull = false;
@@ -934,7 +851,7 @@ void CloudBackend::start()
     m_authExpired = false;
     m_resumed = false;
     m_attempt = 0;
-    if (!sessionUsable(m_session, m_allowLoopback)) {
+    if (!PortalHttp::sessionUsable(m_session, m_allowLoopback)) {
         emit failed(pushOp, QStringLiteral("Для подключения нужны HTTPS, Cookie и CSRF веб-сессии"));
         return;
     }
@@ -964,7 +881,7 @@ void CloudBackend::resetAccountScopedState()
 {
     ++m_accountScopeRevision;
     resetWorktime();
-    const auto pending = m_requests;
+    const auto pending = m_portalHttp.pendingRequests();
 
     cancelSessionConfirmation();
     m_portalStatus.clear();
@@ -1024,7 +941,7 @@ void CloudBackend::resetAccountScopedState()
     // Resume history updates only when a view requests them for the new account.
     m_openDialog.clear();
     m_openTask.clear();
-    resetHistoryRetries();
+    m_portalHttp.resetHistoryRetries();
     m_recentDirty = false;
     m_chatDirty = false;
     m_taskMessagesDirty = false;
@@ -1041,15 +958,7 @@ void CloudBackend::resetAccountScopedState()
     resetChatCounters();
     resetNoticeState();
 
-    // abort() can synchronously notify consumers. Only cancel requests from before the reset.
-    for (const auto &[reply, key] : pending.asKeyValueRange()) {
-        // The pending clipboard upload owns the staged file, which a new upload may still open.
-        // Its account-specific key allows the new request, and its stale response cannot advance the upload.
-        if (m_started && parseOperation(key).kind == OperationKind::ChatImageUpload)
-            continue;
-        if (m_requests.contains(reply))
-            reply->abort();
-    }
+    m_portalHttp.reset(pending);
 }
 
 void CloudBackend::setOnline(bool online)
@@ -1089,8 +998,8 @@ void CloudBackend::updateChatViewActivity(bool wasWatching)
         return;
     if (!watching) {
         m_refresh.stop();
-        ++m_chatHistoryRetry.revision;
-        ++m_taskHistoryRetry.revision;
+        m_portalHttp.invalidateHistory(false);
+        m_portalHttp.invalidateHistory(true);
     } else if (!m_foreground && m_started) {
         if (m_activeSection == 0) {
             m_recentDirty = true;
@@ -1108,7 +1017,7 @@ void CloudBackend::setActiveSection(int section)
         return;
     m_activeSection = section;
     if (section != 0)
-        ++m_chatHistoryRetry.revision;
+        m_portalHttp.invalidateHistory(false);
     if (section == 1) {
         m_projectUnreadParentAttempts.clear();
         m_projectUnreadTaskChatAttempts.clear();
@@ -1122,12 +1031,12 @@ void CloudBackend::setActiveSection(int section)
 void CloudBackend::clearOpenHistory(bool task)
 {
     if (task) {
-        ++m_taskHistoryRetry.revision;
+        m_portalHttp.invalidateHistory(true);
         m_openTask.clear();
         m_taskMessagesDirty = false;
         m_taskPopupHistory = {};
     } else {
-        ++m_chatHistoryRetry.revision;
+        m_portalHttp.invalidateHistory(false);
         m_openDialog.clear();
         m_chatDirty = false;
         m_chatPopupHistory = {};
@@ -1154,8 +1063,8 @@ void CloudBackend::rejectSession()
     if (m_authExpired)
         return;
     m_authExpired = true;
-    ++m_chatHistoryRetry.revision;
-    ++m_taskHistoryRetry.revision;
+    m_portalHttp.invalidateHistory(false);
+    m_portalHttp.invalidateHistory(true);
     m_messageViewerMembership.clear();
     m_messageViewerCounts.clear();
     ++m_sessionRevision;
@@ -1219,7 +1128,7 @@ void CloudBackend::confirmSession(quint64 revision, std::function<void(bool)> on
         if (result == signin::RestoreStatus::Rejected)
             rejectSession();
         const bool accepted = result == signin::RestoreStatus::Authenticated
-            && verified.origin == m_session.origin && sessionUsable(verified, m_allowLoopback);
+            && verified.origin == m_session.origin && PortalHttp::sessionUsable(verified, m_allowLoopback);
         if (accepted && (verified.csrf != m_session.csrf || verified.cookie != m_session.cookie)) {
             m_session = verified;
             ++m_sessionRevision;
@@ -1234,10 +1143,10 @@ void CloudBackend::confirmSession(quint64 revision, std::function<void(bool)> on
 
 bool CloudBackend::refreshCsrf(Session candidate, quint64 revision)
 {
-    if (m_inflightOperations.contains(csrfRefreshOp))
+    if (m_portalHttp.contains(csrfRefreshOp))
         return true;
     auto verified = std::make_shared<Session>(std::move(candidate));
-    webRequest(actionUrl(QStringLiteral("im.v2.Recent.load")),
+    m_portalHttp.webRequest(actionUrl(QStringLiteral("im.v2.Recent.load")),
                {{QStringLiteral("filter[recentSection]"), QStringLiteral("default")},
                 {QStringLiteral("limit"), QStringLiteral("1")}},
                csrfRefreshOp, QStringLiteral("data"), [this, verified, revision](const QJsonValue &data) {
@@ -1257,7 +1166,7 @@ bool CloudBackend::refreshCsrf(Session candidate, quint64 revision)
         emit sessionUpdated(m_session);
         invalidateActiveView();
     }, {}, verified);
-    return m_inflightOperations.contains(csrfRefreshOp);
+    return m_portalHttp.contains(csrfRefreshOp);
 }
 
 void CloudBackend::invalidateActiveView()
@@ -1293,7 +1202,7 @@ void CloudBackend::refreshDirtyViews()
     if (!m_started || !canAutoRefreshChats() || m_authExpired)
         return;
     const auto takeDirty = [this](bool &dirty, const QString &operation) {
-        if (!dirty || m_requests.size() >= maxRequests || m_inflightOperations.contains(operation))
+        if (!dirty || m_portalHttp.atCapacity() || m_portalHttp.contains(operation))
             return false;
         dirty = false;
         return true;
@@ -1331,293 +1240,19 @@ void CloudBackend::invalidateTaskChat(const QString &taskId)
     scheduleRefresh();
 }
 
-void CloudBackend::webRequest(QUrl url, const Fields &fields, const QString &operation,
-                              const QString &envelope, Handler onData, const QString &requestKey,
-                              const std::shared_ptr<Session> &candidate, bool includeResponseMeta,
-                              std::optional<RequestPolicy> policyOverride)
+bool CloudBackend::isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const
 {
-    QByteArray encoded;
-    const auto appendField = [&encoded](const QString &key, const QString &value) {
-        if (!encoded.isEmpty())
-            encoded += '&';
-        encoded += QUrl::toPercentEncoding(key);
-        encoded += '=';
-        encoded += QUrl::toPercentEncoding(value);
-    };
-    appendField(QStringLiteral("sessid"), QString::fromLatin1(candidate ? candidate->csrf : m_session.csrf));
-    for (const auto &field : fields)
-        appendField(field.first, field.second);
-    auto *buffer = new QBuffer;
-    buffer->setData(std::move(encoded));
-    buffer->open(QIODevice::ReadOnly);
-    webRequestRaw(std::move(url), buffer,
-                  {{"Content-Type", "application/x-www-form-urlencoded; charset=UTF-8"}},
-                  operation, envelope, std::move(onData), requestKey, candidate, includeResponseMeta, policyOverride);
-}
-
-QString CloudBackend::scopedRequestKey(const QString &operation, RequestPolicy policy, const QString &requestKey) const
-{
-    if (policy == RequestPolicy::AccountScoped)
-        return operation + QLatin1Char(':') + QString::number(m_accountScopeRevision);
-    return requestKey.isEmpty() ? operation : requestKey;
-}
-
-struct CloudBackend::InflightRequest {
-    QUrl url;
-    Headers headers;
-    std::optional<QByteArray> bufferedBody;
-    QString operation;
-    RequestPolicy policy;
-    QString envelope;
-    quint64 scope;
-    quint64 revision;
-    std::shared_ptr<Session> candidate;
-    bool includeResponseMeta;
-    QList<Handler> handlers;
-    bool waitingForHistoryRetry = false;
-
-    void notify(CloudBackend *backend, const QJsonValue &value, const QString &error = {}) const
-    {
-        QPointer<CloudBackend> alive(backend);
-        for (const auto &handler : handlers) {
-            if (!alive || !backend->m_started || scope != backend->m_accountScopeRevision)
-                return;
-            if (error.isEmpty())
-                handler.onData(value);
-            else
-                handler.reject(error, policy == RequestPolicy::Optional);
-        }
-    }
-};
-
-void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &headers,
-                                 const QString &operation, const QString &envelope, Handler onData,
-                                 const QString &requestKey, const std::shared_ptr<Session> &candidate,
-                                 bool includeResponseMeta, std::optional<RequestPolicy> policyOverride)
-{
-    std::unique_ptr<QIODevice> ownedBody(body);
-    const auto accountScope = m_accountScopeRevision;
-    const auto kind = parseOperation(operation).kind;
-    const auto policy = policyOverride.value_or(defaultRequestPolicy(kind));
-    const auto key = scopedRequestKey(operation, policy, requestKey);
-    const bool historySnapshot = policy == RequestPolicy::HistorySnapshot;
-    const bool latestHistory = historySnapshot || policy == RequestPolicy::HistoryRead;
-    const auto historyRevision = (latestHistory && parseOperation(key).kind == OperationKind::TaskMessages
-        ? m_taskHistoryRetry : m_chatHistoryRetry).revision;
-    const auto failedOperation = latestHistory ? key : operation;
-    const auto rejectRequest = [&](const QString &reason) {
-        const bool optional = policy == RequestPolicy::Optional;
-        QPointer<CloudBackend> alive(this);
-        const auto detail = optional && onData.accepts ? onData.invalidMessage : reason;
-        if (!optional || onData.accepts)
-            emit failed(failedOperation, detail);
-        if (alive && accountScope == m_accountScopeRevision)
-            onData.reject(detail, optional);
-    };
-    auto *buffer = qobject_cast<QBuffer *>(body);
-    const auto revision = m_sessionRevision;
-    if (m_inflightOperations.contains(key)) {
-        const auto pending = m_inflightOperations.value(key);
-        if (buffer && pending && shareableRead(kind) && pending->scope == accountScope
-            && pending->revision == revision && pending->policy == policy && pending->candidate == candidate
-            && pending->operation == operation && pending->url == url && pending->headers == headers && pending->bufferedBody
-            && *pending->bufferedBody == buffer->data() && pending->envelope == envelope
-            && pending->includeResponseMeta == includeResponseMeta)
-            pending->handlers.append(std::move(onData));
-        return;
-    }
-    const auto &credentials = candidate ? *candidate : m_session;
-    if (m_authExpired && !candidate) {
-        rejectRequest(QStringLiteral("Вход в портал истёк. Обновите подключение."));
-        return;
-    }
-    if (!sessionUsable(credentials, m_allowLoopback) || credentials.origin != m_session.origin
-        || !url.userInfo().isEmpty() || url.hasFragment() || !OriginGuard(m_session.origin).isSameOrigin(url)) {
-        rejectRequest(QStringLiteral("Импортируйте действующую веб-сессию портала"));
-        return;
-    }
-    if (m_requests.size() >= maxRequests) {
-        rejectRequest(QStringLiteral("Дождитесь завершения текущих запросов"));
-        if (operation == pushOp)
-            scheduleReconnect();
-        return;
-    }
-    if (!body || !body->isReadable()) {
-        rejectRequest(QStringLiteral("Не удалось прочитать данные запроса"));
-        return;
-    }
-    QNetworkRequest request(url);
-    request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
-    request.setAttribute(QNetworkRequest::CookieLoadControlAttribute, QNetworkRequest::Manual);
-    request.setAttribute(QNetworkRequest::CookieSaveControlAttribute, QNetworkRequest::Manual);
-    bool upload = false;
-    for (const auto &[name, value] : headers) {
-        const auto normalized = name.toLower();
-        if ((normalized != "content-type" && normalized != "content-range"
-             && !normalized.startsWith("x-upload-")) || !safeHeader(value)) {
-            rejectRequest(QStringLiteral("Некорректные параметры запроса"));
-            return;
-        }
-        upload = upload || normalized == "x-upload-content-name";
-        request.setRawHeader(name, value);
-    }
-    request.setTransferTimeout(upload ? 60000 : 12000);
-    request.setRawHeader("Cookie", credentials.cookie);
-    request.setRawHeader("X-Bitrix-Csrf-Token", credentials.csrf);
-    request.setRawHeader("Accept", "application/json");
-    request.setRawHeader("X-Requested-With", "XMLHttpRequest");
-    request.setRawHeader("BX-Ajax", "true");
-    const auto online = OriginGuard(m_session.origin).resolve(QStringLiteral("/online/"));
-    request.setRawHeader("Origin", online.toEncoded(QUrl::RemovePath));
-    request.setRawHeader("Referer", online.toEncoded());
-
-    auto *reply = m_http.post(request, body);
-    ownedBody.release()->setParent(reply);
-    m_requests.insert(reply, key);
-    auto pending = std::make_shared<InflightRequest>(InflightRequest{
-        url, headers, buffer ? std::optional<QByteArray>(buffer->data()) : std::nullopt, operation, policy, envelope,
-        accountScope, revision, candidate, includeResponseMeta, {std::move(onData)}});
-    m_inflightOperations.insert(key, pending);
-    if (operation == sessionRecoveryOp)
-        m_sessionRecoveryReply = reply;
-    reply->setReadBufferSize(maxResponse + 1);
-    auto *deadline = new QTimer(reply);
-    deadline->setSingleShot(true);
-    connect(deadline, &QTimer::timeout, reply, &QNetworkReply::abort);
-    deadline->start(upload ? 300000 : 15000);
-    connect(reply, &QIODevice::readyRead, this, [reply] {
-        if (reply->bytesAvailable() > maxResponse)
-            reply->abort();
-    });
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, operation, kind, policy, key, envelope, revision, candidate, historySnapshot, latestHistory, historyRevision, failedOperation,
-             accountScope, includeResponseMeta, pending] {
-        m_requests.remove(reply);
-        reply->deleteLater();
-        if (operation == sessionRecoveryOp) {
-            if (m_sessionRecoveryReply != reply)
-                return;
-            m_sessionRecoveryReply = nullptr;
-        }
-        m_inflightOperations.remove(key, pending);
-        if (!m_started)
-            return;
-        if (accountScope != m_accountScopeRevision) {
-            // These operations leave controls busy until they receive a terminal signal.
-            if (key == operation && policy == RequestPolicy::NotifyAccountChange)
-                emit failed(operation, QStringLiteral("Аккаунт изменился. Результат запроса не подтверждён."));
-            return;
-        }
-        scheduleRefresh();
-        if (kind == OperationKind::ProjectTaskChats
-            && key != m_projectTaskChatsRequest)
-            return;
-        if (key != operation
-            && (kind == OperationKind::Board || kind == OperationKind::BoardColumn)
-            && key != boardReadKey(operation, m_boardPageGeneration))
-            return;
-
-        const QPointer<CloudBackend> alive(this);
-        const auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const bool redirect = status >= 300 && status < 400;
-        const bool complete = reply->isOpen() && reply->bytesAvailable() <= maxResponse && !redirect;
-        const auto document = complete ? QJsonDocument::fromJson(reply->readAll()) : QJsonDocument();
-        const auto object = document.object();
-        const auto location = reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl();
-        const bool denied = signin::isAuthorizationRejection(status, object, reply->url(), location);
-        const auto result = object.value(envelope);
-        const auto errors = object.value(QStringLiteral("errors"));
-        const bool ajaxRejected = envelope == QLatin1String("data")
-            && (object.value(QStringLiteral("status")) != QLatin1String("success")
-                || (!errors.isUndefined() && !errors.isNull() && (!errors.isArray() || !errors.toArray().isEmpty())));
-        const bool failed = reply->error() != QNetworkReply::NoError || redirect || !document.isObject()
-            || object.contains(QStringLiteral("error")) || ajaxRejected || result.isUndefined();
-
-        if (failed) {
-            const auto error = reply->error();
-            const bool transientConnection = status == 0
-                && (error == QNetworkReply::TimeoutError || error == QNetworkReply::OperationCanceledError
-                    || error == QNetworkReply::RemoteHostClosedError || error == QNetworkReply::TemporaryNetworkFailureError
-                    || error == QNetworkReply::ConnectionRefusedError || error == QNetworkReply::NetworkSessionFailedError);
-            const bool temporary = transientConnection || (status >= 500 && status < 600);
-            if (historySnapshot && !denied && !m_authExpired
-                && (temporary || (status >= 200 && status < 300))) {
-                // The separate message list can still be usable if the full chat snapshot fails.
-                pending->notify(this, {});
-                return;
-            }
-            if (latestHistory && !denied && temporary && scheduleHistoryRetry(key, historyRevision, pending))
-                return;
-            if (operation == csrfRefreshOp) {
-                if (denied && revision == m_sessionRevision)
-                    rejectSession();
-                return;
-            }
-            // Some optional endpoints may deny access while the main routes are still usable.
-            const bool lookup = policy == RequestPolicy::Optional;
-            bool refreshing = false;
-            if (denied && (!lookup || operation == sessionKeepaliveOp)
-                && !candidate && revision == m_sessionRevision) {
-                auto retry = signin::csrfRetrySession(m_session, *reply, object);
-                refreshing = retry.isValid() && refreshCsrf(std::move(retry), revision);
-                if (!refreshing) {
-                    if (operation == sessionKeepaliveOp) {
-                        rejectSession();
-                    } else {
-                        confirmSession(revision);
-                        refreshing = true;
-                    }
-                }
-            }
-            QString detail = refreshing ? QStringLiteral("Клиент проверяет вход в портал. Повторите действие после проверки")
-                : denied && revision != m_sessionRevision && !m_authExpired
-                    ? QStringLiteral("Параметры входа обновлены. Повторите действие")
-                : denied ? QStringLiteral("Действие требует новой веб-сессии портала")
-                : status == 403 ? QStringLiteral("Портал запретил действие")
-                : status > 0 ? QStringLiteral("Портал отклонил действие или вернул другой формат (HTTP %1)").arg(status)
-                : QStringLiteral("Ошибка сети или истекло время ожидания");
-            detail += operationErrorHint(kind);
-            const auto &first = pending->handlers.first();
-            if (lookup && first.accepts)
-                detail = first.invalidMessage;
-            if (!lookup || first.accepts)
-                emit this->failed(failedOperation, detail);
-            if (alive)
-                pending->notify(this, {}, detail);
-            if (operation == pushOp && alive && !m_authExpired)
-                scheduleReconnect();
-            return;
-        }
-        if (candidate) {
-            *candidate = signin::updatedSession(*candidate, *reply);
-        } else if (revision == m_sessionRevision) {
-            const auto renewed = signin::updatedSession(m_session, *reply);
-            if (!renewed.isValid()) {
-                rejectSession();
-            } else if (renewed.cookie != m_session.cookie || renewed.csrf != m_session.csrf) {
-                m_session = renewed;
-                ++m_sessionRevision;
-                emit sessionUpdated(m_session);
-            }
-        }
-        if (!alive || !m_started || accountScope != m_accountScopeRevision)
-            return;
-        const auto value = includeResponseMeta ? QJsonValue(object) : result;
-        const auto &first = pending->handlers.first();
-        if (first.accepts && !first.accepts(value)) {
-            emit this->failed(failedOperation, first.invalidMessage);
-            if (alive)
-                pending->notify(this, {}, first.invalidMessage);
-            return;
-        }
-        pending->notify(this, value);
-    });
+    if (kind == OperationKind::ProjectTaskChats)
+        return key == m_projectTaskChatsRequest;
+    if (key != operation && (kind == OperationKind::Board || kind == OperationKind::BoardColumn))
+        return key == boardReadKey(operation, m_boardPageGeneration);
+    return true;
 }
 
 void CloudBackend::ajax(const QString &action, Fields fields, const QString &operation, Handler handler,
                         const QString &requestKey)
 {
-    webRequest(actionUrl(action), fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
+    m_portalHttp.webRequest(actionUrl(action), fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
 }
 
 QUrl CloudBackend::actionUrl(const QString &action) const
@@ -1641,7 +1276,7 @@ void CloudBackend::ajaxJson(QUrl url, const QJsonObject &body, const QString &op
     auto *buffer = new QBuffer;
     buffer->setData(QJsonDocument(body).toJson(QJsonDocument::Compact));
     buffer->open(QIODevice::ReadOnly);
-    webRequestRaw(std::move(url), buffer, {{"Content-Type", "application/json"}}, operation,
+    m_portalHttp.webRequestRaw(std::move(url), buffer, {{"Content-Type", "application/json"}}, operation,
                   QStringLiteral("data"), std::move(handler), requestKey);
 }
 
@@ -1655,7 +1290,7 @@ void CloudBackend::componentAction(const QString &action, const Fields &fields,
     query.addQueryItem(QStringLiteral("c"), component);
     query.addQueryItem(QStringLiteral("action"), action);
     url.setQuery(query);
-    webRequest(url, fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
+    m_portalHttp.webRequest(url, fields, operation, QStringLiteral("data"), std::move(handler), requestKey);
 }
 
 void CloudBackend::failShape(const QString &operation)
@@ -1699,7 +1334,7 @@ void CloudBackend::requestCurrentUser(const QString &operation,
     QUrlQuery query(url);
     query.addQueryItem(QStringLiteral("e"), extension);
     url.setQuery(query);
-    webRequest(url, {{QStringLiteral("extension[0]"), extension}, {QStringLiteral("coreLoaded"), QStringLiteral("Y")}},
+    m_portalHttp.webRequest(url, {{QStringLiteral("extension[0]"), extension}, {QStringLiteral("coreLoaded"), QStringLiteral("Y")}},
                operation, QStringLiteral("data"), [this, extension, operation, optional, onUser = std::move(onUser)](QJsonValue data) {
         if (!data.isArray() && !optional)
             return failShape(operation);
@@ -1724,16 +1359,12 @@ void CloudBackend::requestCurrentUser(const QString &operation,
 
 void CloudBackend::cancelSessionRecovery()
 {
-    if (auto *reply = std::exchange(m_sessionRecoveryReply, nullptr)) {
-        m_requests.remove(reply);
-        m_inflightOperations.remove(sessionRecoveryOp);
-        reply->abort();
-    }
+    m_portalHttp.cancelSessionRecovery();
 }
 
 void CloudBackend::recoverSession(const Session &candidate, std::function<bool()> stillAllowed)
 {
-    if (!m_started || !m_authExpired || m_inflightOperations.contains(sessionRecoveryOp))
+    if (!m_started || !m_authExpired || m_portalHttp.contains(sessionRecoveryOp))
         return;
     if (candidate.origin != m_session.origin || numericId(m_userId).isEmpty()) {
         emit failed(sessionRecoveryOp, QStringLiteral("Чтобы открыть другой портал или аккаунт, выйдите из текущего рабочего окна."));
@@ -1744,7 +1375,7 @@ void CloudBackend::recoverSession(const Session &candidate, std::function<bool()
     requestCurrentUser(sessionRecoveryOp, [this, verified, expectedUser, stillAllowed = std::move(stillAllowed)](const QString &id) {
         if (stillAllowed && !stillAllowed())
             return;
-        if (!sessionUsable(*verified, m_allowLoopback)) {
+        if (!PortalHttp::sessionUsable(*verified, m_allowLoopback)) {
             emit failed(sessionRecoveryOp, QStringLiteral("Портал отклонил новый вход. Обновите подключение ещё раз."));
             return;
         }
@@ -1752,9 +1383,7 @@ void CloudBackend::recoverSession(const Session &candidate, std::function<bool()
             emit failed(sessionRecoveryOp, QStringLiteral("Подключитесь под тем же аккаунтом, чтобы сохранить рабочее окно и черновики."));
             return;
         }
-        const auto pending = m_requests;
-        for (auto *reply : pending.keys())
-            reply->abort();
+        m_portalHttp.abortAll();
         resetWorktime();
         m_session = *verified;
         ++m_sessionRevision;
@@ -1881,7 +1510,7 @@ void CloudBackend::requestProjectTaskChats(const QString &projectId, int offset)
     if (offset == 0) {
         resetProjectTaskChats();
         m_projectTaskChatsProject = projectId;
-    } else if (m_inflightOperations.contains(m_projectTaskChatsRequest)) {
+    } else if (m_portalHttp.contains(m_projectTaskChatsRequest)) {
         return;
     }
     const auto request = operation + QLatin1Char(':') + QString::number(++m_projectTaskChatsSerial);
@@ -1893,7 +1522,7 @@ void CloudBackend::requestProjectTaskChats(const QString &projectId, int offset)
     for (const auto *name : {"ID", "TITLE", "GROUP_ID", "CHAT_ID", "ACTIVITY_DATE"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.list.json"));
-    webRequest(url, fields, operation, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, fields, operation, QStringLiteral("result"),
         [this, projectId, offset, request, operation, bindingRevision](const QJsonValue &response) {
             if (m_projectTaskChatsRequest != request || m_authExpired)
                 return;
@@ -2159,7 +1788,7 @@ void CloudBackend::hydrateRecentUserStatuses(QVector<Chat> chats, const QStringL
         rememberDismissalStatus(id, std::nullopt);
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.list.get.json"));
-    webRequest(url, fields, recentUserStatusOp, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, fields, recentUserStatusOp, QStringLiteral("result"),
                [this, pending = std::move(pending), chats = std::move(chats), generation](QJsonValue data) mutable {
         if (data.isNull() || generation != m_recentStatusGeneration)
             return;
@@ -2485,68 +2114,16 @@ void CloudBackend::resolveTaskChatTitles(QVector<Chat> chats, const QString &key
     }, operationKey(OperationKind::TaskChatTitlesRequest, key, ids.join(QLatin1Char(','))));
 }
 
-void CloudBackend::resetHistoryRetries()
+bool CloudBackend::isCurrentHistory(bool task, const QString &key, const QString &dialog) const
 {
-    // Waiting reads have no live reply for the account reset to abort.
-    m_inflightOperations.removeIf([](decltype(m_inflightOperations)::iterator it) {
-        return it.value() && it.value()->waitingForHistoryRetry;
-    });
-    m_chatHistoryRetry = {};
-    m_taskHistoryRetry = {};
-}
-
-bool CloudBackend::scheduleHistoryRetry(const QString &operation, quint64 revision,
-                                        const std::shared_ptr<InflightRequest> &pending)
-{
-    const auto parsed = parseOperation(operation);
-    const bool task = parsed.kind == OperationKind::TaskMessages;
-    const auto key = parsed.ids.value(0);
-    auto &attempt = task ? m_taskHistoryRetry : m_chatHistoryRetry;
-    const auto dialog = attempt.dialog;
-    const auto scope = m_accountScopeRevision;
-    const auto current = [this, task, key, dialog, revision, scope] {
-        return m_started && canAutoRefreshChats() && !m_authExpired && scope == m_accountScopeRevision
-            && !dialog.isEmpty() && (task ? m_openTask == key && m_taskDialogs.value(key) == dialog
-                                         : m_activeSection == 0 && m_openDialog == dialog)
-            && (task ? m_taskHistoryRetry : m_chatHistoryRetry).revision == revision;
-    };
-    if (attempt.used || !current())
-        return false;
-    attempt.used = true;
-    pending->waitingForHistoryRetry = true;
-    m_inflightOperations.insert(operation, pending);
-    QTimer::singleShot(350, this, [this, key, dialog, task, current, operation, pending] {
-        m_inflightOperations.remove(operation, pending);
-        if (!current()) {
-            // A newer view may have deferred its refresh while this key was occupied.
-            if (pending->scope == m_accountScopeRevision)
-                scheduleRefresh();
-            pending->notify(this, {}, QStringLiteral("Чтение истории больше не актуально"));
-            return;
-        }
-        if (pending->handlers.size() == 1) {
-            loadMessages(key, dialog, task, true);
-            return;
-        }
-        // Subscribers need the failed stage's response. A fresh chat snapshot could
-        // contain messages inline and skip the message-list request they subscribed to.
-        QUrlQuery form(QString::fromUtf8(*pending->bufferedBody));
-        form.removeAllQueryItems(QStringLiteral("sessid"));
-        Handler subscribers{
-            [this, pending](QJsonValue result) { pending->notify(this, result); },
-            [this, pending](const QString &error) { pending->notify(this, {}, error); }
-        };
-        // A replay must retain the effective policy of the request its subscribers joined.
-        webRequest(pending->url, form.queryItems(QUrl::FullyDecoded), pending->operation,
-                   pending->envelope, std::move(subscribers), operation, pending->candidate,
-                   pending->includeResponseMeta, pending->policy);
-    });
-    return true;
+    return canAutoRefreshChats() && !dialog.isEmpty()
+        && (task ? m_openTask == key && m_taskDialogs.value(key) == dialog
+                 : m_activeSection == 0 && m_openDialog == dialog);
 }
 
 void CloudBackend::loadMessages(const QString &key, const QString &dialogId, bool task, bool retry)
 {
-    if (m_userId.isEmpty() && (!m_triedHistoryIdentity || m_inflightOperations.contains(chatIdentityOp))) {
+    if (m_userId.isEmpty() && (!m_triedHistoryIdentity || m_portalHttp.contains(chatIdentityOp))) {
         auto &pending = m_historiesWaitingForIdentity;
         pending.erase(std::remove_if(pending.begin(), pending.end(), [task](const auto &request) {
             return request.task == task;
@@ -2559,12 +2136,9 @@ void CloudBackend::loadMessages(const QString &key, const QString &dialogId, boo
         return;
     }
     const auto operation = operationKey(task ? OperationKind::TaskMessages : OperationKind::Chat, key);
-    if (m_inflightOperations.contains(operation))
+    if (m_portalHttp.contains(operation))
         return;
-    auto &attempt = task ? m_taskHistoryRetry : m_chatHistoryRetry;
-    attempt.dialog = dialogId;
-    ++attempt.revision;
-    attempt.used = retry;
+    m_portalHttp.beginHistory(dialogId, task, retry);
     const auto generation = m_dialogMessageStates.value(dialogId).historyGeneration;
     const auto superseded = [this, key, dialogId, task, generation, scope = m_accountScopeRevision] {
         if (scope != m_accountScopeRevision)
@@ -2784,15 +2358,15 @@ void CloudBackend::requestChatMessages(const QString &dialogId)
         return;
     }
     if (m_openDialog != valid) {
-        ++m_chatHistoryRetry.revision;
+        m_portalHttp.invalidateHistory(false);
         m_openDialog = valid;
         m_chatDirty = false;
         m_chatPopupHistory = {};
     }
     if (m_activeSection == 0)
         updateHistoryCatchup(true);
-    if (m_activeSection == 0 && canAutoRefreshChats() && (m_requests.size() >= maxRequests
-        || m_inflightOperations.contains(operationKey(OperationKind::Chat, dialogId)))) {
+    if (m_activeSection == 0 && canAutoRefreshChats() && (m_portalHttp.atCapacity()
+        || m_portalHttp.contains(operationKey(OperationKind::Chat, dialogId)))) {
         m_chatDirty = true;
         scheduleRefresh();
         return;
@@ -3010,9 +2584,9 @@ QString projectAvatarColor(const QString &value)
 
 void CloudBackend::fetchPortalHtml(const QUrl &url, std::function<void(QString)> handler)
 {
-    if (!m_started || m_authExpired || !sessionUsable(m_session, m_allowLoopback)
+    if (!m_started || m_authExpired || !PortalHttp::sessionUsable(m_session, m_allowLoopback)
         || !OriginGuard(m_session.origin).isSameOrigin(url) || !url.userInfo().isEmpty() || url.hasFragment()
-        || m_requests.size() >= maxRequests) {
+        || m_portalHttp.atCapacity()) {
         handler({});
         return;
     }
@@ -3025,18 +2599,18 @@ void CloudBackend::fetchPortalHtml(const QUrl &url, std::function<void(QString)>
     request.setRawHeader("Accept", "text/html");
     request.setTransferTimeout(8000);
     auto *reply = m_http.get(request);
-    m_requests.insert(reply, {});
-    reply->setReadBufferSize(maxResponse + 1);
+    m_portalHttp.track(reply);
+    reply->setReadBufferSize(PortalHttp::maxResponse + 1);
     QTimer::singleShot(8000, reply, [reply] {
         if (!reply->isFinished())
             reply->abort();
     });
     connect(reply, &QIODevice::readyRead, this, [reply] {
-        if (reply->bytesAvailable() > maxResponse)
+        if (reply->bytesAvailable() > PortalHttp::maxResponse)
             reply->abort();
     });
     connect(reply, &QNetworkReply::finished, this, [this, reply, scope = m_accountScopeRevision, handler = std::move(handler)] {
-        m_requests.remove(reply);
+        m_portalHttp.untrack(reply);
         reply->deleteLater();
         if (!m_started || scope != m_accountScopeRevision)
             return;
@@ -3044,7 +2618,7 @@ void CloudBackend::fetchPortalHtml(const QUrl &url, std::function<void(QString)>
         const auto contentType = reply->rawHeader("Content-Type").split(';').first().trimmed().toLower();
         if (reply->error() != QNetworkReply::NoError
             || reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200
-            || contentType != "text/html" || reply->bytesAvailable() > maxResponse) {
+            || contentType != "text/html" || reply->bytesAvailable() > PortalHttp::maxResponse) {
             handler({});
             return;
         }
@@ -3334,7 +2908,7 @@ void CloudBackend::requestProjectFiles(const QString &projectId, const QString &
         return;
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/disk.storage.getList.json"));
-    webRequest(url, {{QStringLiteral("filter[ENTITY_TYPE]"), QStringLiteral("group")},
+    m_portalHttp.webRequest(url, {{QStringLiteral("filter[ENTITY_TYPE]"), QStringLiteral("group")},
                      {QStringLiteral("filter[ENTITY_ID]"), projectId}}, operation,
                QStringLiteral("result"), Handler::checked(QStringLiteral("Диск проекта недоступен"),
                [](const QJsonValue &data) { return data.isArray(); },
@@ -3364,7 +2938,7 @@ void CloudBackend::loadProjectDiskItems(const QString &projectId, const QString 
     const auto endpoint = folderId.isEmpty() ? QStringLiteral("/rest/disk.storage.getChildren.json")
                                             : QStringLiteral("/rest/disk.folder.getChildren.json");
     const auto url = OriginGuard(m_session.origin).resolve(endpoint);
-    webRequest(url, {{QStringLiteral("id"), folderId.isEmpty() ? disk.id : folderId},
+    m_portalHttp.webRequest(url, {{QStringLiteral("id"), folderId.isEmpty() ? disk.id : folderId},
                      {QStringLiteral("start"), QString::number(offset)}}, operation, QStringLiteral("result"),
                Handler::checked(QStringLiteral("Не удалось получить файлы проекта"),
                [](const QJsonValue &data) { return data.isArray(); },
@@ -3568,7 +3142,7 @@ void CloudBackend::requestProjectBoard(const QString &projectId)
         emit failed(op, QStringLiteral("Некорректный номер проекта"));
         return;
     }
-    if (m_openBoard == projectId && m_inflightOperations.contains(boardReadKey(op, m_boardPageGeneration)))
+    if (m_openBoard == projectId && m_portalHttp.contains(boardReadKey(op, m_boardPageGeneration)))
         return;
     if (m_openBoard != projectId) {
         m_openBoard = projectId;
@@ -3646,12 +3220,12 @@ void CloudBackend::requestMoreBoardTasks(const QString &projectId, const QString
         return;
     }
     const auto generation = m_boardPageGeneration;
-    if (m_inflightOperations.contains(boardReadKey(operationKey(OperationKind::Board, projectId), generation))) {
+    if (m_portalHttp.contains(boardReadKey(operationKey(OperationKind::Board, projectId), generation))) {
         emit failed(operation, QStringLiteral("Дождитесь обновления доски"));
         return;
     }
     const auto key = boardReadKey(operation, generation);
-    if (m_inflightOperations.contains(key))
+    if (m_portalHttp.contains(key))
         return;
     if (!cursor->deferred.isEmpty()) {
         publishDeferredBoardTasks(projectId, stageId, *cursor);
@@ -4063,7 +3637,7 @@ void CloudBackend::updateTask(const QString &taskId, const TaskEdit &edit)
         emit failed(operation, QStringLiteral("Проверьте название и срок задачи"));
         return;
     }
-    if (m_inflightOperations.contains(operation) || m_inflightOperations.contains(taskActionRequestKey(m_accountScopeRevision, taskId)))
+    if (m_portalHttp.contains(operation) || m_portalHttp.contains(taskActionRequestKey(m_accountScopeRevision, taskId)))
         return;
     if (edit.rating && (!m_started || numericId(taskId) != taskId || legacyTaskMark(*edit.rating).isUndefined()))
         return failShape(operation);
@@ -4146,7 +3720,7 @@ void CloudBackend::deleteTask(const QString &taskId)
         return failShape(operation);
     const auto account = m_accountScopeRevision;
     const auto key = taskActionRequestKey(account, taskId);
-    if (m_inflightOperations.contains(key) || m_inflightOperations.contains(operationKey(OperationKind::UpdateTask, taskId)))
+    if (m_portalHttp.contains(key) || m_portalHttp.contains(operationKey(OperationKind::UpdateTask, taskId)))
         return;
     const QJsonObject id{{QStringLiteral("id"), taskId.toLongLong()}};
     ajaxJson(QStringLiteral("tasks.v2.Task.get"), {{QStringLiteral("task"), id}}, operation,
@@ -4161,7 +3735,7 @@ void CloudBackend::deleteTask(const QString &taskId)
             return;
         }
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.delete.json"));
-        webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, QStringLiteral("result"),
+        m_portalHttp.webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, QStringLiteral("result"),
                    [this, taskId, operation, account](QJsonValue result) {
             if (account != m_accountScopeRevision)
                 return;
@@ -4223,7 +3797,7 @@ void CloudBackend::updateTaskRequisite(const QString &taskId, const TaskEdit &ed
             auto *buffer = new QBuffer;
             buffer->setData(QJsonDocument(body).toJson(QJsonDocument::Compact));
             buffer->open(QIODevice::ReadOnly);
-            webRequestRaw(url, buffer, {{"Content-Type", "application/json"}}, operation, QStringLiteral("result"),
+            m_portalHttp.webRequestRaw(url, buffer, {{"Content-Type", "application/json"}}, operation, QStringLiteral("result"),
                           [this, taskId, operation, rating, account](QJsonValue result) {
                 if (account != m_accountScopeRevision)
                     return;
@@ -4911,7 +4485,7 @@ void CloudBackend::requestTaskHistory(const QString &taskId)
         return;
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.history.list.json"));
-    webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, {{QStringLiteral("taskId"), taskId}}, operation, QStringLiteral("result"),
                Handler::checked(QStringLiteral("История задачи недоступна"),
                [](const QJsonValue &data) { return data.toObject().value(QStringLiteral("list")).isArray(); },
                [this, taskId](QJsonValue data) {
@@ -5005,14 +4579,14 @@ void CloudBackend::loadProjectTimeline(const QString &projectId, int offset, QVe
 void CloudBackend::requestTaskMessages(const QString &taskId)
 {
     if (m_openTask != taskId) {
-        ++m_taskHistoryRetry.revision;
+        m_portalHttp.invalidateHistory(true);
         m_openTask = taskId;
         m_taskMessagesDirty = false;
         m_taskPopupHistory = {};
     }
     updateHistoryCatchup(true);
-    if (canAutoRefreshChats() && (m_requests.size() >= maxRequests
-        || m_inflightOperations.contains(operationKey(OperationKind::TaskMessages, taskId)))) {
+    if (canAutoRefreshChats() && (m_portalHttp.atCapacity()
+        || m_portalHttp.contains(operationKey(OperationKind::TaskMessages, taskId)))) {
         m_taskMessagesDirty = true;
         scheduleRefresh();
         return;
@@ -5037,7 +4611,7 @@ void CloudBackend::sendMessage(const QString &key, const QString &dialogId, cons
 {
     const auto scope = operationKey(task ? OperationKind::Task : OperationKind::Chat, key);
     const auto op = operationKey(task ? OperationKind::SendTask : OperationKind::SendChat, key);
-    if (m_inflightOperations.contains(op))
+    if (m_portalHttp.contains(op))
         return;
     if (validDialog(dialogId).isEmpty() || text.trimmed().isEmpty() || text.size() > 20000) {
         emit failed(op, QStringLiteral("Введите сообщение длиной до 20 000 символов"));
@@ -5145,7 +4719,7 @@ void CloudBackend::notificationBatch(const QString &method, const QUrlQuery &par
     if (!parameters.isEmpty())
         command += QLatin1Char('?') + parameters.toString(QUrl::FullyEncoded);
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
-    webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")},
+    m_portalHttp.webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")},
                      {QStringLiteral("cmd[notify]"), command}},
                operation, QStringLiteral("result"),
                [this, operation, onResult = std::move(onResult)](QJsonValue batch) {
@@ -5465,13 +5039,13 @@ void CloudBackend::deleteNotification(const QString &id)
 
 void CloudBackend::connectPull()
 {
-    if (!m_started || m_authExpired || m_inflightOperations.contains(pushOp))
+    if (!m_started || m_authExpired || m_portalHttp.contains(pushOp))
         return;
     auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/pull.config.get.json"));
     QUrlQuery configQuery;
     configQuery.addQueryItem(QStringLiteral("logTag"), QStringLiteral("client_start"));
     url.setQuery(configQuery);
-    webRequest(url, {{QStringLiteral("CACHE"), QStringLiteral("N")}}, pushOp, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, {{QStringLiteral("CACHE"), QStringLiteral("N")}}, pushOp, QStringLiteral("result"),
                [this](QJsonValue response) {
         const auto config = response.toObject();
         const auto server = config.value(QStringLiteral("server")).toObject();
@@ -6313,7 +5887,7 @@ void CloudBackend::updateNotificationSetting(const QString &name, int value)
 void CloudBackend::loadChatPopupSettings()
 {
     const auto now = QDateTime::currentMSecsSinceEpoch();
-    if (m_inflightOperations.contains(soundsOp) || now < m_nextChatPopupSettingsRequest)
+    if (m_portalHttp.contains(soundsOp) || now < m_nextChatPopupSettingsRequest)
         return;
     m_nextChatPopupSettingsRequest = now + 3000;
     const bool hadUser = !m_userId.isEmpty();

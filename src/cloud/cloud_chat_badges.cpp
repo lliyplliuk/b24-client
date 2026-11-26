@@ -121,7 +121,7 @@ QJsonObject messengerConfig(const QString &html)
 
 void CloudBackend::loadChatBadges()
 {
-    if (!m_started || m_authExpired || m_badgePagePending || m_inflightOperations.contains(snapshotOperation)
+    if (!m_started || m_authExpired || m_badgePagePending || m_portalHttp.contains(snapshotOperation)
         || (m_chatBadgeRefresh.isValid() && !m_chatBadgeRefresh.hasExpired(badgeRefreshIntervalMs)))
         return;
     const auto revision = ++m_chatBadgeRevision;
@@ -417,7 +417,7 @@ void CloudBackend::resolveProjectUnreadChats(const QHash<qint64, int> &candidate
     const auto operation = operationKey(OperationKind::ProjectUnreadDialogs);
     m_projectUnreadPending = true;
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
-    webRequest(url, std::move(fields), operation, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, std::move(fields), operation, QStringLiteral("result"),
         [this, scope, parents, directChats, tasks = std::move(tasks), commandKey](QJsonValue response) mutable {
         if (scope != m_accountScopeRevision)
             return;
@@ -477,7 +477,7 @@ void CloudBackend::resolveProjectUnreadTasks(const QHash<qint64, qint64> &tasks)
     const auto operation = operationKey(OperationKind::ProjectUnreadTasks);
     m_projectUnreadPending = true;
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.list.json"));
-    webRequest(url, std::move(fields), operation, QStringLiteral("result"), [this, scope, tasks](QJsonValue response) {
+    m_portalHttp.webRequest(url, std::move(fields), operation, QStringLiteral("result"), [this, scope, tasks](QJsonValue response) {
         if (scope != m_accountScopeRevision)
             return;
         m_projectUnreadPending = false;
@@ -831,7 +831,7 @@ void CloudBackend::readVisibleChat(const QString &dialog, const QStringList &inc
 
     const auto operation = operationKey(OperationKind::ReadVisibleMessages, dialog);
     auto &state = dialogMessageState(dialog);
-    if (m_inflightOperations.contains(operation)) {
+    if (m_portalHttp.contains(operation)) {
         state.pendingReadIds = incoming.mid(0, maxVisibleReadIds);
         state.pendingReadTask = task;
         return;

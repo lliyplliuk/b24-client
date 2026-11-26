@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cloud/portal_http.h"
 #include "core/backend.h"
 #include "core/session.h"
 #include "core/tunables.h"
@@ -142,37 +143,13 @@ signals:
 
 private:
     friend class ::TestCloudBackend;
-    using Fields = QList<QPair<QString, QString>>;
-    using Headers = QList<QPair<QByteArray, QByteArray>>;
-    struct Handler {
-        std::function<void(QJsonValue)> onData;
-        std::function<void(const QString &)> onError;
+    friend class PortalHttp;
+    using Fields = PortalHttp::Fields;
+    using Headers = PortalHttp::Headers;
+    using Handler = PortalHttp::Handler;
 
-        QString invalidMessage;
-        std::function<bool(const QJsonValue &)> accepts;
-
-        Handler() = default;
-        template<typename Callback>
-        Handler(Callback callback, std::function<void(const QString &)> error = {})
-            : onData(std::move(callback)), onError(std::move(error)) {}
-
-        static Handler checked(QString message, std::function<bool(const QJsonValue &)> validate,
-                               std::function<void(QJsonValue)> callback)
-        {
-            Handler handler(std::move(callback));
-            handler.invalidMessage = std::move(message);
-            handler.accepts = std::move(validate);
-            return handler;
-        }
-
-        void reject(const QString &reason, bool emptyFallback) const
-        {
-            if (onError)
-                onError(reason);
-            else if (emptyFallback && !accepts)
-                onData({});
-        }
-    };
+    bool isCurrentResponse(OperationKind kind, const QString &key, const QString &operation) const;
+    bool isCurrentHistory(bool task, const QString &key, const QString &dialog) const;
 
     struct WorktimeExport;
     void resetWorktime();
@@ -198,21 +175,6 @@ private:
                   const QString &requestKey = {});
     void componentAction(const QString &action, const Fields &fields, const QString &operation, Handler onData,
                          const QString &component = QStringLiteral("bitrix:tasks.kanban"), const QString &requestKey = {});
-    // An occupied key admits only matching subscribers to an idempotent buffered read.
-    // Other duplicates, including mutations and uploads, are dropped without another POST.
-    // Use distinct keys for distinct parameters that must run concurrently. A shared read
-    // delivers data or a private error to each subscriber. Required reads emit failed once
-    // per request. Optional lookups can deliver an empty fallback. Stopped backends and
-    // stale account scopes discard replies, except for existing busy-control failures.
-    void webRequest(QUrl url, const Fields &fields, const QString &operation,
-                    const QString &envelope, Handler onData, const QString &requestKey = {},
-                    const std::shared_ptr<Session> &candidate = {}, bool includeResponseMeta = false,
-                    std::optional<RequestPolicy> policyOverride = {});
-    void webRequestRaw(QUrl url, QIODevice *body, const Headers &headers, const QString &operation,
-                       const QString &envelope, Handler onData, const QString &requestKey = {},
-                       const std::shared_ptr<Session> &candidate = {}, bool includeResponseMeta = false,
-                       std::optional<RequestPolicy> policyOverride = {});
-    QString scopedRequestKey(const QString &operation, RequestPolicy policy, const QString &requestKey = {}) const;
     QUrl actionUrl(const QString &action) const;
     void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser);
     void requestCurrentUser(const QString &operation, std::function<void(const QString &)> onUser,
@@ -250,9 +212,6 @@ private:
     void updateTaskChecklist(const QString &taskId, const QString &action, QJsonObject payload);
     void loadProjectTimeline(const QString &projectId, int offset, QVector<Task> tasks);
     void loadMessages(const QString &key, const QString &dialogId, bool task, bool retry = false);
-    struct InflightRequest;
-    bool scheduleHistoryRetry(const QString &operation, quint64 revision, const std::shared_ptr<InflightRequest> &pending);
-    void resetHistoryRetries();
     void resumeHistoriesWithIdentity();
     void loadRecentChats(bool task, bool badgesOnly = false);
     void publishRecentChats(QVector<Chat> chats, bool task);
@@ -502,6 +461,7 @@ private:
     bool m_notificationsDirty = false;
     int m_attempt = 0;
     QNetworkAccessManager m_http;
+    PortalHttp m_portalHttp;
     QWebSocket m_socket;
     QTimer m_retry;
     QTimer m_watchdog;
@@ -510,9 +470,6 @@ private:
     QTimer m_configExpiry;
     QTimer m_historyCatchup;
     QTimer m_sessionKeepalive;
-    QHash<QNetworkReply *, QString> m_requests;
-    QNetworkReply *m_sessionRecoveryReply = nullptr;
-    QMultiHash<QString, std::shared_ptr<InflightRequest>> m_inflightOperations;
     QHash<QString, QString> m_taskDialogs;
     QCache<QString, QString> m_recentTitles{2 * tunables::kPageSizeChats};
     QCache<QString, QString> m_taskChatTitles{2 * tunables::kPageSizeChats};
@@ -672,13 +629,7 @@ private:
     QHash<QString, BoardColumnCursor> m_boardColumnCursors;
     quint64 m_boardPageGeneration = 0;
     QString m_userId;
-    struct HistoryRetry {
-        QString dialog;
-        quint64 revision = 0;
-        bool used = false;
-    };
-    HistoryRetry m_chatHistoryRetry;
-    HistoryRetry m_taskHistoryRetry;
+
 };
 
 } // namespace bx

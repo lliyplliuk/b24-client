@@ -29,6 +29,8 @@ add_library(bxcore STATIC
     src/core/demo_backend.h
     src/core/demo_backend.cpp
     src/cloud/cloud_backend.h
+    src/cloud/portal_http.h
+    src/cloud/portal_http.cpp
     src/cloud/cloud_backend.cpp
     src/cloud/cloud_channels.cpp
     src/cloud/cloud_avatars.cpp

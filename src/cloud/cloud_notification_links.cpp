@@ -450,7 +450,7 @@ void CloudBackend::requestMessageContext(const QString &dialogId, const QString 
         // Loading a context here only needs the read-only command in that batch.
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/batch.json"));
         const auto method = QStringLiteral("im.v2.Chat.Message.getContext?id=%1&range=25").arg(expectedMessage);
-        webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")}, {QStringLiteral("cmd[context]"), method}},
+        m_portalHttp.webRequest(url, {{QStringLiteral("halt"), QStringLiteral("0")}, {QStringLiteral("cmd[context]"), method}},
                    operation, QStringLiteral("result"),
                    [this, dialogId, messageId, canonicalDialog, expectedMessage, chatId, operation](QJsonValue batch) {
             const auto result = batch.toObject().value(QStringLiteral("result")).toObject();
@@ -508,7 +508,7 @@ void CloudBackend::loadPerson(const QString &id, const QString &operation, Perso
 {
     const auto expected = integerId(id);
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.get.json"));
-    webRequest(url, {{QStringLiteral("ID"), expected}}, operation, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, {{QStringLiteral("ID"), expected}}, operation, QStringLiteral("result"),
                [this, expected, requireName, onPerson = std::move(onPerson)](QJsonValue response) {
         const auto profile = response.toObject();
         if (valueId(profile.value(QStringLiteral("id"))) != expected)

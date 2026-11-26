@@ -1191,6 +1191,8 @@ private slots:
     void overlappingTaskSearches();
     void dropsDuplicateSendBeforePosting();
     void rejectedRequestUsesExplicitPolicy();
+    void joinedSubscribersRespectAccountScope_data();
+    void joinedSubscribersRespectAccountScope();
     void overlappingTaskSearchFailure();
     void findsProjectTasksOutsideInitialBoard();
     void loadsBoardColumnsLazilyWithoutSkippingFirstPage();
@@ -4060,15 +4062,45 @@ void TestCloudBackend::rejectedRequestUsesExplicitPolicy()
     };
 
     const auto url = backend.actionUrl(QStringLiteral("tasks.task.history.list"));
-    backend.webRequest(url, {}, operation, QStringLiteral("data"), onData);
+    backend.m_portalHttp.webRequest(url, {}, operation, QStringLiteral("data"), onData);
     QCOMPARE(fallbacks, 1);
     QVERIFY(failures.isEmpty());
 
     // The same optional endpoint is mandatory for this caller.
-    backend.webRequest(url, {}, operation, QStringLiteral("data"), onData, {}, {}, false, RequestPolicy::Required);
+    backend.m_portalHttp.webRequest(url, {}, operation, QStringLiteral("data"), onData, {}, {}, false, RequestPolicy::Required);
     QCOMPARE(fallbacks, 1);
     QCOMPARE(failures.size(), 1);
     QCOMPARE(failures.first().first().toString(), operation);
+}
+
+void TestCloudBackend::joinedSubscribersRespectAccountScope_data()
+{
+    QTest::addColumn<bool>("resetDuringDelivery");
+    QTest::newRow("same-account") << false;
+    QTest::newRow("first-subscriber-resets-account") << true;
+}
+
+void TestCloudBackend::joinedSubscribersRespectAccountScope()
+{
+    using namespace Qt::StringLiterals;
+    QFETCH(bool, resetDuringDelivery);
+    CloudFixture fixture;
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    backend.start();
+    const auto action = u"tasks.task.list"_s;
+    const auto operation = u"search-project-tasks:17"_s;
+    int first = 0, second = 0;
+    backend.ajax(action, {}, operation, [&](QJsonValue) {
+        ++first;
+        if (resetDuringDelivery)
+            backend.resetAccountScopedState();
+    });
+    backend.ajax(action, {}, operation, [&](QJsonValue) { ++second; });
+
+    QTRY_COMPARE(first, 1);
+    QCOMPARE(second, resetDuringDelivery ? 0 : 1);
+    QCOMPARE(fixture.requestsFor(action).size(), 1);
 }
 
 void TestCloudBackend::overlappingTaskSearchFailure()
@@ -5256,7 +5288,7 @@ void TestCloudBackend::recoversLatestHistoryAfterATemporaryFailure()
         backend.requestChatMessages(dialog);
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
     if (mode == QLatin1String("reopen")) {
-        auto *original = backend.m_requests.key(operation);
+        auto *original = backend.m_portalHttp.m_requests.key(operation);
         QVERIFY(original);
         connect(original, &QNetworkReply::finished, &backend, [&] {
             backend.clearOpenHistory(false);
@@ -5342,7 +5374,7 @@ void TestCloudBackend::retriesCoalescedHistoryRead()
                      }, key);
     };
     subscribe();
-    auto *original = backend.m_requests.key(key);
+    auto *original = backend.m_portalHttp.m_requests.key(key);
     QVERIFY(original);
     // Qt runs this after the backend's finished handler has scheduled the retry.
     connect(original, &QNetworkReply::finished, &backend, subscribe);

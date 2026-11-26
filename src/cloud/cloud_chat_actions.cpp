@@ -119,7 +119,7 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
     };
     const auto rest = [this, &operation, &acknowledge](const QString &method, const Fields &fields) {
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/") + method + QStringLiteral(".json"));
-        webRequest(url, fields, operation, QStringLiteral("result"), acknowledge);
+        m_portalHttp.webRequest(url, fields, operation, QStringLiteral("result"), acknowledge);
     };
 
     switch (action) {
@@ -155,11 +155,11 @@ void CloudBackend::changeMessage(const QString &dialog, const QString &id, Messa
             break;
         }
         // A repeated creation command for this message has a single UI acknowledgement.
-        if (m_inflightOperations.contains(operation))
+        if (m_portalHttp.contains(operation))
             return;
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.message.share.json"));
         const auto account = m_accountScopeRevision;
-        webRequest(url, {{QStringLiteral("MESSAGE_ID"), message}, {QStringLiteral("DIALOG_ID"), scope},
+        m_portalHttp.webRequest(url, {{QStringLiteral("MESSAGE_ID"), message}, {QStringLiteral("DIALOG_ID"), scope},
                          {QStringLiteral("TYPE"), QStringLiteral("TASK")}},
                    operation, QStringLiteral("result"), [this, operation, scope, account](const QJsonValue &result) {
             if (account != m_accountScopeRevision)
@@ -202,7 +202,7 @@ void CloudBackend::forwardMessage(const QString &source, const QString &id, cons
         emit failed(operation, QStringLiteral("Некорректный диалог или сообщение для пересылки"));
         return;
     }
-    if (m_inflightOperations.contains(operation))
+    if (m_portalHttp.contains(operation))
         return;
     const auto uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_sentTemplates.enqueue(uuid);
@@ -247,7 +247,7 @@ void CloudBackend::createGroupChat(const QString &title, const QStringList &memb
         seen.insert(id);
         fields.append({QStringLiteral("fields[users][%1]").arg(seen.size() - 1), id});
     }
-    webRequest(url, fields, op, QStringLiteral("result"), [this, op](const QJsonValue &value) {
+    m_portalHttp.webRequest(url, fields, op, QStringLiteral("result"), [this, op](const QJsonValue &value) {
         const auto id = jsonId(value.toObject().value(QStringLiteral("chatId")));
         if (id.isEmpty()) {
             emit failed(op, QStringLiteral("Портал не подтвердил создание чата"));
@@ -271,7 +271,7 @@ void CloudBackend::changeChatMember(const QString &dialog, const QString &user, 
     const auto fields = add ? Fields{{QStringLiteral("CHAT_ID"), scope.mid(4)},
                                      {QStringLiteral("USERS[0]"), id}, {QStringLiteral("HIDE_HISTORY"), QStringLiteral("Y")}}
                             : Fields{{QStringLiteral("dialogId"), scope}, {QStringLiteral("userId"), id}};
-    webRequest(url, fields, op, QStringLiteral("result"), [this, scope, op, add](const QJsonValue &result) {
+    m_portalHttp.webRequest(url, fields, op, QStringLiteral("result"), [this, scope, op, add](const QJsonValue &result) {
         if (!commandAccepted(result)) {
             emit failed(op, QStringLiteral("Портал отклонил изменение состава чата"));
             return;

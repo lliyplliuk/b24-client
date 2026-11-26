@@ -339,7 +339,7 @@ void CloudBackend::resetWorktime()
     ++m_worktimeRevision;
     if (m_workdayReply)
         m_workdayReply->abort();
-    m_inflightOperations.remove(workdayRead);
+    m_portalHttp.release(workdayRead);
     m_workday = {};
     m_worktimeSheetMonth = {};
     m_loadingWorktimeSheet = false;
@@ -351,7 +351,7 @@ void CloudBackend::resetWorktime()
 QNetworkReply *CloudBackend::startWorktimeRequest(const QUrl &url, const QByteArray &form, qsizetype limit)
 {
     const OriginGuard guard(m_session.origin);
-    if (!m_started || m_authExpired || !m_session.isValid() || m_requests.size() >= 12
+    if (!m_started || m_authExpired || !m_session.isValid() || m_portalHttp.atCapacity()
         || m_session.cookie.contains('\r') || m_session.cookie.contains('\n'))
         return nullptr;
 
@@ -369,7 +369,7 @@ QNetworkReply *CloudBackend::startWorktimeRequest(const QUrl &url, const QByteAr
     }
 
     auto *reply = form.isEmpty() ? m_http.get(request) : m_http.post(request, form);
-    m_requests.insert(reply, {});
+    m_portalHttp.track(reply);
     reply->setReadBufferSize(limit + 1);
     QTimer::singleShot(15000, reply, [reply] {
         if (!reply->isFinished())
@@ -380,7 +380,7 @@ QNetworkReply *CloudBackend::startWorktimeRequest(const QUrl &url, const QByteAr
             reply->abort();
     });
     connect(reply, &QNetworkReply::finished, this, [this, reply] {
-        m_requests.remove(reply);
+        m_portalHttp.untrack(reply);
         reply->deleteLater();
         scheduleRefresh();
     });
@@ -389,7 +389,7 @@ QNetworkReply *CloudBackend::startWorktimeRequest(const QUrl &url, const QByteAr
 
 void CloudBackend::requestWorkday()
 {
-    if (!m_inflightOperations.contains(workdayWrite))
+    if (!m_portalHttp.contains(workdayWrite))
         queryWorkday(u"update"_s, {});
 }
 
@@ -397,7 +397,7 @@ void CloudBackend::queryWorkday(const QString &action, Fields fields, bool allow
 {
     const bool writing = action != u"update";
     const auto operation = writing ? workdayWrite : workdayRead;
-    if (m_inflightOperations.contains(operation))
+    if (m_portalHttp.contains(operation))
         return;
     auto url = OriginGuard(m_session.origin).resolve(u"/bitrix/tools/timeman.php"_s);
     QUrlQuery query;
@@ -418,15 +418,15 @@ void CloudBackend::queryWorkday(const QString &action, Fields fields, bool allow
         emit failed(operation, u"Не удалось выполнить запрос рабочего дня."_s);
         return;
     }
-    if (!m_inflightOperations.contains(operation))
-        m_inflightOperations.insert(operation, nullptr);
+    if (!m_portalHttp.contains(operation))
+        m_portalHttp.reserve(operation);
     m_workdayReply = reply;
     m_workday = {};
     const auto revision = m_worktimeRevision;
     const auto sessionRevision = m_sessionRevision;
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, action, operation, revision, sessionRevision, writing, allowSessionRetry] {
-        m_inflightOperations.remove(operation);
+        m_portalHttp.release(operation);
         m_workdayReply = nullptr;
         if (!m_started || revision != m_worktimeRevision)
             return;
@@ -439,12 +439,12 @@ void CloudBackend::queryWorkday(const QString &action, Fields fields, bool allow
                     : u"Состояние рабочего дня недоступно. Обновите его вручную."_s);
                 return;
             }
-            if (!m_inflightOperations.contains(operation))
-                m_inflightOperations.insert(operation, nullptr);
+            if (!m_portalHttp.contains(operation))
+                m_portalHttp.reserve(operation);
             confirmSession(sessionRevision, [this, operation, revision, sessionRevision](bool accepted) {
                 if (!m_started || revision != m_worktimeRevision)
                     return;
-                m_inflightOperations.remove(operation);
+                m_portalHttp.release(operation);
                 if (accepted && m_sessionRevision != sessionRevision)
                     queryWorkday(u"update"_s, {}, false);
                 else
@@ -500,7 +500,7 @@ void CloudBackend::queryWorkday(const QString &action, Fields fields, bool allow
 
 void CloudBackend::changeWorkday(WorkdayAction action, const QString &report)
 {
-    if (m_inflightOperations.contains(workdayWrite) || m_inflightOperations.contains(workdayRead)) {
+    if (m_portalHttp.contains(workdayWrite) || m_portalHttp.contains(workdayRead)) {
         emit failed(workdayWrite, u"Дождитесь ответа портала о рабочем дне."_s);
         return;
     }
@@ -541,7 +541,7 @@ void CloudBackend::changeWorkday(WorkdayAction action, const QString &report)
 void CloudBackend::changeWorkdayAt(WorkdayAction action, const QDate &date, const QTime &time,
                                   const QString &reason, const QString &report)
 {
-    if (m_inflightOperations.contains(workdayWrite) || m_inflightOperations.contains(workdayRead)) {
+    if (m_portalHttp.contains(workdayWrite) || m_portalHttp.contains(workdayRead)) {
         emit failed(workdayWrite, u"Дождитесь ответа портала о рабочем дне."_s);
         return;
     }

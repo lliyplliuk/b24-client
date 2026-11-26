@@ -81,7 +81,7 @@ void CloudBackend::loadInitialPortalStatus()
     const auto revision = m_portalStatusRevision;
     const auto user = m_userId;
     const auto operation = operationKey(OperationKind::PortalStatusBootstrap);
-    webRequest(url, {}, operation, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, {}, operation, QStringLiteral("result"),
                [this, revision, user, operation](const QJsonValue &data) {
         if (!user.isEmpty() && user != m_userId) {
             loadInitialPortalStatus();
@@ -104,7 +104,7 @@ void CloudBackend::readPortalStatus(const QString &operation, std::function<void
 {
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.status.get.json"));
     const auto revision = m_portalStatusRevision;
-    webRequest(url, {}, operation, QStringLiteral("result"),
+    m_portalHttp.webRequest(url, {}, operation, QStringLiteral("result"),
                [this, operation, revision, onStatus = std::move(onStatus)](const QJsonValue &data) {
         const auto status = data.toString();
         if (!supportedStatus(status)) {
@@ -128,7 +128,7 @@ void CloudBackend::requestPortalStatus()
 
 void CloudBackend::updatePortalStatus(const QString &expected, const QString &status)
 {
-    if (m_inflightOperations.contains(statusChange))
+    if (m_portalHttp.contains(statusChange))
         return;
     if (!supportedStatus(expected) || !supportedStatus(status) || expected == status
         || (expected != QLatin1String("dnd") && status != QLatin1String("dnd"))) {
@@ -141,7 +141,7 @@ void CloudBackend::updatePortalStatus(const QString &expected, const QString &st
             return;
         }
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.user.status.set.json"));
-        webRequest(url, {{QStringLiteral("STATUS"), status}}, statusChange, QStringLiteral("result"),
+        m_portalHttp.webRequest(url, {{QStringLiteral("STATUS"), status}}, statusChange, QStringLiteral("result"),
                    [this, status](const QJsonValue &data) {
             if (data != QJsonValue(true)) {
                 emit failed(statusChange, QStringLiteral("Портал отклонил смену статуса"));

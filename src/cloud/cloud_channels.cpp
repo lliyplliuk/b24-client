@@ -448,7 +448,7 @@ void CloudBackend::streamMessageFile(const QUrl &url, const std::shared_ptr<Mess
         request.setRawHeader("Accept-Encoding", "identity");
     auto *reply = m_http.get(request);
     download->reply = reply;
-    m_requests.insert(reply, {});
+    m_portalHttp.track(reply);
     reply->setReadBufferSize(downloadBlockBytes);
     if (download->mode == MessageDownloadMode::Video) {
         const int remaining = qMax(0, videoDownloadTimeoutMs - int(download->lifetime.elapsed()));
@@ -488,7 +488,7 @@ void CloudBackend::streamMessageFile(const QUrl &url, const std::shared_ptr<Mess
     }
     connect(reply, &QIODevice::readyRead, this, pump);
     connect(reply, &QNetworkReply::finished, this, [this, reply, download, pump] {
-        m_requests.remove(reply);
+        m_portalHttp.untrack(reply);
         reply->deleteLater();
         if (download->cancelled)
             return;
@@ -1040,8 +1040,8 @@ void CloudBackend::requestPinnedMessages(const QString &dialogId)
             return;
         const auto historyOperation = operationKey(OperationKind::Chat, dialog);
         const auto taskOperation = operationKey(OperationKind::TaskMessages, m_openTask);
-        const bool pendingHistory = m_inflightOperations.contains(historyOperation)
-            || (m_taskDialogs.value(m_openTask) == dialog && m_inflightOperations.contains(taskOperation))
+        const bool pendingHistory = m_portalHttp.contains(historyOperation)
+            || (m_taskDialogs.value(m_openTask) == dialog && m_portalHttp.contains(taskOperation))
             || std::any_of(m_historiesWaitingForIdentity.cbegin(), m_historiesWaitingForIdentity.cend(),
                            [&dialog](const auto &history) { return history.dialog == dialog; });
         if (pendingHistory)
@@ -1195,7 +1195,7 @@ void CloudBackend::searchTaskChats(const QString &query)
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
     const auto scope = m_accountScopeRevision;
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/tasks.task.list.json"));
-    webRequest(url, std::move(fields), operation, resultEnvelope,
+    m_portalHttp.webRequest(url, std::move(fields), operation, resultEnvelope,
                [this, scope, query, needle, id, operation](QJsonValue data) {
         if (scope != m_accountScopeRevision || m_authExpired)
             return;
@@ -1344,7 +1344,7 @@ void CloudBackend::loadChatAssets(qint64 chatId, ChatAssetKind kind, qint64 boun
         fields.append({links ? QStringLiteral("OFFSET") : QStringLiteral("LAST_ID"), QString::number(boundary)});
     const auto url = OriginGuard(m_session.origin).resolve(links ? QStringLiteral("/rest/im.chat.url.get.json")
                                                                  : QStringLiteral("/rest/im.chat.file.get.json"));
-    webRequest(url, fields, operation, resultEnvelope,
+    m_portalHttp.webRequest(url, fields, operation, resultEnvelope,
                [this, operation, links, boundary, chatId, preview, scope,
                 complete = std::move(complete)](const QJsonValue &value) {
         if (preview && (m_authExpired || settingsScope() != scope)) {
@@ -1438,7 +1438,7 @@ void CloudBackend::requestMessageViewers(const QString &scopeId, const QString &
     }
     const auto operation = operationKey(OperationKind::MessageViewers, QUuid::createUuid().toString(QUuid::WithoutBraces));
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.v2.Chat.Message.tailViewers.json"));
-    webRequest(url, {{QStringLiteral("id"), QString::number(id)},
+    m_portalHttp.webRequest(url, {{QStringLiteral("id"), QString::number(id)},
                      {QStringLiteral("limit"), QString::number(tunables::kPageSizeChats)}},
                operation, resultEnvelope,
                [this, scope, dialog, task, scopeId, id, chatId, count = *knownCount, group, viewerDialog, key,
@@ -1560,7 +1560,7 @@ void CloudBackend::searchMessages(const QString &scopeId, const QString &query, 
     resolveDialog(scopeId, task, operation, key,
                   [this, scopeId, query, trimmed, task, operation, key](const QString &dialog, qint64 chatId) {
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.dialog.messages.search.json"));
-        webRequest(url, {{QStringLiteral("CHAT_ID"), QString::number(chatId)},
+        m_portalHttp.webRequest(url, {{QStringLiteral("CHAT_ID"), QString::number(chatId)},
                          {QStringLiteral("SEARCH_MESSAGE"), trimmed}}, operation, resultEnvelope,
                    [this, scopeId, query, task, operation, dialog](QJsonValue result) {
             const auto obj = result.toObject();
@@ -1651,7 +1651,7 @@ std::shared_ptr<CloudBackend::Upload> CloudBackend::openUpload(const QString &sc
     const QString &localPath, const QString &kind, const QString &operation)
 {
     const auto policy = defaultRequestPolicy(parseOperation(operation).kind);
-    if (m_inflightOperations.contains(scopedRequestKey(operation, policy)))
+    if (m_portalHttp.contains(m_portalHttp.scopedRequestKey(operation, policy)))
         return {};
     const QFileInfo info(localPath);
     const auto fileName = info.fileName().normalized(QString::NormalizationForm_C);
@@ -1699,7 +1699,7 @@ void CloudBackend::uploadChatAttachment(const QString &scopeId, const QString &l
     }
     const auto accountScope = m_accountScopeRevision;
     const auto imageKey = operationKey(OperationKind::ChatImageUpload, QString::number(accountScope), operation);
-    if (m_inflightOperations.contains(imageKey))
+    if (m_portalHttp.contains(imageKey))
         return;
     const auto kind = task ? QStringLiteral("task-chat") : QStringLiteral("chat");
     const auto upload = openUpload(scopeId, localPath, kind, operation);
@@ -1719,7 +1719,7 @@ void CloudBackend::uploadChatAttachment(const QString &scopeId, const QString &l
         if (!upload->activeFor(m_accountScopeRevision))
             return;
         const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.disk.folder.get.json"));
-        webRequest(url, {{QStringLiteral("chat_id"), QString::number(chatId)}}, upload->operation, resultEnvelope,
+        m_portalHttp.webRequest(url, {{QStringLiteral("chat_id"), QString::number(chatId)}}, upload->operation, resultEnvelope,
                    [this, upload, chatId, dialogId](QJsonValue result) {
             if (!upload->activeFor(m_accountScopeRevision))
                 return;
@@ -1773,7 +1773,7 @@ void CloudBackend::uploadChunk(const std::shared_ptr<Upload> &upload, qint64 off
     }
     // The request body must keep the staged directory alive until its file is closed.
     auto chunkFile = std::shared_ptr<QFile>(upload, upload->file.get());
-    webRequestRaw(url, new FileChunk(std::move(chunkFile), offset, length), headers, upload->operation, dataEnvelope,
+    m_portalHttp.webRequestRaw(url, new FileChunk(std::move(chunkFile), offset, length), headers, upload->operation, dataEnvelope,
                   [this, upload, end](QJsonValue response) {
         if (!upload->activeFor(m_accountScopeRevision))
             return;
@@ -1828,7 +1828,7 @@ void CloudBackend::commitUpload(const std::shared_ptr<Upload> &upload)
         return;
     }
     const auto url = OriginGuard(m_session.origin).resolve(QStringLiteral("/rest/im.disk.file.commit.json"));
-    webRequest(url, {{QStringLiteral("chat_id"), QString::number(upload->chatId)},
+    m_portalHttp.webRequest(url, {{QStringLiteral("chat_id"), QString::number(upload->chatId)},
                      {QStringLiteral("message"), upload->caption},
                      {QStringLiteral("template_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
                      {QStringLiteral("file_template_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
