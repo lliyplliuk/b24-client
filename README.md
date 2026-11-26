@@ -32,6 +32,8 @@ cmake --build build --parallel 4
 
 The demo uses sample data and runs offline without an account.
 
+Native Wayland requires Qt 6.6.2 or newer to restore maximized windows after minimizing. On older Qt versions, the client prefers XWayland when available. You can pass `-platform` to choose a Qt platform explicitly.
+
 To connect to your portal, replace the example URL with your own.
 
 ```bash

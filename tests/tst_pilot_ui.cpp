@@ -1523,7 +1523,8 @@ private slots:
             action->trigger();
         };
         auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
-        auto *composer = window.findChild<ui::ChatComposer *>(QStringLiteral("chatComposer"));
+        auto *composer = dynamic_cast<ui::ChatComposer *>(
+            window.findChild<QFrame *>(QStringLiteral("chatComposer")));
         QVERIFY(history && composer);
         QTRY_COMPARE(history->count(), 1);
         ui::ChatReply draftReply;
@@ -1560,7 +1561,8 @@ private slots:
         QVERIFY(card);
         QApplication::setActiveWindow(card);
         auto *taskHistory = findAccessible<QListWidget>(card, QStringLiteral("Чат карточки"));
-        auto *taskComposer = card->findChild<ui::ChatComposer *>(QStringLiteral("chatComposer"));
+        auto *taskComposer = dynamic_cast<ui::ChatComposer *>(
+            card->findChild<QFrame *>(QStringLiteral("chatComposer")));
         QVERIFY(taskHistory && taskComposer);
         QTRY_COMPARE(taskHistory->count(), 1);
         taskComposer->input()->setPlainText(QStringLiteral("Черновик задачи"));
@@ -1592,7 +1594,8 @@ private slots:
         emit backend->connectionChanged(true);
 
         auto *history = findAccessible<QListWidget>(&window, QStringLiteral("Сообщения чата"));
-        auto *composer = window.findChild<ui::ChatComposer *>(QStringLiteral("chatComposer"));
+        auto *composer = dynamic_cast<ui::ChatComposer *>(
+            window.findChild<QFrame *>(QStringLiteral("chatComposer")));
         QVERIFY(history && composer);
         QTRY_COMPARE(history->count(), 4);
         auto *input = composer->input();
@@ -1634,7 +1637,8 @@ private slots:
         QVERIFY(card);
         QApplication::setActiveWindow(card);
         auto *taskHistory = findAccessible<QListWidget>(card, QStringLiteral("Чат карточки"));
-        auto *taskComposer = card->findChild<ui::ChatComposer *>(QStringLiteral("chatComposer"));
+        auto *taskComposer = dynamic_cast<ui::ChatComposer *>(
+            card->findChild<QFrame *>(QStringLiteral("chatComposer")));
         QVERIFY(taskHistory && taskComposer);
         QTRY_COMPARE(taskHistory->count(), 3);
         taskComposer->input()->setFocus();
@@ -2279,7 +2283,8 @@ private slots:
         }
 
         window.openTaskCard(QStringLiteral("501"));
-        auto *card = window.findChild<ui::TaskCardDialog *>(QStringLiteral("taskCardDialog"));
+        auto *card = dynamic_cast<ui::TaskCardDialog *>(
+            window.findChild<QDialog *>(QStringLiteral("taskCardDialog")));
         QVERIFY(card);
         auto *cardStatus = findAccessible<QLabel>(card, QStringLiteral("Состояние карточки"));
         QVERIFY(cardStatus);
@@ -7198,7 +7203,8 @@ private slots:
         }
         QVERIFY(anchor);
         QTest::mouseClick(history->viewport(), Qt::LeftButton, Qt::NoModifier, *anchor);
-        auto *card = window.findChild<ui::TaskCardDialog *>(QStringLiteral("taskCardDialog"));
+        auto *card = dynamic_cast<ui::TaskCardDialog *>(
+            window.findChild<QDialog *>(QStringLiteral("taskCardDialog")));
         QVERIFY(card);
         QCOMPARE(card->taskId(), taskChat.taskId);
         auto *cardHistory = findAccessible<QListWidget>(card, QStringLiteral("Чат карточки"));
@@ -9681,10 +9687,12 @@ private slots:
         window.resize(960, 650);
         window.show();
         const auto activeTaskCard = [&]() -> ui::TaskCardDialog * {
-            const auto dialogs = window.findChildren<ui::TaskCardDialog *>(QStringLiteral("taskCardDialog"));
-            for (auto *dialog : dialogs)
-                if (dialog->isVisible())
-                    return dialog;
+            const auto dialogs = window.findChildren<QDialog *>(QStringLiteral("taskCardDialog"));
+            for (auto *dialog : dialogs) {
+                auto *card = dynamic_cast<ui::TaskCardDialog *>(dialog);
+                if (card && card->isVisible())
+                    return card;
+            }
             return nullptr;
         };
         auto *chats = findAccessible<QListWidget>(&window, QStringLiteral("Недавние чаты"));
@@ -9850,7 +9858,8 @@ private slots:
         window.show();
         const auto taskId = QStringLiteral("501");
         window.openTaskCard(taskId);
-        const QPointer card(window.findChild<ui::TaskCardDialog *>(QStringLiteral("taskCardDialog")));
+        auto *dialog = window.findChild<QDialog *>(QStringLiteral("taskCardDialog"));
+        const QPointer card(dynamic_cast<ui::TaskCardDialog *>(dialog));
         QVERIFY(card);
         QTRY_VERIFY(card->isVisible());
         QVERIFY(!card->hasUnsavedChanges());

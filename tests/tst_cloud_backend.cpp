@@ -6714,6 +6714,13 @@ void TestCloudBackend::desktopBannersCatchUpFromHistory()
     rows.append(row(913));
     publish();
     load();
+    const auto foregroundHistoryIsCurrent = [&] {
+        const auto messages = history.last().at(1).value<QVector<Message>>();
+        return std::any_of(messages.cbegin(), messages.cend(), [](const Message &message) {
+            return message.id == QLatin1String("913");
+        });
+    };
+    QTRY_VERIFY(foregroundHistoryIsCurrent());
     backend.setForeground(false);
     load();
     QCOMPARE(banners.size(), 3);

@@ -25,6 +25,7 @@
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <QTranslator>
+#include <QVersionNumber>
 #include <QWindow>
 #include <algorithm>
 #include <cstdio>
@@ -603,6 +604,13 @@ WorkspaceResult runWorkspace(QApplication &app, const QIcon &icon, Backend &back
 } // namespace
 
 int main(int argc, char **argv) {
+#ifdef Q_OS_LINUX
+    // QTBUG-119136: Qt Wayland before 6.6.2 unmaximizes the window when minimizing it.
+    const auto qtVersion = QVersionNumber::fromString(QLatin1String(qVersion()));
+    if (qtVersion < QVersionNumber(6, 6, 2) && qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")
+        && qgetenv("XDG_SESSION_TYPE") == "wayland" && !qEnvironmentVariableIsEmpty("DISPLAY"))
+        qputenv("QT_QPA_PLATFORM", "xcb;wayland");
+#endif
     QApplication app(argc, argv);
     ui::installApplicationTypography(app);
     ui::installDialogChrome(app);
