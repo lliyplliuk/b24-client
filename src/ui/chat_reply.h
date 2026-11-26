@@ -10,6 +10,8 @@ class QTemporaryDir;
 
 namespace bx::ui {
 
+inline constexpr qsizetype kMessageCharacters = 20000;
+
 struct ChatReply {
     QString id;
     QString author;

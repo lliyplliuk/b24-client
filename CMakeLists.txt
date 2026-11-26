@@ -48,6 +48,7 @@ endif()
 add_library(bxwidgets STATIC
     src/ui/main_window.h
     src/ui/main_window.cpp
+    src/ui/composer_send_controller.cpp
     src/ui/chat_action_ui.cpp
     src/ui/chat_video_previews.cpp
     src/ui/message_markup.cpp

@@ -306,30 +306,6 @@ void switchDraft(ui::ChatComposer *composer, QHash<QString, ui::ChatDraft> &draf
     composer->setDraft(drafts.take(to));
 }
 
-void clearSentDraft(ui::ChatComposer *composer, QHash<QString, ui::ChatDraft> &drafts,
-                    const QString &current, const QString &pending, const ui::ChatDraft &sent)
-{
-    auto sentWithoutImage = sent;
-    sentWithoutImage.image.reset();
-    if (composer && current == pending) {
-        const auto currentDraft = composer->draft();
-        if (currentDraft == sent || (sent.image && currentDraft == sentWithoutImage))
-            composer->setDraft({});
-        else if (sent.image && currentDraft.image == sent.image)
-            composer->clearDraftImage();
-    }
-    const auto saved = drafts.find(pending);
-    if (saved == drafts.end())
-        return;
-    if (*saved == sent || (sent.image && *saved == sentWithoutImage)) {
-        drafts.erase(saved);
-    } else if (sent.image && saved->image == sent.image) {
-        saved->image.reset();
-        if (saved->isEmpty())
-            drafts.erase(saved);
-    }
-}
-
 void selectAvailable(QListWidget *list, QListWidgetItem *selection)
 {
     if (!selection && list->count() > 0 && !list->item(0)->data(workspace::Id).toString().isEmpty())
@@ -414,7 +390,20 @@ bool allowsAutomaticPublicPreview(const QModelIndex &row)
 
 MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicLinkRequest publicLinkRequest)
     : QMainWindow(parent), m_backend(backend), m_readOnly(readOnly), m_online(backend->isDemo()),
-      m_publicLinkRequest(std::move(publicLinkRequest))
+      m_publicLinkRequest(std::move(publicLinkRequest)),
+      m_chatSendController(ui::ComposerSendController::Surface::Chat, backend,
+          [this](const QString &, const QString &status, bool loading) {
+              setStatus(status, loading);
+              updateComposers();
+          }),
+      m_taskSendController(ui::ComposerSendController::Surface::Task, backend,
+          [this](const QString &id, const QString &status, bool loading) {
+              if (m_card && m_card->taskId() == id)
+                  m_card->setStatus(status, loading);
+              else if (!status.isEmpty())
+                  setStatus(status, loading);
+              updateWriteAvailability();
+          })
 {
     m_chatPhotoDecodePool.setMaxThreadCount(1);
     m_chatVideoPreviews = std::make_unique<ui::ChatVideoPreviews>(backend, [this](bool posterChanged) {
@@ -557,10 +546,8 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
                 m_pendingCreateSubtask.clear();
                 m_pendingUpload.clear();
                 m_uploadName.clear();
-                m_pendingChatId.clear();
-                m_pendingChatDraft = {};
-                m_pendingTaskId.clear();
-                m_pendingTaskDraft = {};
+                m_chatSendController.reset();
+                m_taskSendController.reset();
                 if (m_descriptionUploadCard)
                     m_descriptionUploadCard->descriptionEditor()->setUploadStatus({});
                 clearDescriptionUpload();
@@ -1115,24 +1102,9 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     });
 
     connect(m_backend, &Backend::messageSent, this, [this](const QString &scope, const QString &) {
-        if (!m_pendingChatId.isEmpty() && scope == operationKey(OperationKind::Chat, m_pendingChatId)) {
-            clearSentDraft(m_chatComposer, m_chatDrafts, m_currentChatId, m_pendingChatId, m_pendingChatDraft);
-            m_pendingChatId.clear();
-            m_pendingChatDraft = {};
-            setStatus(QString());
-        } else if (!m_pendingTaskId.isEmpty() && scope == operationKey(OperationKind::Task, m_pendingTaskId)) {
-            if (m_card && m_card->taskId() == m_pendingTaskId) {
-                clearSentDraft(m_card->composer(), m_taskDrafts, m_card->taskId(),
-                               m_pendingTaskId, m_pendingTaskDraft);
-                m_card->setStatus(QString());
-            } else {
-                clearSentDraft(nullptr, m_taskDrafts, {}, m_pendingTaskId, m_pendingTaskDraft);
-            }
-            m_pendingTaskId.clear();
-            m_pendingTaskDraft = {};
-            updateWriteAvailability();
-        }
-        updateComposers();
+        m_chatSendController.confirm(scope, m_chatComposer, m_currentChatId, m_chatDrafts);
+        m_taskSendController.confirm(scope, m_card ? m_card->composer() : nullptr,
+                                     m_card ? m_card->taskId() : QString{}, m_taskDrafts);
     });
 
     reloadChatVisibilityPreference();
@@ -2488,26 +2460,16 @@ void MainWindow::onSendChat()
 {
     if (m_chatComposer->submitMessageEdit())
         return;
-    const auto text = m_chatComposer->wireText().trimmed();
-    if (!writable() || !m_pendingChatId.isEmpty() || m_currentChatId.isEmpty() || text.size() > 20000
-        || pastedChatImagePending(m_currentChatId, false))
-        return;
-    if (m_chatComposer->hasDraftImage()) {
-        uploadPastedChatImage(m_chatComposer, m_currentChatId, false, text);
-        return;
-    }
-    if (text.isEmpty())
-        return;
-    m_chatComposer->cancelTyping();
-    m_pendingChatId = m_currentChatId;
-    m_pendingChatDraft = m_chatComposer->draft();
-    const auto replyId = m_pendingChatDraft.reply.id;
-    setStatus(QStringLiteral("Отправляем сообщение…"), true);
-    updateComposers();
-    if (replyId.isEmpty())
-        m_backend->sendChatMessage(m_currentChatId, text);
-    else
-        m_backend->sendChatReply(m_currentChatId, text, replyId);
+    sendFromComposer(m_chatSendController, m_chatComposer, m_currentChatId);
+}
+
+void MainWindow::sendFromComposer(ui::ComposerSendController &controller, ui::ChatComposer *composer, const QString &id)
+{
+    const bool task = controller.isTask();
+    controller.send(*composer, id, writable(), pastedChatImagePending(id, task),
+                    [this, composer, id, task](const QString &caption) {
+                        uploadPastedChatImage(composer, id, task, caption);
+                    });
 }
 
 void MainWindow::onPeopleFound(const QString &requestId, const QVector<Person> &people)
@@ -2547,7 +2509,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         return;
     }
 
-    bool presentedInCard = false;
+    bool statusPresented = false;
     QString footer = reason;
     switch (kind) {
     case OperationKind::ProjectTaskChats:
@@ -2830,7 +2792,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
             m_card->setStatus(networkFailure
                 ? QStringLiteral("Не удалось подтвердить сохранение задачи. Проверьте изменения на портале перед повтором")
                 : reason);
-            presentedInCard = networkFailure;
+            statusPresented = networkFailure;
         }
         m_pendingTaskEdit.clear();
         m_pendingTaskEditCard.clear();
@@ -2861,23 +2823,11 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
         break;
     case OperationKind::SendChat:
     case OperationKind::SendTask: {
-        const auto unconfirmedSend = QStringLiteral("Не удалось подтвердить отправку. Проверьте историю перед повторной отправкой");
-        if (!m_pendingChatId.isEmpty() && kind == OperationKind::SendChat && ids.value(0) == m_pendingChatId) {
-            m_pendingChatId.clear();
-            m_pendingChatDraft = {};
-            if (networkFailure)
-                footer = unconfirmedSend;
-        }
-        if (!m_pendingTaskId.isEmpty() && kind == OperationKind::SendTask && ids.value(0) == m_pendingTaskId) {
-            if (m_card && m_card->taskId() == m_pendingTaskId) {
-                m_card->setStatus(networkFailure ? unconfirmedSend : reason);
-                presentedInCard = networkFailure;
-            } else if (networkFailure) {
-                footer = unconfirmedSend;
-            }
-            m_pendingTaskId.clear();
-            m_pendingTaskDraft = {};
-        }
+        const auto id = ids.value(0);
+        const bool task = kind == OperationKind::SendTask;
+        auto &controller = task ? m_taskSendController : m_chatSendController;
+        if (controller.fail(id, reason, networkFailure))
+            statusPresented = !task || networkFailure || !m_card || m_card->taskId() != id;
         break;
     }
     case OperationKind::Chat: {
@@ -2912,7 +2862,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
             ? QStringLiteral("Не удалось загрузить задачу. Откройте карточку заново")
             : QStringLiteral("Не удалось загрузить чат задачи. Откройте карточку заново");
         m_card->setStatus(networkFailure ? retryCard : reason);
-        presentedInCard = networkFailure;
+        statusPresented = networkFailure;
         if (m_cardSearchQuery.isEmpty() && (!detailsFailed || m_loadCardChat)
             && (!networkFailure || m_card->messageList()->count() == 0))
             m_card->setChatStatus(QStringLiteral("Не удалось загрузить чат задачи"));
@@ -2947,7 +2897,7 @@ void MainWindow::onFailed(const QString &operation, const QString &reason)
     default:
         break;
     }
-    if (!presentedInCard)
+    if (!statusPresented)
         setStatus(footer);
     updateComposers();
     updateWriteAvailability();
@@ -2990,13 +2940,13 @@ void MainWindow::updateComposers()
     const bool editing = m_chatComposer->editingMessage();
     const bool saving = m_chatComposer->messageEditPending();
     const bool hasImage = m_chatComposer->hasDraftImage();
-    const bool sending = !m_pendingChatId.isEmpty() || pastedChatImagePending(m_currentChatId, false);
+    const bool sending = m_chatSendController.pending() || pastedChatImagePending(m_currentChatId, false);
     m_chatInput->setReadOnly(m_readOnly || m_currentChatId.isEmpty() || saving);
     const bool canSubmit = editing ? m_chatComposer->canSaveMessageEdit(wire) : !sending
-        && text.size() <= 20000 && (hasImage ? m_pendingUpload.isEmpty() : !text.isEmpty());
+        && text.size() <= ui::kMessageCharacters && (hasImage ? m_pendingUpload.isEmpty() : !text.isEmpty());
     m_chatSend->setEnabled(enabled && canSubmit);
     m_chatSend->setToolTip(editing ? (saving ? QStringLiteral("Сохраняем сообщение…") : QStringLiteral("Сохранить сообщение"))
-        : text.size() > 20000 ? QStringLiteral("Максимум 20 000 символов")
+        : text.size() > ui::kMessageCharacters ? QStringLiteral("Максимум 20 000 символов")
         : sending || (hasImage && !m_pendingUpload.isEmpty()) ? QStringLiteral("Отправка…")
         : QStringLiteral("Отправить сообщение"));
     m_chatEmoji->setEnabled(enabled && !saving);
@@ -3150,7 +3100,7 @@ void MainWindow::updateWriteAvailability()
         const bool deleting = !m_pendingTaskDelete.isEmpty();
         m_card->setWriteState(writable() && m_cardDetailsReady && !deleting, !m_pendingTaskEdit.isEmpty() || deleting,
                               !m_pendingBoardEdit.isEmpty(),
-                              !m_pendingTaskId.isEmpty() || pastedChatImagePending(m_card->taskId(), true),
+                              m_taskSendController.pending() || pastedChatImagePending(m_card->taskId(), true),
                               !m_pendingUpload.isEmpty());
     }
     if (m_stageManager)
@@ -3417,27 +3367,8 @@ void MainWindow::openTaskCardForProject(const QString &taskId, const QString &pr
         edit.stageId = stage;
         saveTaskEdit(edit);
     });
-    card->setOnSend([this, card](const QString &body) {
-        if (!writable() || !m_pendingTaskId.isEmpty() || pastedChatImagePending(card->taskId(), true))
-            return;
-        const auto text = body.trimmed();
-        if (text.size() > 20000)
-            return;
-        if (card->composer()->hasDraftImage()) {
-            uploadPastedChatImage(card->composer(), card->taskId(), true, text);
-            return;
-        }
-        if (text.isEmpty())
-            return;
-        m_pendingTaskId = card->taskId();
-        m_pendingTaskDraft = card->composer()->draft();
-        const auto replyId = m_pendingTaskDraft.reply.id;
-        card->setStatus(QStringLiteral("Отправляем сообщение…"), true);
-        updateWriteAvailability();
-        if (replyId.isEmpty())
-            m_backend->sendTaskMessage(card->taskId(), text);
-        else
-            m_backend->sendTaskReply(card->taskId(), text, replyId);
+    card->setOnSend([this, card] {
+        sendFromComposer(m_taskSendController, card->composer(), card->taskId());
     });
     card->setOnSearch([this, card](const QString &query) {
         if (query.isEmpty()) {
@@ -6204,7 +6135,6 @@ void MainWindow::uploadPastedChatImage(ui::ChatComposer *composer, const QString
         feedback(QStringLiteral("Чтобы отправить изображение, отмените ответ или удалите изображение из черновика"));
         return;
     }
-    composer->cancelTyping();
     m_pendingUpload = operationKey(task ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scope);
     m_pendingPastedChatImage = draft;
     m_uploadName = QFileInfo(draft.image->path).fileName();

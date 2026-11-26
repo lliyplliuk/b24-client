@@ -1977,7 +1977,7 @@ public:
     }
     bool canSaveMessageEdit(const QString &text) const
     {
-        return !m_editPending && text != m_editOriginal && !text.trimmed().isEmpty() && text.size() <= 20000;
+        return !m_editPending && text != m_editOriginal && !text.trimmed().isEmpty() && text.size() <= kMessageCharacters;
     }
     bool submitMessageEdit()
     {

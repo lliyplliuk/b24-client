@@ -1442,7 +1442,7 @@ public:
     void setPeopleResults(const QString &id, const QVector<Person> &people) { m_detailEditor->setPeopleResults(id, people); }
     bool setPeopleSearchError(const QString &id) { return m_detailEditor->setPeopleSearchError(id); }
     void setOnMove(std::function<void(const QString &)> handler) { m_onMove = std::move(handler); }
-    void setOnSend(std::function<void(const QString &)> handler) { m_onSend = std::move(handler); }
+    void setOnSend(std::function<void()> handler) { m_onSend = std::move(handler); }
     void setOnSearch(std::function<void(const QString &)> handler) { m_onSearch = std::move(handler); }
     void setOnFile(std::function<void(bool)> handler) { m_onFile = std::move(handler); }
 
@@ -1547,10 +1547,8 @@ private:
     {
         if (m_composer->submitMessageEdit())
             return;
-        if (m_onSend && m_send->isEnabled()) {
-            m_composer->cancelTyping();
-            m_onSend(m_composer->wireText());
-        }
+        if (m_onSend && m_send->isEnabled())
+            m_onSend();
     }
     void searchMessages()
     {
@@ -1972,7 +1970,7 @@ private:
         const auto wire = m_composer->wireText();
         const auto text = wire.trimmed();
         const bool canSubmit = editingMessage ? m_composer->canSaveMessageEdit(wire) : !m_sending
-            && text.size() <= 20000 && (m_composer->hasDraftImage() ? !m_uploading : !text.isEmpty());
+            && text.size() <= kMessageCharacters && (m_composer->hasDraftImage() ? !m_uploading : !text.isEmpty());
         m_send->setEnabled(m_writable && canSubmit);
         m_send->setToolTip(editingMessage ? (savingMessage ? QStringLiteral("Сохраняем сообщение…") : QStringLiteral("Сохранить сообщение"))
                                            : m_send->accessibleName());
@@ -2062,7 +2060,7 @@ private:
     std::function<void(const TaskEdit &)> m_onSave;
     std::function<void()> m_onDelete;
     std::function<void(const QString &)> m_onMove;
-    std::function<void(const QString &)> m_onSend;
+    std::function<void()> m_onSend;
     std::function<void(const QString &)> m_onSearch;
     std::function<void()> m_onLatest;
     std::function<void(bool)> m_onFile;

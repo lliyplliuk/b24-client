@@ -67,13 +67,16 @@ namespace {
 
 // These clocks are value members without a QObject parent. Explicit instantiation
 // gives the tests access without changing widget ownership or exposing a UI API.
-template<typename Owner, typename Clock, Clock Owner::*member>
+template<typename Owner, typename Clock, Clock Owner::*member, typename... Tags>
 struct WidgetClock {
-    friend Clock &testClock(Owner &owner) { return owner.*member; }
+    friend Clock &testClock(Owner &owner, Tags...) { return owner.*member; }
 };
 
 QTimer &testClock(ui::ChatComposer &);
 template struct WidgetClock<ui::ChatComposer, QTimer, &ui::ChatComposer::m_typingExpiry>;
+struct TypingDelay {};
+QTimer &testClock(ui::ChatComposer &, TypingDelay);
+template struct WidgetClock<ui::ChatComposer, QTimer, &ui::ChatComposer::m_typingDelay, TypingDelay>;
 QTimer &testClock(ui::TaskCardDialog &);
 template struct WidgetClock<ui::TaskCardDialog, QTimer, &ui::TaskCardDialog::m_copyFeedbackTimer>;
 QVariantAnimation &testClock(ui::HistoryList &);
@@ -10333,7 +10336,10 @@ private slots:
         QVERIFY(preview->isVisible());
         const auto replyId = QStringLiteral("999");
         composer->setReply({replyId, QStringLiteral("Анна"), QStringLiteral("Исходное сообщение")});
+        auto &typingDelay = testClock(*composer, TypingDelay{});
+        typingDelay.start();
         QTest::keyClick(input, Qt::Key_Return);
+        QVERIFY(!typingDelay.isActive());
         QCOMPARE(backend->imageUploadRequests, 0);
         QCOMPARE(composer->reply().id, replyId);
         QVERIFY(preview->isVisible());

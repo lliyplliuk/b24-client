@@ -57,7 +57,7 @@ bool MainWindow::beginMessageEdit(const QPersistentModelIndex &message, const QS
     const bool cardHistory = owner == m_card;
     auto *composer = cardHistory ? m_card->composer() : m_chatComposer;
     if (!composer || composer->input()->isReadOnly() || !m_pendingUpload.isEmpty()
-        || (cardHistory ? !m_pendingTaskId.isEmpty() : !m_pendingChatId.isEmpty()))
+        || (cardHistory ? m_taskSendController.pending() : m_chatSendController.pending()))
         return false;
     const auto id = message.data(workspace::ReceiptMessageId).toString();
     const auto resolve = messageActionTarget(message, dialog);

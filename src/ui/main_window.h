@@ -2,7 +2,7 @@
 
 #include "core/backend.h"
 #include "ui/chat_image_previews.h"
-#include "ui/chat_reply.h"
+#include "ui/composer_send_controller.h"
 #include "ui/public_link_preview.h"
 
 #include <QHash>
@@ -246,6 +246,7 @@ private:
     void createProject();
     void openStageManager();
     void pickFile(const QString &scope, const QString &kind);
+    void sendFromComposer(ui::ComposerSendController &controller, ui::ChatComposer *composer, const QString &id);
     void uploadPastedChatImage(ui::ChatComposer *composer, const QString &scope, bool task, const QString &caption);
     bool pastedChatImagePending(const QString &scope, bool task) const;
     void queueDescriptionFiles(const QString &taskId, const QStringList &paths);
@@ -490,10 +491,8 @@ private:
     QString m_pendingBoardEdit;
     QString m_pendingMoveTask;
     QString m_boardMoveRefreshProject;
-    QString m_pendingChatId;
-    QString m_pendingTaskId;
-    ui::ChatDraft m_pendingChatDraft;
-    ui::ChatDraft m_pendingTaskDraft;
+    ui::ComposerSendController m_chatSendController;
+    ui::ComposerSendController m_taskSendController;
     int m_lastSection = 0;
 };
 
