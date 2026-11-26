@@ -272,18 +272,12 @@ QHash<qint64, int> CloudBackend::chatMessageCounters() const
 void CloudBackend::resetChatCounters()
 {
     m_chats.invalidateRecentStatuses();
-    m_timeline.chatBadgeRevision = 0;
-    m_timeline.chatCounterSnapshotRevision = 0;
     m_badgePagePending = false;
     m_badgePageOvertaken = false;
     m_chatBadgeRefresh.invalidate();
     m_haveCounterSnapshot = false;
     m_chatCounterSnapshotTotal = 0;
     m_chatCounterBadges.clear();
-    m_timeline.recentOverlays.clear();
-    m_timeline.recentChatItems.clear();
-    m_timeline.recentTaskChatItems.clear();
-    m_timeline.legacyTaskChats.clear();
 }
 
 qint64 CloudBackend::badgeChatId(const QString &dialog) const

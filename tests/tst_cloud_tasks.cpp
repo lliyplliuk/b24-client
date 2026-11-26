@@ -31,6 +31,7 @@ private slots:
     void createsTasksWithSelectedRequisites();
     void readsTaskCardOpenedOutsideProjects();
     void loadsAuthorizedTaskSummaryWhileDetailsArePending();
+    void keepsOverlappingTaskCardsIndependent();
     void taskCardRequiresTheMatchingLegacyResponse_data();
     void taskCardRequiresTheMatchingLegacyResponse();
     void createsTaskWithOneNativeShareAndReloadsTheSource();
@@ -131,6 +132,39 @@ void TestCloudTasks::loadsAuthorizedTaskSummaryWhileDetailsArePending()
     }));
     QCOMPARE(fixture.requestsFor(legacy).size(), 4);
     QVERIFY(fixture.requestsFor(QStringLiteral("im.v2.Chat.load")).isEmpty());
+}
+
+void TestCloudTasks::keepsOverlappingTaskCardsIndependent()
+{
+    CloudFixture fixture;
+    fixture.actionTaskLegacy = {{"id", 42}, {"title", "First task"}};
+    fixture.actionTaskCurrent = {{"id", 42}, {"rights", QJsonObject{{"remove", true}}}};
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy cards(&backend, &Backend::taskLoaded);
+    QSignalSpy summaries(&backend, &Backend::taskSummaryLoaded);
+    backend.start();
+
+    fixture.holdNotificationReply = QStringLiteral("tasks.v2.Task.get");
+    backend.requestTask(QStringLiteral("42"));
+    QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    QTRY_COMPARE(summaries.size(), 1);
+
+    fixture.actionTaskLegacy = {{"id", 43}, {"title", "Second task"}};
+    fixture.actionTaskCurrent = {{"id", 43}, {"rights", QJsonObject{{"remove", false}}}};
+    backend.requestTask(QStringLiteral("43"));
+    QTRY_COMPARE(cards.size(), 1);
+    const auto second = cards.first().first().value<Task>();
+    QCOMPARE(second.id, QStringLiteral("43"));
+    QCOMPARE(second.name, QStringLiteral("Second task"));
+    QVERIFY(!second.editRights.remove);
+
+    fixture.releaseHeldNotificationReply();
+    QTRY_COMPARE(cards.size(), 2);
+    const auto first = cards.last().first().value<Task>();
+    QCOMPARE(first.id, QStringLiteral("42"));
+    QCOMPARE(first.name, QStringLiteral("First task"));
+    QVERIFY(first.editRights.remove);
 }
 
 void TestCloudTasks::taskCardRequiresTheMatchingLegacyResponse_data()

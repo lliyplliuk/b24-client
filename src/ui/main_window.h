@@ -71,6 +71,8 @@ private slots:
     void onFailed(const QString &operation, const QString &reason);
 
 private:
+    void buildUi();
+    void onAvatarLoaded(const QUrl &url, const QByteArray &bytes);
     void refreshCurrentSection(bool reloadProjectDirectory = true);
     void showProfileSettings();
     void reloadChatVisibilityPreference();

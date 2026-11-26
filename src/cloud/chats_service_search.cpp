@@ -78,7 +78,7 @@ QVector<Message> ChatsService::decodePinnedMessages(const QJsonObject &payload) 
     }
     auto data = payload;
     data.insert(QStringLiteral("messages"), messages);
-    return m_host.decodeMessages(data, false, m_pinnedDialog);
+    return m_history.decodeMessages(data, false, m_pinnedDialog);
 }
 
 void ChatsService::publishPinnedMessages()
@@ -151,12 +151,12 @@ void ChatsService::requestPinnedMessages(const QString &dialogId)
     if (dialog.isEmpty())
         return;
     QTimer::singleShot(0, this, [this, dialog, generation] {
-        if (!m_host.started() || m_pinnedGeneration != generation || m_havePinnedSnapshot)
+        if (!m_session.started() || m_pinnedGeneration != generation || m_havePinnedSnapshot)
             return;
         const auto historyOperation = operationKey(OperationKind::Chat, dialog);
-        const auto taskOperation = operationKey(OperationKind::TaskMessages, m_timeline.openTask);
+        const auto taskOperation = operationKey(OperationKind::TaskMessages, m_timeline.activeTask());
         const bool pendingHistory = m_portalHttp.contains(historyOperation)
-            || (m_timeline.taskDialogs.value(m_timeline.openTask) == dialog && m_portalHttp.contains(taskOperation))
+            || (m_timeline.activeTaskDialog() == dialog && m_portalHttp.contains(taskOperation))
             || std::any_of(m_historiesWaitingForIdentity.cbegin(), m_historiesWaitingForIdentity.cend(),
                            [&dialog](const auto &history) { return history.dialog == dialog; });
         if (pendingHistory)
@@ -168,8 +168,8 @@ void ChatsService::requestPinnedMessages(const QString &dialogId)
             if (m_pinnedGeneration != generation)
                 return;
             const auto payload = data.toObject();
-            m_host.rememberDialog(dialog, payload);
-            m_host.rememberDialogContact(dialog, payload);
+            m_directory.rememberDialog(dialog, payload);
+            m_directory.rememberDialogContact(dialog, payload);
             acceptPinnedSnapshot(dialog, payload);
         }, operation + QLatin1Char(':') + QString::number(generation));
     });
@@ -184,7 +184,7 @@ void ChatsService::handlePinnedPull(const QString &command, const QJsonObject &p
     const auto id = field(record, {"messageId"});
     const auto chat = positiveId(field(record, {"chatId"}));
     if (positiveId(id) == 0 || chat <= 0
-        || (chat != m_timeline.dialogChatIds.value(m_pinnedDialog) && chat != groupChatId(m_pinnedDialog)))
+        || (chat != m_timeline.knownChatId(m_pinnedDialog) && chat != groupChatId(m_pinnedDialog)))
         return;
     std::optional<Message> refreshed;
     if (add) {
@@ -219,15 +219,15 @@ void ChatsService::searchTaskChats(const QString &query)
                    id.isEmpty() ? needle : id}, {QStringLiteral("start"), QStringLiteral("0")}};
     for (const auto *name : {"ID", "TITLE", "CHAT_ID", "GROUP_ID"})
         fields.append({QStringLiteral("select[]"), QLatin1String(name)});
-    const auto scope = m_host.accountScopeRevision();
-    const auto url = OriginGuard(m_host.portalOrigin()).resolve(QStringLiteral("/rest/tasks.task.list.json"));
+    const auto scope = m_session.accountScopeRevision();
+    const auto url = OriginGuard(m_session.portalOrigin()).resolve(QStringLiteral("/rest/tasks.task.list.json"));
     m_portalHttp.webRequest(url, std::move(fields), operation, resultEnvelope,
                [this, scope, query, needle, id, operation](QJsonValue data) {
-        if (scope != m_host.accountScopeRevision() || m_host.authExpired())
+        if (scope != m_session.accountScopeRevision() || m_session.authExpired())
             return;
         const auto rows = data.toObject().value(QStringLiteral("tasks"));
         if (!rows.isArray())
-            return m_host.failShape(operation);
+            return m_session.failShape(operation);
         QSet<qint64> seenTasks, seenChats;
         QVector<Chat> matches;
         const auto page = rows.toArray();
@@ -251,16 +251,16 @@ void ChatsService::searchTaskChats(const QString &query)
             if (name.trimmed().isEmpty() || (id.isEmpty() ? !name.contains(needle, Qt::CaseInsensitive) : task != id))
                 continue;
             const auto dialog = QStringLiteral("chat") + QString::number(*chatId);
-            const auto recent = std::find_if(m_timeline.recentTaskChatItems.cbegin(), m_timeline.recentTaskChatItems.cend(),
+            const auto recent = std::find_if(m_timeline.recentChats(true).cbegin(), m_timeline.recentChats(true).cend(),
                 [&dialog, &task](const Chat &chat) { return chat.id == dialog && chat.taskId == task; });
-            Chat chat = recent == m_timeline.recentTaskChatItems.cend() ? Chat{} : *recent;
+            Chat chat = recent == m_timeline.recentChats(true).cend() ? Chat{} : *recent;
             chat.id = dialog;
             chat.taskId = task;
             chat.serverChatId = *chatId;
             chat.taskChat = true;
             chat.kind = QStringLiteral("tasksTask");
             chat.title = name.simplified().left(500);
-            m_host.decorateProjectTaskChat(chat);
+            m_badges.decorateProjectTaskChat(chat);
             seenTasks.insert(*taskId);
             seenChats.insert(*chatId);
             matches.append(std::move(chat));
@@ -299,7 +299,7 @@ void ChatsService::searchChats(const QString &query)
              operation, [this, query, operation](QJsonValue data) {
         const auto items = data.toObject().value(QStringLiteral("dialog")).toObject().value(QStringLiteral("items"));
         if (!items.isArray())
-            return m_host.failShape(operation);
+            return m_session.failShape(operation);
         QVector<Chat> matches;
         QSet<QString> seen;
         for (const auto row : items.toArray()) {
@@ -313,7 +313,7 @@ void ChatsService::searchChats(const QString &query)
             if (result.title.isEmpty() || result.taskChat)
                 continue;
             seen.insert(id);
-            m_host.rememberDialog(id, QJsonObject{{QStringLiteral("chat"), chat}});
+            m_directory.rememberDialog(id, QJsonObject{{QStringLiteral("chat"), chat}});
             result.updated = date(custom.value(QStringLiteral("dateMessage")));
             matches.append(std::move(result));
             if (matches.size() >= tunables::kPageSizeChats)
@@ -329,26 +329,26 @@ void ChatsService::requestOlderChatMessages(const QString &scopeId, const QStrin
         task ? QStringLiteral("task") : QStringLiteral("chat"), scopeId, beforeId);
     const auto before = positiveId(beforeId);
     if (before == 0)
-        return m_host.failShape(operation);
-    const auto scope = m_host.accountScopeRevision();
-    m_host.resolveDialog(scopeId, task, operation, operation,
+        return m_session.failShape(operation);
+    const auto scope = m_session.accountScopeRevision();
+    m_directory.resolveDialog(scopeId, task, operation, operation,
                   [this, scopeId, beforeId, before, task, operation, scope](const QString &dialog, qint64 chatId) {
-        if (scope != m_host.accountScopeRevision())
+        if (scope != m_session.accountScopeRevision())
             return;
         constexpr int limit = 25;
-        const auto generation = m_timeline.dialogMessageStates.value(dialog).historyGeneration;
-        const auto revision = m_timeline.chatBadgeRevision;
+        const auto generation = m_timeline.historyGeneration(dialog);
+        const auto revision = m_timeline.badgeRevision();
         m_portalHttp.ajax(QStringLiteral("im.v2.Chat.Message.tail"),
              {{QStringLiteral("chatId"), QString::number(chatId)}, {QStringLiteral("filter[lastId]"), QString::number(before)},
               {QStringLiteral("order[id]"), QStringLiteral("DESC")}, {QStringLiteral("limit"), QString::number(limit)}},
              operation, [this, scopeId, beforeId, before, task, operation, dialog, chatId, generation, scope, revision](QJsonValue data) {
-            if (scope != m_host.accountScopeRevision() || m_timeline.dialogMessageStates.value(dialog).historyGeneration != generation)
+            if (scope != m_session.accountScopeRevision() || m_timeline.historyGeneration(dialog) != generation)
                 return;
             auto page = data.toObject();
             const auto rawRows = page.value(QStringLiteral("messages"));
             const auto responseChat = field(page, {"chatId", "CHAT_ID"});
             if (!rawRows.isArray() || (!responseChat.isEmpty() && positiveId(responseChat) != chatId))
-                return m_host.failShape(operation);
+                return m_session.failShape(operation);
             QSet<qint64> seen;
             QJsonArray rows;
             for (const auto &value : rawRows.toArray()) {
@@ -364,9 +364,9 @@ void ChatsService::requestOlderChatMessages(const QString &scopeId, const QStrin
             }
             page.insert(QStringLiteral("chatId"), chatId);
             page.insert(QStringLiteral("messages"), rows);
-            if (task ? m_timeline.openTask == scopeId : m_timeline.openDialog == dialog)
+            if (task ? m_timeline.activeTask() == scopeId : m_timeline.activeDialog() == dialog)
                 rememberUnreadHistoryRows(dialog, chatId, rows, revision);
-            const auto messages = m_host.decodeMessages(page, true, dialog);
+            const auto messages = m_history.decodeMessages(page, true, dialog);
             const auto hasMore = !messages.isEmpty() &&
                 page.value(QStringLiteral("hasNextPage")).toBool(rows.size() == limit);
             emit olderChatMessagesLoaded(scopeId, beforeId, task, messages, hasMore);
@@ -387,16 +387,16 @@ void ChatsService::searchMessages(const QString &scopeId, const QString &query, 
         return;
     }
     const auto key = operation + QLatin1Char('\n') + trimmed;
-    m_host.resolveDialog(scopeId, task, operation, key,
+    m_directory.resolveDialog(scopeId, task, operation, key,
                   [this, scopeId, query, trimmed, task, operation, key](const QString &dialog, qint64 chatId) {
-        const auto url = OriginGuard(m_host.portalOrigin()).resolve(QStringLiteral("/rest/im.dialog.messages.search.json"));
+        const auto url = OriginGuard(m_session.portalOrigin()).resolve(QStringLiteral("/rest/im.dialog.messages.search.json"));
         m_portalHttp.webRequest(url, {{QStringLiteral("CHAT_ID"), QString::number(chatId)},
                          {QStringLiteral("SEARCH_MESSAGE"), trimmed}}, operation, resultEnvelope,
                    [this, scopeId, query, task, operation, dialog](QJsonValue result) {
             const auto obj = result.toObject();
             if (!obj.value(QStringLiteral("messages")).isArray())
-                return m_host.failShape(operation);
-            auto messages = m_host.decodeMessages(obj, false, dialog);
+                return m_session.failShape(operation);
+            auto messages = m_history.decodeMessages(obj, false, dialog);
             for (auto &message : messages)
                 message.unread = false;
             emit messagesFound(scopeId, query, task, messages);

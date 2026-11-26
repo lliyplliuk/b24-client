@@ -11,7 +11,7 @@
 
 namespace bx {
 
-struct ChatTimeline;
+class ChatTimeline;
 
 class NotificationsHost : public virtual SessionStateHost {
 public:

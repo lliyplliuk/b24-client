@@ -32,7 +32,15 @@ add_library(bxcore STATIC
     src/cloud/portal_http.h
     src/cloud/portal_http.cpp
     src/cloud/cloud_rows.cpp
+    src/cloud/task_card_fields.cpp
     src/cloud/tasks_service.cpp
+    src/cloud/tasks_service_create.cpp
+    src/cloud/tasks_service_edit.cpp
+    src/cloud/tasks_service_observers.cpp
+    src/cloud/tasks_service_checklist.cpp
+    src/cloud/tasks_service_relations.cpp
+    src/cloud/tasks_service_history.cpp
+    src/cloud/tasks_service_attachments.cpp
     src/cloud/projects_service.cpp
     src/cloud/projects_service_board.cpp
     src/cloud/projects_service_chats.cpp
@@ -75,7 +83,16 @@ add_library(bxwidgets STATIC
     src/ui/main_window.h
     src/ui/notifications_panel.h
     src/ui/notifications_panel.cpp
+    src/ui/notifications_panel_actions.cpp
+    src/ui/notifications_panel_history.cpp
+    src/ui/notifications_panel_read.cpp
+    src/ui/notifications_panel_rows.cpp
+    src/ui/notifications_panel_settings.cpp
     src/ui/projects_panel.cpp
+    src/ui/projects_panel_directory.cpp
+    src/ui/projects_panel_board.cpp
+    src/ui/projects_panel_tasks.cpp
+    src/ui/projects_panel_errors.cpp
     src/ui/projects_panel.h
     src/ui/workspace_presentation.cpp
     src/ui/task_card_controller.h
@@ -85,6 +102,9 @@ add_library(bxwidgets STATIC
     src/ui/task_card_controller_history.cpp
     src/ui/task_card_controller_files.cpp
     src/ui/main_window.cpp
+    src/ui/main_window_ui.cpp
+    src/ui/main_window_avatars.cpp
+    src/ui/main_window_files.cpp
     src/ui/avatar_painter.cpp
     src/ui/card_row_painter.cpp
     src/ui/directory_row_painter.cpp

@@ -14,7 +14,7 @@ void ChatsService::handleImPull(const QString &command, const QJsonObject &param
         handlePinnedPull(command, params);
         return;
     }
-    if (m_host.handleAnchorPull(command, params))
+    if (m_history.handleAnchorPull(command, params))
         return;
     if (command == QLatin1String("settingsUpdate")) {
         emit popupSettingsChanged(params);
@@ -32,7 +32,7 @@ void ChatsService::handleImPull(const QString &command, const QJsonObject &param
     }
     if (command == QLatin1String("message") || command == QLatin1String("messageChat")) {
         const auto user = numericId(field(params.value(QStringLiteral("message")).toObject(), {"senderId", "authorId"}));
-        if (!dialog.isEmpty() && !user.isEmpty() && user != m_host.currentUserId())
+        if (!dialog.isEmpty() && !user.isEmpty() && user != m_directory.currentUserId())
             emit chatTypingChanged(dialog, user, 0);
     }
     if (command == QLatin1String("addReaction") || command == QLatin1String("deleteReaction")) {
@@ -50,7 +50,7 @@ void ChatsService::handleImPull(const QString &command, const QJsonObject &param
             return;
         if (const auto counter = chatUnreadCount(params.value(QStringLiteral("counter"))))
             m_timeline.dialogMessageState(dialog).unreadCounter = counter;
-        m_host.applyReadHistory(dialog, params, {});
+        m_history.applyReadHistory(dialog, params, {});
     }
 
     if (command == QLatin1String("notifyRead") || command == QLatin1String("notifyUnread")
@@ -59,16 +59,16 @@ void ChatsService::handleImPull(const QString &command, const QJsonObject &param
         return;
     }
     if (readEvent || command.startsWith(QLatin1String("message"))) {
-        m_timeline.recentDirty = true;
+        m_timeline.invalidateRecent();
         const auto eventChat = chatDialog(chatId);
         const auto matches = [&](const QString &dialogId) {
             return !dialogId.isEmpty() && (dialog == dialogId || eventChat == dialogId);
         };
-        if (matches(m_timeline.openDialog))
-            m_timeline.chatDirty = true;
-        if (matches(m_timeline.taskDialogs.value(m_timeline.openTask)))
-            m_timeline.taskMessagesDirty = true;
-        m_host.scheduleRefresh();
+        if (matches(m_timeline.activeDialog()))
+            m_timeline.invalidateHistory(false);
+        if (matches(m_timeline.activeTaskDialog()))
+            m_timeline.invalidateHistory(true);
+        m_activity.scheduleRefresh();
     }
     applyRecentPull(command, dialog, chatId, params, recentExtra);
     if (command != QLatin1String("message") && command != QLatin1String("messageChat")
@@ -83,11 +83,11 @@ QString ChatsService::pullDialog(const QJsonObject &params, const QString &chatI
     auto dialog = validDialog(field(params, {"dialogId"}));
     if (dialog.isEmpty() && !chatId.isEmpty()) {
         const auto id = chatId.toLongLong();
-        const auto personal = std::find_if(m_timeline.recentChatItems.cbegin(), m_timeline.recentChatItems.cend(), [id](const Chat &chat) {
+        const auto personal = std::find_if(m_timeline.recentChats(false).cbegin(), m_timeline.recentChats(false).cend(), [id](const Chat &chat) {
             return chat.serverChatId == id;
         });
-        dialog = personal != m_timeline.recentChatItems.cend() ? personal->id
-            : m_timeline.dialogChatIds.key(id, chatDialog(chatId));
+        dialog = personal != m_timeline.recentChats(false).cend() ? personal->id
+            : m_timeline.dialogForChat(id, chatDialog(chatId));
     }
     return dialog;
 }
@@ -95,7 +95,7 @@ QString ChatsService::pullDialog(const QJsonObject &params, const QString &chatI
 void ChatsService::handleOpponentReadPull(const QString &dialog, const QJsonObject &params)
 {
     const auto user = numericId(field(params, {"userId"}));
-    if (dialog.isEmpty() || user.isEmpty() || m_host.currentUserId().isEmpty() || user == m_host.currentUserId())
+    if (dialog.isEmpty() || user.isEmpty() || m_directory.currentUserId().isEmpty() || user == m_directory.currentUserId())
         return;
     auto &seen = m_timeline.dialogMessageState(dialog).seenByOthers;
     QStringList confirmed;
@@ -117,7 +117,7 @@ void ChatsService::handleOpponentReadPull(const QString &dialog, const QJsonObje
 void ChatsService::handleTypingPull(const QString &dialog, const QJsonObject &params)
 {
     const auto user = numericId(field(params, {"userId"}));
-    if (m_host.chatForeground() && !dialog.isEmpty() && !user.isEmpty() && !m_host.currentUserId().isEmpty() && user != m_host.currentUserId()
+    if (m_activity.chatForeground() && !dialog.isEmpty() && !user.isEmpty() && !m_directory.currentUserId().isEmpty() && user != m_directory.currentUserId()
         && params.value(QStringLiteral("type")) == QLatin1String("writing")) {
         const auto duration = params.value(QStringLiteral("duration")).toInt();
         emit chatTypingChanged(dialog, user, duration > 0 ? std::min(duration, 25000) : 25000);
@@ -130,25 +130,25 @@ void ChatsService::handleReactionPull(const QString &dialog, const QJsonObject &
     const auto id = numericId(field(reaction, {"messageId"}));
     const auto matches = [&](const QString &shown) {
         return !shown.isEmpty() && (shown == dialog || (dialog.isEmpty() && !id.isEmpty()
-            && m_timeline.replyPreviews.contains(m_timeline.replyPreviewKey(shown, id))));
+            && m_timeline.hasReplyPreview(shown, id)));
     };
-    if (matches(m_timeline.openDialog))
-        m_timeline.chatDirty = true;
-    if (matches(m_timeline.taskDialogs.value(m_timeline.openTask)))
-        m_timeline.taskMessagesDirty = true;
-    m_host.scheduleRefresh();
+    if (matches(m_timeline.activeDialog()))
+        m_timeline.invalidateHistory(false);
+    if (matches(m_timeline.activeTaskDialog()))
+        m_timeline.invalidateHistory(true);
+    m_activity.scheduleRefresh();
 }
 
 void ChatsService::handleHistoryRemovalPull(const QString &command, const QString &dialog, const QString &chatId, const QJsonObject &params)
 {
-    const auto mappedChat = m_host.badgeChatId(dialog);
+    const auto mappedChat = m_badges.badgeChatId(dialog);
     if (!dialog.isEmpty() && (chatId.isEmpty() || mappedChat == 0 || mappedChat == chatId.toLongLong())) {
         QStringList deleted;
         if (command == QLatin1String("messageUpdate") || command == QLatin1String("messageDelete")
             || command == QLatin1String("messageDeleteComplete")) {
             const auto message = numericId(field(params, {"id"}));
             if (!message.isEmpty()) {
-                m_timeline.replyPreviews.remove(m_timeline.replyPreviewKey(dialog, message));
+                m_timeline.forgetReplyPreview(dialog, message);
                 if (command != QLatin1String("messageUpdate"))
                     deleted.append(message);
             }
@@ -161,7 +161,7 @@ void ChatsService::handleHistoryRemovalPull(const QString &command, const QStrin
                 if (message.isEmpty() || (!rowDialog.isEmpty() && rowDialog != dialog)
                     || (!rowChat.isEmpty() && mappedChat > 0 && rowChat.toLongLong() != mappedChat))
                     continue;
-                m_timeline.replyPreviews.remove(m_timeline.replyPreviewKey(dialog, message));
+                m_timeline.forgetReplyPreview(dialog, message);
                 if (!deleted.contains(message))
                     deleted.append(message);
                 if (deleted.size() >= tunables::kPageSizeMessages)
@@ -174,10 +174,10 @@ void ChatsService::handleHistoryRemovalPull(const QString &command, const QStrin
                 if (through == 0)
                     ++m_timeline.dialogMessageState(dialog).historyGeneration;
                 emit chatHistoryRemoved(dialog, {}, through);
-                if (m_timeline.openDialog == dialog)
+                if (m_timeline.activeDialog() == dialog)
                     requestChatMessages(dialog);
-                if (!m_timeline.openTask.isEmpty() && m_timeline.taskDialogs.value(m_timeline.openTask) == dialog)
-                    requestTaskMessages(m_timeline.openTask);
+                if (!m_timeline.activeTask().isEmpty() && m_timeline.activeTaskDialog() == dialog)
+                    requestTaskMessages(m_timeline.activeTask());
             }
         }
         if (!deleted.isEmpty())
@@ -193,7 +193,7 @@ void ChatsService::handleMutePull(const QString &dialog, const QJsonObject &para
         state.muted = muted;
         state.muteList = {};
         state.muteFromPull = true;
-        m_host.deliverChatPopups();
+        m_history.deliverChatPopups();
     }
 }
 

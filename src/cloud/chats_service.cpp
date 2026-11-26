@@ -28,8 +28,11 @@ void storeChatMetadata(QCache<QString, T> &cache, const QString &id, const T &va
 
 } // namespace
 
-ChatsService::ChatsService(ChatsHost &host, ChatTimeline &timeline, PortalHttp &http, QObject *parent)
-    : QObject(parent), m_host(host), m_timeline(timeline), m_portalHttp(http)
+ChatsService::ChatsService(CloudServiceContext &session, ChatActivityHost &activity, ChatHistoryHost &history,
+                           ChatDirectoryHost &directory, ChatBadgeHost &badges, ChatTimeline &timeline,
+                           PortalHttp &http, QObject *parent)
+    : QObject(parent), m_session(session), m_activity(activity), m_history(history),
+      m_directory(directory), m_badges(badges), m_timeline(timeline), m_portalHttp(http)
 {
 }
 
@@ -110,7 +113,7 @@ Chat ChatsService::chatFromMetadata(const QString &dialog, const QJsonObject &ro
         avatar = field(chat, {"avatar", "avatarUrl"});
     if (avatar.isEmpty())
         avatar = field(row, {"avatar", "avatarUrl"});
-    result.avatarUrl = m_host.avatarUrlFromPortal(avatar);
+    result.avatarUrl = m_session.avatarUrlFromPortal(avatar);
     result.pinned = notificationFlag(row.value(QStringLiteral("pinned"))).value_or(false);
     if (!result.taskChat && isPersonalMetadata(dialog, type)) {
         result.kind = QStringLiteral("im");
@@ -118,24 +121,24 @@ Chat ChatsService::chatFromMetadata(const QString &dialog, const QJsonObject &ro
         result.dismissed = dismissed.value_or(cachedDismissalStatus(dialog).value_or(false));
         if (dismissed)
             rememberDismissalStatus(dialog, dismissed);
-        m_host.rememberChatContact(dialog, user, false);
-        m_host.applyChatContact(result);
+        m_directory.rememberChatContact(dialog, user, false);
+        m_directory.applyChatContact(result);
     }
     return result;
 }
 
 void ChatsService::requestRecentChats()
 {
-    m_timeline.showTaskChats = false;
+    m_timeline.selectRecentSection(false);
     loadRecentChats(false);
-    m_host.loadChatBadges();
+    m_badges.loadChatBadges();
 }
 
 void ChatsService::requestTaskChats()
 {
-    m_timeline.showTaskChats = true;
+    m_timeline.selectRecentSection(true);
     loadRecentChats(true);
-    m_host.loadChatBadges();
+    m_badges.loadChatBadges();
 }
 
 void ChatsService::requestTaskChatBadges()
@@ -149,18 +152,18 @@ void ChatsService::loadRecentChats(bool task, bool badgesOnly)
     m_portalHttp.ajax(QStringLiteral("im.v2.Recent.load"),
          {{QStringLiteral("filter[recentSection]"), task ? QStringLiteral("tasksTask") : QStringLiteral("default")},
           {QStringLiteral("limit"), QString::number(tunables::kPageSizeChats)}},
-         operation, [this, task, badgesOnly, operation, scope = m_host.accountScopeRevision(),
-                     counterRevision = m_timeline.chatBadgeRevision](QJsonValue data) {
-        if (scope != m_host.accountScopeRevision())
+         operation, [this, task, badgesOnly, operation, scope = m_session.accountScopeRevision(),
+                     counterRevision = m_timeline.badgeRevision()](QJsonValue data) {
+        if (scope != m_session.accountScopeRevision())
             return;
         const auto rows = list(data, {"recentItems", "items", "recent"});
         if (!rows.isArray())
-            return m_host.failShape(operation);
+            return m_session.failShape(operation);
 
         const auto root = data.toObject();
         const auto userId = numericId(field(root, {"userId", "currentUserId"}));
-        m_host.rememberCurrentUser(userId);
-        const auto currentUser = numericId(m_host.currentUserId()).toLongLong();
+        m_directory.rememberCurrentUser(userId);
+        const auto currentUser = numericId(m_directory.currentUserId()).toLongLong();
         QHash<qint64, QJsonObject> messages, latestMessagesByChat;
         QHash<QString, QJsonObject> users, chatById, chatByDialog, counters;
         for (const auto value : root.value(QStringLiteral("messages")).toArray()) {
@@ -234,7 +237,7 @@ void ChatsService::loadRecentChats(bool task, bool badgesOnly)
             if (rowChatId.isEmpty())
                 rowChatId = field(metadata, {"id", "chatId"});
             chat.serverChatId = numericId(rowChatId).toLongLong();
-            m_host.trackProjectChat(chat);
+            m_badges.trackProjectChat(chat);
             const auto counter = counters.value(rowChatId);
             bool hasCounterSnapshot = false;
             const auto snapshotCount = counter.value(QStringLiteral("counter")).toVariant().toInt(&hasCounterSnapshot);
@@ -267,34 +270,34 @@ void ChatsService::loadRecentChats(bool task, bool badgesOnly)
             bool hasReadId = false;
             const auto readId = field(metadata, {"lastId"}).toLongLong(&hasReadId);
             auto &live = m_timeline.recentOverlay(dialogId);
-            const auto state = m_timeline.dialogMessageStates.constFind(dialogId);
+            const auto *state = m_timeline.findMessageState(dialogId);
             const auto unreadId = numericId(field(metadata, {"unreadId"})).toLongLong();
-            const bool alreadyRead = chat.unread == 1 && unreadId > 0 && state != m_timeline.dialogMessageStates.cend()
+            const bool alreadyRead = chat.unread == 1 && unreadId > 0 && state
                 && (unreadId <= state->confirmedReadThrough || state->exactlyRead.contains(unreadId));
             const bool olderCursor = hasReadId && readId >= 0 && readId < live.confirmedCounterCursor;
             // A newer own preview alone does not supersede a confirmed read.
             const bool staleOwnCounter = live.counter && (alreadyRead || olderCursor) && currentUser > 0
                 && expectedChatId > 0 && explicitMessageChatId(preview) == expectedChatId
                 && explicitMessageAuthorId(preview) == currentUser;
-            const bool counterCurrent = m_timeline.chatCounterSnapshotRevision <= counterRevision
+            const bool counterCurrent = m_timeline.snapshotRevision() <= counterRevision
                 && live.counterRevision <= counterRevision && !staleOwnCounter;
             if (!metadata.isEmpty() || !recentChatId.isEmpty())
-                m_host.rememberDialog(dialogId, {{QStringLiteral("chat"), metadata}, {QStringLiteral("chatId"), recentChatId}},
+                m_directory.rememberDialog(dialogId, {{QStringLiteral("chat"), metadata}, {QStringLiteral("chatId"), recentChatId}},
                                counterCurrent);
             auto &rejectedPreviewChatId = chat.taskChat ? live.rejectedTaskPreviewChatId : live.rejectedRecentPreviewChatId;
             rejectedPreviewChatId = foreignPreview && preview.isEmpty() ? expectedChatId : 0;
-            const auto lastRead = m_timeline.dialogMessageStates.value(dialogId).lastReadId;
+            const auto lastRead = m_timeline.lastReadId(dialogId);
             if (messageId > live.messageId && messageId > lastRead) {
                 live.messageId = messageId;
                 // A newer preview can arrive in a response carrying an older unread count.
                 if (counterCurrent) {
                     live.incomingId = 0;
-                    if (!m_host.hasCounterSnapshot())
+                    if (!m_badges.hasCounterSnapshot())
                         live.counter.reset();
                 }
                 live.preview = {};
             }
-            if (counterCurrent && !m_host.hasCounterSnapshot() && live.incomingId > 0 && messageId >= live.messageId
+            if (counterCurrent && !m_badges.hasCounterSnapshot() && live.incomingId > 0 && messageId >= live.messageId
                 && readId >= live.incomingId && readId >= lastRead
                 && (hasCounterSnapshot || chatUnreadCount(oneOf(object, {"counter", "unreadCount"})))) {
                 live.counter = chat.unread;
@@ -314,25 +317,25 @@ void ChatsService::loadRecentChats(bool task, bool badgesOnly)
                 chats.append(std::move(chat));
             }
         }
-        m_host.publishProjectChatCounts();
+        m_badges.publishProjectChatCounts();
         if (!task) {
-            m_timeline.legacyTaskChats = std::move(legacyTasks);
+            m_timeline.replaceLegacyTasks(std::move(legacyTasks));
             const auto generation = ++m_recentStatusGeneration;
             publishRecentChats(chats, false);
             if (!usersWithoutStatus.isEmpty())
                 hydrateRecentUserStatuses(chats, usersWithoutStatus, generation);
-            if (m_host.currentUserId().isEmpty() && std::any_of(chats.cbegin(), chats.cend(), [](const Chat &chat) { return chat.dismissed; }))
-                m_host.withCurrentUser(settingsIdentityOp, [](qint64) {});
+            if (m_directory.currentUserId().isEmpty() && std::any_of(chats.cbegin(), chats.cend(), [](const Chat &chat) { return chat.dismissed; }))
+                m_session.withCurrentUser(settingsIdentityOp, [](qint64) {});
             return;
         }
-        for (const auto &legacy : std::as_const(m_timeline.legacyTaskChats)) {
+        for (const auto &legacy : m_timeline.legacyTasks()) {
             if (chats.size() >= tunables::kPageSizeChats)
                 break;
             if (!taskDialogs.contains(legacy.id))
                 chats.append(legacy);
         }
         ++m_taskTitleGeneration;
-        if (badgesOnly && !m_timeline.showTaskChats) {
+        if (badgesOnly && !m_timeline.showingTaskChats()) {
             publishRecentChats(std::move(chats), true);
             return;
         }
@@ -353,7 +356,7 @@ void ChatsService::hydrateRecentUserStatuses(QVector<Chat> chats, const QStringL
         pending.insert(id);
         rememberDismissalStatus(id, std::nullopt);
     }
-    const auto url = OriginGuard(m_host.portalOrigin()).resolve(QStringLiteral("/rest/im.user.list.get.json"));
+    const auto url = OriginGuard(m_session.portalOrigin()).resolve(QStringLiteral("/rest/im.user.list.get.json"));
     m_portalHttp.webRequest(url, fields, recentUserStatusOp, QStringLiteral("result"),
                [this, pending = std::move(pending), chats = std::move(chats), generation](QJsonValue data) mutable {
         if (data.isNull() || generation != m_recentStatusGeneration)
@@ -386,8 +389,8 @@ void ChatsService::hydrateRecentUserStatuses(QVector<Chat> chats, const QStringL
         }
         if (changed) {
             publishRecentChats(std::move(chats), false);
-            if (m_host.currentUserId().isEmpty())
-                m_host.withCurrentUser(settingsIdentityOp, [](qint64) {});
+            if (m_directory.currentUserId().isEmpty())
+                m_session.withCurrentUser(settingsIdentityOp, [](qint64) {});
         }
     }, recentUserStatusOp + QLatin1Char(':') + QString::number(generation));
 }
@@ -398,10 +401,10 @@ void ChatsService::publishRecentChats(QVector<Chat> chats, bool task)
     bool hasLivePreview = false;
     for (auto &chat : chats) {
         listed.insert(chat.id);
-        m_host.decorateChatBadges(chat);
-        m_host.applyChatContact(chat);
-        const auto live = m_timeline.recentOverlays.constFind(chat.id);
-        if (live == m_timeline.recentOverlays.cend())
+        m_badges.decorateChatBadges(chat);
+        m_directory.applyChatContact(chat);
+        const auto live = m_timeline.overlays().constFind(chat.id);
+        if (live == m_timeline.overlays().cend())
             continue;
         if (live->counter)
             chat.unread = *live->counter;
@@ -423,14 +426,14 @@ void ChatsService::publishRecentChats(QVector<Chat> chats, bool task)
             hasLivePreview = true;
         }
     }
-    for (const auto &live : std::as_const(m_timeline.recentOverlays)) {
+    for (const auto &live : m_timeline.overlays()) {
         const auto &preview = live.preview;
         if (preview.id.isEmpty() || preview.taskChat != task || listed.contains(preview.id)
             || (live.counter.value_or(0) == 0 && !live.markedUnread.value_or(false)))
             continue;
         auto chat = preview;
-        m_host.decorateChatBadges(chat);
-        m_host.applyChatContact(chat);
+        m_badges.decorateChatBadges(chat);
+        m_directory.applyChatContact(chat);
         chat.unread = live.counter.value_or(0);
         chat.markedUnread = live.markedUnread.value_or(false);
         chats.append(std::move(chat));
@@ -444,20 +447,20 @@ void ChatsService::publishRecentChats(QVector<Chat> chats, bool task)
                 return false;
             if (left.updated != right.updated)
                 return left.updated > right.updated;
-            return m_timeline.recentOverlays.value(left.id).messageId > m_timeline.recentOverlays.value(right.id).messageId;
+            return m_timeline.overlays().value(left.id).messageId > m_timeline.overlays().value(right.id).messageId;
         });
     }
     if (chats.size() > tunables::kPageSizeChats)
         chats.resize(tunables::kPageSizeChats);
     if (task) {
-        m_timeline.recentTaskChatItems = std::move(chats);
-        emit taskChatsLoaded(m_timeline.recentTaskChatItems);
+        m_timeline.replaceRecentChats(std::move(chats), true);
+        emit taskChatsLoaded(m_timeline.recentChats(true));
     } else {
-        m_timeline.recentChatItems = std::move(chats);
-        emit recentChatsLoaded(m_timeline.recentChatItems);
+        m_timeline.replaceRecentChats(std::move(chats), false);
+        emit recentChatsLoaded(m_timeline.recentChats(false));
     }
-    if (!m_host.hasCounterSnapshot())
-        m_host.publishUnreadChatCount();
+    if (!m_badges.hasCounterSnapshot())
+        m_badges.publishUnreadChatCount();
 }
 
 void ChatsService::rememberTaskTitle(const QString &id, const QString &title)
@@ -489,10 +492,10 @@ void ChatsService::resolveTaskChatTitles(QVector<Chat> chats, const QString &key
         }
     }
     const auto generation = m_taskTitleGeneration;
-    const auto scope = m_host.accountScopeRevision();
+    const auto scope = m_session.accountScopeRevision();
     // Show available rows even if the optional title batch is unavailable.
     deliver(chats);
-    if (missing.isEmpty() || scope != m_host.accountScopeRevision() || generation != m_taskTitleGeneration)
+    if (missing.isEmpty() || scope != m_session.accountScopeRevision() || generation != m_taskTitleGeneration)
         return;
     auto ids = missing.values();
     std::sort(ids.begin(), ids.end());
@@ -541,32 +544,32 @@ void ChatsService::applyRecentPull(const QString &command, const QString &dialog
     const auto message = params.value(QStringLiteral("message")).toObject();
     const auto messageId = numericId(field(message, {"id"})).toLongLong();
     const auto author = numericId(field(message, {"senderId", "authorId"}));
-    const auto state = m_timeline.dialogMessageStates.constFind(dialog);
+    const auto *state = m_timeline.findMessageState(dialog);
     if (messageEvent) {
         const auto groupChatId = groupDialogChatId(dialog);
-        const auto knownChatId = groupChatId > 0 ? groupChatId : m_host.badgeChatId(dialog);
+        const auto knownChatId = groupChatId > 0 ? groupChatId : m_badges.badgeChatId(dialog);
         const auto eventChatId = chatId.toLongLong();
         const auto expectedChatId = knownChatId > 0 ? knownChatId : eventChatId;
         const auto messageChatId = explicitMessageChatId(message);
         if ((knownChatId > 0 && eventChatId > 0 && eventChatId != knownChatId)
             || (messageChatId != 0 && messageChatId != expectedChatId))
             return;
-        if (!counter || messageId <= 0 || author.isEmpty() || author == m_host.currentUserId()
-            || m_timeline.sentTemplates.contains(field(message, {"templateId", "uuid"})))
+        if (!counter || messageId <= 0 || author.isEmpty() || author == m_directory.currentUserId()
+            || m_timeline.wasSentTemplate(field(message, {"templateId", "uuid"})))
             return;
-        if (messageId <= m_timeline.recentOverlays.value(dialog).messageId
-            || (state != m_timeline.dialogMessageStates.cend()
+        if (messageId <= m_timeline.overlays().value(dialog).messageId
+            || (state
                 && (messageId <= state->lastReadId || state->exactlyRead.contains(messageId))))
             return;
         const auto sent = date(extra.value(QStringLiteral("server_time_unix")));
         if (extra.value(QStringLiteral("server_time_ago")).toInteger() > freshPopupSeconds
             || (sent.isValid() && sent.secsTo(QDateTime::currentDateTimeUtc()) > freshPopupSeconds))
             return;
-        if (m_host.currentUserId().isEmpty()) {
+        if (m_directory.currentUserId().isEmpty()) {
             if (m_recentPullsAwaitingIdentity.size() >= 8)
                 m_recentPullsAwaitingIdentity.removeFirst();
             m_recentPullsAwaitingIdentity.append({command, dialog, chatId, params, extra});
-            m_host.withCurrentUser(settingsIdentityOp, [this](qint64 id) {
+            m_session.withCurrentUser(settingsIdentityOp, [this](qint64 id) {
                 if (id == 0)
                     m_recentPullsAwaitingIdentity.clear();
             });
@@ -575,7 +578,7 @@ void ChatsService::applyRecentPull(const QString &command, const QString &dialog
         const auto members = params.value(QStringLiteral("userInChat")).toObject().value(chatId);
         if (members.isArray()) {
             const auto users = members.toArray();
-            if (std::none_of(users.cbegin(), users.cend(), [this](const QJsonValue &user) { return string(user) == m_host.currentUserId(); }))
+            if (std::none_of(users.cbegin(), users.cend(), [this](const QJsonValue &user) { return string(user) == m_directory.currentUserId(); }))
                 return;
         }
     }
@@ -584,18 +587,18 @@ void ChatsService::applyRecentPull(const QString &command, const QString &dialog
     const auto lookup = [&dialog](const QVector<Chat> &chats) {
         return std::find_if(chats.cbegin(), chats.cend(), [&dialog](const Chat &chat) { return chat.id == dialog; });
     };
-    const auto ordinary = lookup(m_timeline.recentChatItems);
-    const auto task = lookup(m_timeline.recentTaskChatItems);
-    const bool listedOrdinary = ordinary != m_timeline.recentChatItems.cend();
-    const bool listedTask = task != m_timeline.recentTaskChatItems.cend();
+    const auto ordinary = lookup(m_timeline.recentChats(false));
+    const auto task = lookup(m_timeline.recentChats(true));
+    const bool listedOrdinary = ordinary != m_timeline.recentChats(false).cend();
+    const bool listedTask = task != m_timeline.recentChats(true).cend();
     const auto chat = params.value(QStringLiteral("chat")).toObject().value(chatId).toObject();
     const auto user = params.value(QStringLiteral("users")).toObject().value(dialog).toObject();
     auto candidate = chatFromMetadata(dialog, {}, chat, user);
     candidate.serverChatId = chatId.toLongLong();
     candidate.taskChat = isRecentTaskChat(candidate.taskChat, listedTask, sections);
     const bool listed = candidate.taskChat ? listedTask : listedOrdinary;
-    const auto previous = m_timeline.recentOverlays.constFind(dialog);
-    const bool knownRow = listed || (previous != m_timeline.recentOverlays.cend() && !previous->preview.id.isEmpty());
+    const auto previous = m_timeline.overlays().constFind(dialog);
+    const bool knownRow = listed || (previous != m_timeline.overlays().cend() && !previous->preview.id.isEmpty());
     if (candidate.taskChat && listedTask)
         candidate = *task;
     else if (!candidate.taskChat && listedOrdinary)
@@ -603,19 +606,19 @@ void ChatsService::applyRecentPull(const QString &command, const QString &dialog
 
     const auto eventChatId = chatId.toLongLong();
     const auto canonicalChatId = eventChatId > 0 ? eventChatId
-        : candidate.serverChatId > 0 ? candidate.serverChatId : m_host.badgeChatId(dialog);
-    m_host.trackProjectChat(candidate);
+        : candidate.serverChatId > 0 ? candidate.serverChatId : m_badges.badgeChatId(dialog);
+    m_badges.trackProjectChat(candidate);
     const bool inRecentScope = knownRow || (candidate.taskChat ? !sections.isEmpty()
                                                                : sections.contains(QStringLiteral("default")));
-    const bool inProjectScope = m_host.hasProjectChat(canonicalChatId)
+    const bool inProjectScope = m_badges.hasProjectChat(canonicalChatId)
         && dialog == chatDialog(QString::number(canonicalChatId));
     // Reads, manual marks and updates for snapshot chats also affect the global count off page.
     if (!inRecentScope && !inProjectScope
-        && (canonicalChatId <= 0 || (messageEvent && !m_host.hasChatCounter(canonicalChatId))))
+        && (canonicalChatId <= 0 || (messageEvent && !m_badges.hasChatCounter(canonicalChatId))))
         return;
     auto &live = m_timeline.recentOverlay(dialog);
     live.chatId = canonicalChatId;
-    live.counterRevision = ++m_timeline.chatBadgeRevision;
+    live.counterRevision = m_timeline.nextBadgeRevision();
     if (counter)
         live.counter = counter;
     if (marked)
@@ -637,24 +640,24 @@ void ChatsService::applyRecentPull(const QString &command, const QString &dialog
         }
     }
     if (inRecentScope && (knownRow || live.counter.value_or(0) > 0 || live.markedUnread.value_or(false)))
-        publishRecentChats(candidate.taskChat ? m_timeline.recentTaskChatItems : m_timeline.recentChatItems, candidate.taskChat);
+        publishRecentChats(m_timeline.recentChats(candidate.taskChat), candidate.taskChat);
     if (inProjectScope)
-        m_host.publishProjectChatBadges(canonicalChatId);
-    m_host.publishUnreadChatCount();
+        m_badges.publishProjectChatBadges(canonicalChatId);
+    m_badges.publishUnreadChatCount();
 }
 
 bool ChatsService::acceptsRecentRead(const QString &dialog, const QJsonObject &params, const QJsonObject &extra) const
 {
-    const auto live = m_timeline.recentOverlays.constFind(dialog);
-    const auto state = m_timeline.dialogMessageStates.constFind(dialog);
-    const auto currentRead = state == m_timeline.dialogMessageStates.cend() ? -1 : state->lastReadId;
+    const auto live = m_timeline.overlays().constFind(dialog);
+    const auto *state = m_timeline.findMessageState(dialog);
+    const auto currentRead = !state ? -1 : state->lastReadId;
     const auto eventTime = field(extra, {"server_time_unix"}).toLongLong();
     bool hasRead = false;
     const auto lastRead = field(params, {"lastId"}).toLongLong(&hasRead);
     const bool exact = notificationFlag(params.value(QStringLiteral("exact"))).value_or(false);
     if (hasRead && !exact && lastRead < currentRead)
         return false;
-    if (live == m_timeline.recentOverlays.cend())
+    if (live == m_timeline.overlays().cend())
         return true;
     if (eventTime > 0 && eventTime < live->eventTime)
         return false;

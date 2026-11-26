@@ -14,15 +14,10 @@
 #include "core/notification_targets.h"
 #include "core/operations.h"
 
-#include <QAction>
-#include <QImageReader>
-#include <QBuffer>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QDialogButtonBox>
 #include <QDesktopServices>
-#include <QFileDialog>
-#include <QFileInfo>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QPushButton>
@@ -63,173 +58,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
             [this](const QUrl &url) { requestAvatar(url); }, [this](const QUrl &url) { return m_avatars.object(url); },
             [this] { scheduleAvatars(); }
         }, this);
-    setWindowTitle(QStringLiteral("Битрикс24"));
-    setMinimumSize(720, 500);
-    resize(1100, 710);
-    setStyleSheet(workspace::styleSheet() + ui::editorStyles());
-
-    auto *central = new QWidget(this);
-    central->setObjectName(QStringLiteral("workspace"));
-    auto *layout = new QHBoxLayout(central);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(0);
-
-    auto *rail = new QWidget(central);
-    rail->setObjectName(QStringLiteral("rail"));
-    rail->setFixedWidth(94);
-    auto *nav = new QVBoxLayout(rail);
-    nav->setContentsMargins(6, 14, 6, 10);
-    nav->setSpacing(13);
-    auto *brand = label(QStringLiteral("B24"), "brand", rail);
-    brand->setAccessibleName(QStringLiteral("Битрикс24"));
-    brand->setAlignment(Qt::AlignCenter);
-    brand->setFixedSize(37, 37);
-    nav->addWidget(brand, 0, Qt::AlignHCenter);
-    m_sections = new QListWidget(rail);
-    m_sections->setObjectName(QStringLiteral("sections"));
-    m_sections->setAccessibleName(QStringLiteral("Разделы"));
-    m_sections->setFrameShape(QFrame::NoFrame);
-    m_sections->setMouseTracking(true);
-    m_sections->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_sections->setTextElideMode(Qt::ElideNone);
-    m_sections->setItemDelegate(new ui::SectionRailPainter(m_sections));
-    m_sections->addItems({QStringLiteral("Чаты"), QStringLiteral("Проекты"), QStringLiteral("Уведомления"),
-                          QStringLiteral("Время")});
-    m_sections->setCurrentRow(0);
-    nav->addWidget(m_sections, 1);
-    m_mode = label(m_backend->isDemo() ? QStringLiteral("Демо") : QStringLiteral("Связь…"), "mode", rail);
-    m_mode->setAlignment(Qt::AlignCenter);
-    m_mode->setToolTip(ui::plainTooltip(m_backend->displayName()));
-    nav->addWidget(m_mode);
-    rail->setStyleSheet(QStringLiteral(R"(
-        QPushButton[railAction="true"] {
-            color: #e3f2ed; background: #254953; border: 1px solid #496a70;
-            border-radius: 7px; padding: 5px 3px; font-size: 14px;
-        }
-        QPushButton[railAction="true"]:hover { background: #315963; }
-        QPushButton[railAction="true"]:focus { border-color: #a3d1c4; }
-        QPushButton[railAction="true"]:pressed { background: #3a646a; }
-    )"));
-    auto *profile = ui::button(QStringLiteral("Профиль"), QStringLiteral("Настройки профиля"), rail);
-    profile->setProperty("railAction", true);
-    profile->setToolTip(QStringLiteral("Настройки профиля"));
-    connect(profile, &QPushButton::clicked, this, &MainWindow::showProfileSettings);
-    nav->addWidget(profile);
-    m_logout = ui::button(QStringLiteral("Выйти"), QStringLiteral("Выйти из аккаунта"), rail);
-    m_logout->setObjectName(QStringLiteral("logoutButton"));
-    m_logout->setProperty("railAction", true);
-    m_logout->setToolTip(QStringLiteral("Выйти из аккаунта"));
-    connect(m_logout, &QPushButton::clicked, this, &MainWindow::logoutRequested);
-    nav->addWidget(m_logout);
-    setLogoutAvailable(false);
-    layout->addWidget(rail);
-
-    auto *content = new QWidget(central);
-    auto *main = new QVBoxLayout(content);
-    main->setContentsMargins(0, 0, 0, 0);
-    main->setSpacing(0);
-    m_stack = new QStackedWidget(content);
-    m_chatPanel = new ChatPanel(m_backend, m_readOnly, {
-        [this] { return writable(); },
-        [this] { return !m_upload.operation.isEmpty(); },
-        [this] { return m_tasks && m_tasks->sendPending(); },
-        [this] { return m_sessionRecovery && m_sessionRecovery->isHidden(); },
-        [this] { return m_tasks ? m_tasks->card() : nullptr; },
-        [this](const QWidget *active) { return m_tasks && m_tasks->readActiveTask(active); },
-        [this](const QUrl &url) { return m_avatars.object(url); },
-        [this](const QUrl &url) { requestAvatar(url); },
-        [this](QListWidget *list) { bindMessageFiles(list, true); },
-        [this](const QString &id, const QString &kind) { pickFile(id, kind); },
-        [this](const QString &id, bool task) { return m_upload.pastedImagePending(id, task); },
-        [this](ui::ComposerSendController &controller, ui::ChatComposer *composer, const QString &id) {
-            sendFromComposer(controller, composer, id);
-        },
-        [this](const QString &href) { return messageLinkDestination(href); },
-        m_messagePreviews.get(),
-        m_messageFiles.get()
-    }, m_stack);
-    connect(m_chatPanel, &ChatPanel::statusChanged, this, &MainWindow::setStatus);
-    connect(m_chatPanel, &ChatPanel::avatarsRequested, this, &MainWindow::scheduleAvatars);
-    connect(m_chatPanel, &ChatPanel::avatarRowsChanged, this, &MainWindow::updateAvatarRows);
-    connect(m_chatPanel, &ChatPanel::historyClosed, this, &MainWindow::historyClosed);
-    connect(m_chatPanel, &ChatPanel::taskRequested, this, &MainWindow::openTaskCard);
-    connect(m_chatPanel, &ChatPanel::sectionRequested, this, [this] { m_sections->setCurrentRow(0); });
-    connect(m_chatPanel, &ChatPanel::refreshRequested, this, &MainWindow::onRefresh);
-    connect(m_chatPanel, &ChatPanel::linkRequested, this, [this](const QString &href) { openMessageLink(href); });
-    connect(m_chatPanel, &ChatPanel::unreadCountChanged, this, [this](qint64 count) { setRailUnreadCount(0, count); });
-    connect(m_chatPanel, &ChatPanel::dialogChanged, this, [this] { m_projectsPanel->cancelPendingMessageProject(); });
-    connect(m_chatPanel, &ChatPanel::directoryEmpty, this, [this] { m_projectsPanel->closeTools(); });
-    m_stack->addWidget(m_chatPanel);
-    m_projectsPanel = new ProjectsPanel(m_backend, {
-        [this] { return writable(); },
-        [this] { return !m_tasks || m_tasks->clearTask(); },
-        [this](const QUrl &url) { return m_avatars.object(url); }
-    }, m_stack);
-    connect(m_projectsPanel, &ProjectsPanel::statusChanged, this, &MainWindow::setStatus);
-    connect(m_projectsPanel, &ProjectsPanel::avatarsRequested, this, &MainWindow::scheduleAvatars);
-    connect(m_projectsPanel, &ProjectsPanel::avatarRowsChanged, this, &MainWindow::updateAvatarRows);
-    connect(m_projectsPanel, &ProjectsPanel::writeStateChanged, this, &MainWindow::updateWriteAvailability);
-    connect(m_projectsPanel, &ProjectsPanel::taskRequested, this, &MainWindow::openTaskCard);
-    connect(m_projectsPanel, &ProjectsPanel::refreshRequested, this, &MainWindow::onRefresh);
-    connect(m_projectsPanel, &ProjectsPanel::fileSaveRequested, this,
-            [this](const MessageFile &file, QWidget *source) { m_messageFiles->saveMessageFile(file, source); });
-    connect(m_projectsPanel, &ProjectsPanel::sectionRequested, this, [this] {
-        if (m_lastSection == 1)
-            refreshCurrentSection(false);
-        else
-            m_sections->setCurrentRow(1);
-    });
-    m_stack->addWidget(m_projectsPanel);
-    m_events = new NotificationsPanel(m_backend, m_readOnly, {
-        [this] { return m_online; },
-        [this] { return m_sessionRecovery->isHidden(); },
-        [this](const QString &href) { return messageLinkDestination(href); },
-        [this](QListWidget *list) { bindMessageFiles(list, true); }
-    }, m_stack);
-    connect(m_events, &NotificationsPanel::refreshRequested, this, &MainWindow::onRefresh);
-    connect(m_events, &NotificationsPanel::statusChanged, this, &MainWindow::setStatus);
-    connect(m_events, &NotificationsPanel::unreadCountChanged, this, [this](qint64 count) { setRailUnreadCount(2, count); });
-    connect(m_events, &NotificationsPanel::previewsRequested, this, &MainWindow::scheduleAvatars);
-    connect(m_events, &NotificationsPanel::targetRequested, this, [this](const NotificationTarget &target) { openPortalTarget(target); });
-    connect(m_events, &NotificationsPanel::linkRequested, this, &MainWindow::openMessageLink);
-    m_stack->addWidget(m_events);
-    m_worktime = new ui::WorktimePanel(m_backend, m_stack, m_readOnly);
-    m_stack->addWidget(m_worktime);
-    m_railWorkdayTimer = new QTimer(this);
-    m_railWorkdayTimer->setObjectName(QStringLiteral("railWorkdayTimer"));
-    m_railWorkdayTimer->setSingleShot(true);
-    m_railWorkdayTimer->setTimerType(Qt::PreciseTimer);
-    main->addWidget(m_stack, 1);
-    m_sessionRecovery = new QWidget(content);
-    auto *recovery = new QHBoxLayout(m_sessionRecovery);
-    recovery->setContentsMargins(15, 5, 15, 5);
-    recovery->addWidget(label(QStringLiteral("Вход в портал истёк"), "status", m_sessionRecovery), 1);
-    auto *renew = ui::button(QStringLiteral("Обновить вход"),
-                            QStringLiteral("Восстановить подключение к порталу"), m_sessionRecovery);
-    recovery->addWidget(renew);
-    connect(renew, &QPushButton::clicked, this, &MainWindow::sessionRecoveryRequested);
-    m_sessionRecovery->hide();
-    main->addWidget(m_sessionRecovery);
-    m_status = label(QString(), "status", content);
-    m_status->setContentsMargins(15, 7, 15, 7);
-    m_status->setAccessibleName(QStringLiteral("Состояние"));
-    m_status->hide();
-    main->addWidget(m_status);
-    layout->addWidget(content, 1);
-    setCentralWidget(central);
-
-    auto *refresh = new QAction(this);
-    refresh->setShortcut(QKeySequence(Qt::Key_F5));
-    connect(refresh, &QAction::triggered, this, &MainWindow::onRefresh);
-    addAction(refresh);
-    for (int i = 0; i < m_sections->count(); ++i) {
-        auto *action = new QAction(this);
-        const auto shortcut = QStringLiteral("Alt+%1").arg(i + 1);
-        action->setShortcut(QKeySequence(shortcut));
-        m_sections->item(i)->setToolTip(QStringLiteral("%1 (%2)").arg(m_sections->item(i)->text(), shortcut));
-        connect(action, &QAction::triggered, this, [this, i] { m_sections->setCurrentRow(i); });
-        addAction(action);
-    }
+    buildUi();
 
     connect(m_sections, &QListWidget::currentRowChanged, this, &MainWindow::onSectionChanged);
     connect(m_backend, &Backend::failed, this, &MainWindow::onFailed);
@@ -293,37 +122,7 @@ MainWindow::MainWindow(Backend *backend, bool readOnly, QWidget *parent, PublicL
     });
     updateWriteAvailability();
 
-    connect(m_backend, &Backend::avatarLoaded, this, [this](const QUrl &url, const QByteArray &bytes) {
-        if (!m_requestedAvatars.remove(url))
-            return;
-        auto *photo = new QPixmap;
-        if (!bytes.isEmpty() && bytes.size() <= 512 * 1024) {
-            QBuffer input;
-            input.setData(bytes);
-            input.open(QIODevice::ReadOnly);
-            QImageReader reader(&input);
-            const auto format = reader.format();
-            const auto size = reader.size();
-            if ((format == "png" || format == "jpeg" || format == "webp" || format == "gif") &&
-                size.isValid() && !size.isEmpty() && size.width() <= 1200 && size.height() <= 1200) {
-                const auto scaled = size.scaled(144, 144, Qt::KeepAspectRatio);
-                reader.setScaledSize(QSize(qMax(1, scaled.width()), qMax(1, scaled.height())));
-                const auto image = reader.read();
-                if (!image.isNull() && image.width() <= 1200 && image.height() <= 1200) {
-                    const int side = qMin(image.width(), image.height());
-                    const QRect crop((image.width() - side) / 2, (image.height() - side) / 2, side, side);
-                    *photo = QPixmap::fromImage(image.copy(crop).scaled(72, 72, Qt::IgnoreAspectRatio,
-                                                                        Qt::SmoothTransformation));
-                }
-            }
-        }
-        m_avatars.insert(url, photo);
-        m_projectsPanel->refreshBoardAvatars();
-        m_chatPanel->refreshMentionAvatars();
-        m_tasks->refreshAvatars();
-        updateAvatarRows();
-        scheduleAvatars();
-    });
+    connect(m_backend, &Backend::avatarLoaded, this, &MainWindow::onAvatarLoaded);
     connect(m_backend, &Backend::personLoaded, this, [this](const Person &person) {
         if (!m_personDialog || m_personId != person.id)
             return;
@@ -537,15 +336,6 @@ void MainWindow::resizeEvent(QResizeEvent *event)
         m_events->scheduleVisibleNoticeRead();
 }
 
-void MainWindow::sendFromComposer(ui::ComposerSendController &controller, ui::ChatComposer *composer, const QString &id)
-{
-    const bool task = controller.isTask();
-    controller.send(*composer, id, writable(), m_upload.pastedImagePending(id, task),
-                    [this, composer, id, task](const QString &caption) {
-                        uploadPastedChatImage(composer, id, task, caption);
-                    });
-}
-
 void MainWindow::onFailed(const QString &operation, const QString &reason)
 {
     const auto [kind, ids] = parseOperation(operation);
@@ -731,79 +521,6 @@ void MainWindow::updateRailWorkday()
         m_railWorkdayTimer->stop();
 }
 
-void MainWindow::scheduleAvatars()
-{
-    if (m_avatarUpdateQueued)
-        return;
-    m_avatarUpdateQueued = true;
-    QTimer::singleShot(0, this, [this] {
-        m_avatarUpdateQueued = false;
-        loadVisibleAvatars();
-        m_messagePreviews->loadVisibleChatPreviews();
-    });
-}
-
-void MainWindow::requestAvatar(const QUrl &url)
-{
-    if (m_requestedAvatars.size() >= 4 || !url.isValid() || url.scheme() != QStringLiteral("https") ||
-        url.host().isEmpty() || !url.userInfo().isEmpty() || m_avatars.contains(url) || m_requestedAvatars.contains(url))
-        return;
-    m_requestedAvatars.insert(url);
-    m_backend->requestAvatar(url);
-}
-
-void MainWindow::loadVisibleAvatars()
-{
-    const auto requestVisible = [this](QListWidget *list) {
-        if (!list || !list->isVisible())
-            return;
-        const auto first = list->indexAt(QPoint(4, 3));
-        for (int row = first.isValid() ? first.row() : 0; row < list->count(); ++row) {
-            const auto *item = list->item(row);
-            const auto rect = list->visualItemRect(item);
-            if (rect.top() >= list->viewport()->height())
-                break;
-            if (rect.bottom() >= 0)
-                requestAvatar(item->data(workspace::AvatarUrl).toUrl());
-        }
-    };
-    m_tasks->requestVisibleAvatars();
-    if (m_lastSection == 0) {
-        m_chatPanel->requestVisibleAvatars([this](const QUrl &url) { requestAvatar(url); }, requestVisible);
-    } else if (m_lastSection == 1) {
-        m_projectsPanel->requestVisibleAvatars([this](const QUrl &url) { requestAvatar(url); }, requestVisible);
-    }
-    if (auto *history = m_tasks->history())
-        requestVisible(history);
-    if (m_personDialog)
-        requestAvatar(m_personAvatarUrl);
-}
-
-void MainWindow::updateAvatarRows()
-{
-    const auto updateList = [this](QListWidget *list) {
-        for (int i = 0; i < list->count(); ++i) {
-            auto *item = list->item(i);
-            const auto url = item->data(workspace::AvatarUrl).toUrl();
-            if (!url.isEmpty()) {
-                const auto *photo = m_avatars.object(url);
-                item->setData(workspace::AvatarImage, photo ? QVariant::fromValue(*photo) : QVariant{});
-            }
-        }
-        if (list == m_chatPanel->history() || list == m_tasks->history())
-            list->viewport()->update();
-    };
-    m_chatPanel->updateAvatars(updateList);
-    m_projectsPanel->updateAvatars(updateList);
-    if (auto *history = m_tasks->history())
-        updateList(history);
-    if (m_personDialog) {
-        if (const auto *photo = m_avatars.object(m_personAvatarUrl))
-            m_personAvatar->setPhoto(*photo);
-    }
-    m_events->repaintRows();
-}
-
 void MainWindow::openPortalTarget(NotificationTarget target, QWidget *source, const QUrl &messageUrl)
 {
     if (target.id.isEmpty())
@@ -877,65 +594,6 @@ void MainWindow::openPerson(const QString &id, QWidget *source)
     });
     dialog->show();
     m_backend->requestPerson(id);
-}
-
-void MainWindow::bindMessageFiles(QListWidget *list, bool linkCards)
-{
-    auto *delegate = static_cast<workspace::RowPainter *>(list->itemDelegate());
-    m_messageFiles->bindMessageFiles(list);
-    delegate->setMessageLinkHandler([this, list](const QString &href) { openMessageLink(href, list); });
-    if (linkCards)
-        m_messagePreviews->bindLinkCards(list, delegate);
-}
-
-void MainWindow::uploadPastedChatImage(ui::ChatComposer *composer, const QString &scope, bool task, const QString &caption)
-{
-    if (!m_upload.operation.isEmpty())
-        return;
-    const auto draft = composer->draft();
-    if (!draft.image)
-        return;
-    const auto feedback = [this, task, &scope](const QString &status, bool loading = false) {
-        if (!task || !m_tasks->showTaskStatus(scope, status, loading))
-            setStatus(status, loading);
-    };
-    if (!draft.reply.id.isEmpty()) {
-        feedback(QStringLiteral("Чтобы отправить изображение, отмените ответ или удалите изображение из черновика"));
-        return;
-    }
-    m_upload.operation = operationKey(task ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scope);
-    m_upload.pastedImage = draft;
-    m_upload.name = QFileInfo(draft.image->path).fileName();
-    feedback(QStringLiteral("Отправляем изображение…"), true);
-    m_chatPanel->updateComposers();
-    updateWriteAvailability();
-    m_backend->uploadChatImage(scope, draft.image->path, task, caption, draft.image->directory);
-}
-
-void MainWindow::pickFile(const QString &scope, const QString &kind)
-{
-    if (!writable() || !m_upload.operation.isEmpty() || scope.isEmpty())
-        return;
-    const bool attachment = kind == QStringLiteral("task");
-    const bool taskChat = kind == QStringLiteral("task-chat");
-    QWidget *parent = this;
-    if ((attachment || taskChat) && m_tasks->card())
-        parent = m_tasks->card();
-    const auto path = QFileDialog::getOpenFileName(parent, QStringLiteral("Выберите файл"));
-    if (path.isEmpty() || !writable())
-        return;
-    m_upload.operation = operationKey(attachment ? OperationKind::AttachTask
-        : taskChat ? OperationKind::UploadTaskChat : OperationKind::UploadChat, scope);
-    m_upload.name = QFileInfo(path).fileName();
-    const auto status = QStringLiteral("Загружаем %1…").arg(m_upload.name);
-    if (!(attachment || taskChat) || !m_tasks->showTaskStatus(scope, status, true))
-        setStatus(status, true);
-    m_chatPanel->updateComposers();
-    updateWriteAvailability();
-    if (attachment)
-        m_backend->attachTaskFile(scope, path);
-    else
-        m_backend->uploadChatFile(scope, path, taskChat);
 }
 
 } // namespace bx

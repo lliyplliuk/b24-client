@@ -36,8 +36,9 @@ const QString csrfRefreshOp = operationKey(OperationKind::CsrfRefresh);
 
 CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     : Backend(parent), m_session(std::move(session)), m_allowLoopback(allowLoopback),
-      m_portalHttp(*this, m_http, this), m_projects(*this, m_portalHttp, this), m_tasks(*this, m_portalHttp, this),
-      m_chats(*this, m_timeline, m_portalHttp, this), m_notices(*this, m_timeline, m_portalHttp, this),
+      m_portalHttp(*this, m_http, this), m_projects(*this, m_portalHttp, this),
+      m_tasks(*this, *this, *this, m_portalHttp, this),
+      m_chats(*this, *this, *this, *this, *this, m_timeline, m_portalHttp, this), m_notices(*this, m_timeline, m_portalHttp, this),
       m_pull(*this, m_portalHttp, this)
 {
     connect(&m_notices, &NotificationsService::notificationsLoaded, this, &Backend::notificationsLoaded);
@@ -220,24 +221,13 @@ void CloudBackend::resetAccountScopedState()
     m_pendingAnchorEvents.clear();
     m_chatContacts.clear();
     m_registeredMessageFileUrls.clear();
-    m_timeline.replyPreviews.clear();
-    m_timeline.dialogMessageStates.clear();
     m_messageViewerMembership.clear();
     m_messageViewerCounts.clear();
-    m_timeline.taskDialogs.clear();
-    m_timeline.dialogChatIds.clear();
 
     m_pull.reset();
-    m_timeline.sentTemplates.clear();
-
-    // MainWindow does not reopen the chat or task card on accountScopeChanged.
-    // Resume history updates only when a view requests them for the new account.
-    m_timeline.openDialog.clear();
-    m_timeline.openTask.clear();
+    // MainWindow reopens history only when a view requests it for the new account.
+    m_timeline.resetAccount();
     m_portalHttp.resetHistoryRetries();
-    m_timeline.recentDirty = false;
-    m_timeline.chatDirty = false;
-    m_timeline.taskMessagesDirty = false;
     updateHistoryCatchup();
 
     m_notices.resetSettings();

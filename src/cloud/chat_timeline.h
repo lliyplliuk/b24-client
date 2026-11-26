@@ -9,8 +9,12 @@
 
 namespace bx {
 
-// Shared by recent rows, history and the badge/read-receipt reconciliation code.
-struct ChatTimeline {
+// CloudBackend owns this account's timeline and resets it when the account changes.
+// Chat updates address one dialog at a time. Looking up a dialog must not create an
+// entry; insertion protects the two open histories when evicting message state.
+// History, recent rows and receipts compare revisions from the same badge clock.
+class ChatTimeline {
+public:
     struct RecentOverlay {
         Chat preview;
         struct HistoryPreview {
@@ -31,7 +35,6 @@ struct ChatTimeline {
         std::optional<bool> markedUnread;
     };
     RecentOverlay &recentOverlay(const QString &dialog);
-    QHash<QString, RecentOverlay> recentOverlays;
     struct DialogMessageState {
         qint64 lastReadId = -1;
         qint64 confirmedReadThrough = 0;
@@ -48,11 +51,49 @@ struct ChatTimeline {
         QString pendingReadTask;
     };
     DialogMessageState &dialogMessageState(const QString &dialog);
-    bool recentDirty = false;
+    const DialogMessageState *findMessageState(const QString &dialog) const;
+    quint64 historyGeneration(const QString &dialog) const;
+    qint64 lastReadId(const QString &dialog) const;
+    const QHash<QString, RecentOverlay> &overlays() const { return recentOverlays; }
+
+    const QString &activeDialog() const { return openDialog; }
+    const QString &activeTask() const { return openTask; }
+    QString activeTaskDialog() const { return taskDialogs.value(openTask); }
+    void openHistory(const QString &scope, bool task);
+    void invalidateHistory(bool task);
+    void invalidateRecent();
+    QString taskDialog(const QString &task) const { return taskDialogs.value(task); }
+    bool hasTaskForDialog(const QString &dialog) const;
+    QStringList tasksForDialog(const QString &dialog) const { return taskDialogs.keys(dialog); }
+    qint64 knownChatId(const QString &dialog) const { return dialogChatIds.value(dialog); }
+    QString dialogForChat(qint64 id, const QString &fallback) const { return dialogChatIds.key(id, fallback); }
+
+    const QVector<Chat> &recentChats(bool task) const { return task ? recentTaskChatItems : recentChatItems; }
+    void replaceRecentChats(QVector<Chat> chats, bool task);
+    const QVector<Chat> &legacyTasks() const { return legacyTaskChats; }
+    void replaceLegacyTasks(QVector<Chat> chats);
+    bool showingTaskChats() const { return showTaskChats; }
+    void selectRecentSection(bool task);
+
+    quint64 badgeRevision() const { return chatBadgeRevision; }
+    quint64 nextBadgeRevision();
+    quint64 snapshotRevision() const { return chatCounterSnapshotRevision; }
+    bool wasSentTemplate(const QString &id) const { return sentTemplates.contains(id); }
+    void rememberSentTemplate(const QString &id);
+    bool hasReplyPreview(const QString &dialog, const QString &message) const;
+    void forgetReplyPreview(const QString &dialog, const QString &message);
+
+private:
+    friend class CloudBackend;
+    ChatTimeline() = default;
+    Q_DISABLE_COPY_MOVE(ChatTimeline)
+
+    void resetAccount();
     struct ReplyPreview { QString author; QString text; QVector<MessageFile> files; };
     mutable QCache<QString, ReplyPreview> replyPreviews{128};
     static QString replyPreviewKey(const QString &dialog, const QString &message);
-    void rememberSentTemplate(const QString &id);
+    QHash<QString, RecentOverlay> recentOverlays;
+    bool recentDirty = false;
     QString openDialog;
     QString openTask;
     bool chatDirty = false;

@@ -29,7 +29,9 @@ namespace bx {
 
 namespace signin { class SessionRestore; }
 
-class CloudBackend final : public Backend, private NotificationsHost, private PullHost, private PortalSession, private ProjectsHost, private ChatsHost, private TasksHost {
+class CloudBackend final : public Backend, private NotificationsHost, private PullHost, private PortalSession, private ProjectsHost,
+                           private CloudServiceContext, private ChatActivityHost, private ChatHistoryHost,
+                           private ChatDirectoryHost, private ChatBadgeHost, private TaskChatHost, private TaskFileHost {
     Q_OBJECT
 
 public:
@@ -214,7 +216,6 @@ private:
     void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser) override;
     void requestCurrentUser(const QString &operation, std::function<void(const QString &)> onUser,
                             const std::shared_ptr<Session> &candidate = {});
-    QByteArray csrfToken() const override { return m_session.csrf; }
     quint64 unreadBindingRevision() const override { return m_projects.unreadBindingRevision(); }
     void rememberLoadedTask(const QString &taskId, const QJsonObject &task, quint64 bindingRevision) override;
     void updateTaskChatProject(const QString &taskId, qint64 project) override;

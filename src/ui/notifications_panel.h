@@ -69,6 +69,10 @@ signals:
     void linkRequested(const QString &href, QWidget *source);
 
 private:
+    void showSettings();
+    void connectNoticeActions();
+    void connectNotificationHistory();
+    static QString actionLabel(const NotificationTarget &target, bool preferTargetLabel = true);
     bool writable() const { return !m_readOnly && m_workspace.online(); }
     void requestNotificationHistory();
     void updateNotificationRailBadge();

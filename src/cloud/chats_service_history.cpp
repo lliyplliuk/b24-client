@@ -17,7 +17,7 @@ const QString chatIdentityOp = operationKey(OperationKind::ChatHistoryIdentity);
 
 void ChatsService::loadMessages(const QString &key, const QString &dialogId, bool task, bool retry)
 {
-    if (m_host.currentUserId().isEmpty() && (!m_triedHistoryIdentity || m_portalHttp.contains(chatIdentityOp))) {
+    if (m_directory.currentUserId().isEmpty() && (!m_triedHistoryIdentity || m_portalHttp.contains(chatIdentityOp))) {
         auto &pending = m_historiesWaitingForIdentity;
         pending.erase(std::remove_if(pending.begin(), pending.end(), [task](const auto &request) {
             return request.task == task;
@@ -25,7 +25,7 @@ void ChatsService::loadMessages(const QString &key, const QString &dialogId, boo
         pending.append({key, dialogId, task});
         if (!m_triedHistoryIdentity) {
             m_triedHistoryIdentity = true;
-            m_host.withCurrentUser(chatIdentityOp, [this](qint64) { resumeHistoriesWithIdentity(); });
+            m_session.withCurrentUser(chatIdentityOp, [this](qint64) { resumeHistoriesWithIdentity(); });
         }
         return;
     }
@@ -33,28 +33,28 @@ void ChatsService::loadMessages(const QString &key, const QString &dialogId, boo
     if (m_portalHttp.contains(operation))
         return;
     m_portalHttp.beginHistory(dialogId, task, retry);
-    const auto generation = m_timeline.dialogMessageStates.value(dialogId).historyGeneration;
-    const auto superseded = [this, key, dialogId, task, generation, scope = m_host.accountScopeRevision()] {
-        if (scope != m_host.accountScopeRevision())
+    const auto generation = m_timeline.historyGeneration(dialogId);
+    const auto superseded = [this, key, dialogId, task, generation, scope = m_session.accountScopeRevision()] {
+        if (scope != m_session.accountScopeRevision())
             return true;
-        if (m_timeline.dialogMessageStates.value(dialogId).historyGeneration == generation)
+        if (m_timeline.historyGeneration(dialogId) == generation)
             return false;
-        if (task ? m_timeline.openTask == key : m_timeline.openDialog == dialogId) {
-            (task ? m_timeline.taskMessagesDirty : m_timeline.chatDirty) = true;
-            m_host.scheduleRefresh();
+        if (task ? m_timeline.activeTask() == key : m_timeline.activeDialog() == dialogId) {
+            m_timeline.invalidateHistory(task);
+            m_activity.scheduleRefresh();
         }
         return true;
     };
-    const auto expectedChatId = m_host.badgeChatId(dialogId);
+    const auto expectedChatId = m_badges.badgeChatId(dialogId);
     const auto groupChatId = groupDialogChatId(dialogId);
     const auto popupChatId = groupChatId > 0 ? groupChatId : expectedChatId;
     const bool snapshot = expectedChatId > 0;
     const auto snapshotOperation = operationKey(snapshot ? OperationKind::ChatHistorySnapshot : OperationKind::ChatHistoryRead, operation);
     const auto deliver = [this, key, dialogId, popupChatId, task](const QJsonObject &history, bool trustedMetadata) {
-        const auto messages = m_host.decodeMessages(history, true, dialogId);
-        if (trustedMetadata && (task ? m_timeline.openTask == key : m_timeline.openDialog == dialogId)) {
+        const auto messages = m_history.decodeMessages(history, true, dialogId);
+        if (trustedMetadata && (task ? m_timeline.activeTask() == key : m_timeline.activeDialog() == dialogId)) {
             rememberRecentHistoryPreview(dialogId, history);
-            m_host.reconcileHistoryPopups(dialogId, popupChatId, task, history, messages);
+            m_history.reconcileHistoryPopups(dialogId, popupChatId, task, history, messages);
         }
         if (task)
             emit taskMessagesLoaded(key, messages);
@@ -65,7 +65,7 @@ void ChatsService::loadMessages(const QString &key, const QString &dialogId, boo
          {{QStringLiteral("dialogId"), dialogId}, {QStringLiteral("messageLimit"), QStringLiteral("25")}},
          snapshotOperation,
          [this, key, dialogId, task, operation, superseded, deliver, popupChatId,
-                             counterRevision = ++m_timeline.chatBadgeRevision](QJsonValue data) {
+                             counterRevision = m_timeline.nextBadgeRevision()](QJsonValue data) {
         if (superseded())
             return;
         const auto object = data.toObject();
@@ -74,28 +74,28 @@ void ChatsService::loadMessages(const QString &key, const QString &dialogId, boo
             if (object.value(QStringLiteral("messages")).isArray())
                 deliver(object, false);
             else
-                m_host.failShape(operation);
+                m_session.failShape(operation);
             return;
         }
         const auto chat = object.value(QStringLiteral("chat")).toObject();
         const auto publishHistory = [this, key, dialogId, task, chat, popupChatId, counterRevision, deliver]
             (const QJsonObject &history) {
-            if (task ? m_timeline.openTask == key : m_timeline.openDialog == dialogId) {
+            if (task ? m_timeline.activeTask() == key : m_timeline.activeDialog() == dialogId) {
                 const auto rows = history.value(QStringLiteral("messages")).toArray();
-                rememberUnreadHistoryRows(dialogId, popupChatId > 0 ? popupChatId : m_host.badgeChatId(dialogId),
+                rememberUnreadHistoryRows(dialogId, popupChatId > 0 ? popupChatId : m_badges.badgeChatId(dialogId),
                                           rows, counterRevision);
                 reconcileHistoryUnread(dialogId, chat, rows, popupChatId, counterRevision);
             }
             deliver(history, true);
         };
         if (data.isObject()) {
-            const auto live = m_timeline.recentOverlays.constFind(dialogId);
-            const auto counterCurrent = m_timeline.chatCounterSnapshotRevision <= counterRevision
-                && (live == m_timeline.recentOverlays.cend() || live->counterRevision <= counterRevision);
-            m_host.rememberDialog(dialogId, object, counterCurrent);
-            m_host.rememberDialogContact(dialogId, object);
+            const auto live = m_timeline.overlays().constFind(dialogId);
+            const auto counterCurrent = m_timeline.snapshotRevision() <= counterRevision
+                && (live == m_timeline.overlays().cend() || live->counterRevision <= counterRevision);
+            m_directory.rememberDialog(dialogId, object, counterCurrent);
+            m_directory.rememberDialogContact(dialogId, object);
             acceptPinnedSnapshot(dialogId, object);
-        } else if (task ? m_timeline.openTask != key : m_timeline.openDialog != dialogId) {
+        } else if (task ? m_timeline.activeTask() != key : m_timeline.activeDialog() != dialogId) {
             return;
         }
         if (object.value(QStringLiteral("messages")).isArray()) {
@@ -104,10 +104,10 @@ void ChatsService::loadMessages(const QString &key, const QString &dialogId, boo
         }
         auto chatId = field(object, {"chatId", "CHAT_ID"});
         if (chatId.isEmpty())
-            chatId = QString::number(popupChatId > 0 ? popupChatId : m_host.badgeChatId(dialogId));
+            chatId = QString::number(popupChatId > 0 ? popupChatId : m_badges.badgeChatId(dialogId));
         const auto pagingChatId = numericId(chatId).toLongLong();
         if (pagingChatId <= 0 || (popupChatId > 0 && pagingChatId != popupChatId))
-            return m_host.failShape(operation);
+            return m_session.failShape(operation);
 
         m_portalHttp.ajax(QStringLiteral("im.v2.Chat.Message.list"),
              {{QStringLiteral("chatId"), chatId}, {QStringLiteral("limit"), QStringLiteral("25")}},
@@ -116,7 +116,7 @@ void ChatsService::loadMessages(const QString &key, const QString &dialogId, boo
                 return;
             const auto result = page.toObject();
             if (!result.value(QStringLiteral("messages")).isArray() || !matchesRequestedHistory(result, dialogId, pagingChatId))
-                return m_host.failShape(operation);
+                return m_session.failShape(operation);
             publishHistory(result);
         }, operation);
     }, operation);
@@ -125,7 +125,7 @@ void ChatsService::loadMessages(const QString &key, const QString &dialogId, boo
 void ChatsService::rememberRecentHistoryPreview(const QString &dialog, const QJsonObject &history)
 {
     const auto groupChatId = groupDialogChatId(dialog);
-    const auto expectedChatId = groupChatId > 0 ? groupChatId : m_host.badgeChatId(dialog);
+    const auto expectedChatId = groupChatId > 0 ? groupChatId : m_badges.badgeChatId(dialog);
     if (expectedChatId <= 0)
         return;
     QJsonObject latest;
@@ -152,9 +152,9 @@ void ChatsService::rememberRecentHistoryPreview(const QString &dialog, const QJs
     const bool recoverRecent = live.rejectedRecentPreviewChatId == expectedChatId;
     const bool recoverTask = live.rejectedTaskPreviewChatId == expectedChatId;
     if (recoverRecent)
-        publishRecentChats(m_timeline.recentChatItems, false);
+        publishRecentChats(m_timeline.recentChats(false), false);
     if (recoverTask)
-        publishRecentChats(m_timeline.recentTaskChatItems, true);
+        publishRecentChats(m_timeline.recentChats(true), true);
 }
 
 void ChatsService::resumeHistoriesWithIdentity()
@@ -175,7 +175,7 @@ void ChatsService::setChatPinned(const QString &dialogId, bool pinned)
     const auto endpoint = pinned ? QStringLiteral("im.v2.Chat.pin") : QStringLiteral("im.v2.Chat.unpin");
     m_portalHttp.ajax(endpoint, {{QStringLiteral("dialogId"), dialog}}, operation, [this, dialogId, pinned, operation](QJsonValue result) {
         if (result == false)
-            return m_host.failShape(operation);
+            return m_session.failShape(operation);
         emit chatPinChanged(dialogId, pinned);
     });
 }
@@ -211,11 +211,11 @@ void ChatsService::sendMessage(const QString &key, const QString &dialogId, cons
             return;
         }
         emit messageSent(scope, id);
-        if (task && m_timeline.openTask == key)
-            m_timeline.taskMessagesDirty = true;
-        else if (!task && m_timeline.openDialog == dialogId)
-            m_timeline.chatDirty = true;
-        m_host.scheduleRefresh();
+        if (task && m_timeline.activeTask() == key)
+            m_timeline.invalidateHistory(true);
+        else if (!task && m_timeline.activeDialog() == dialogId)
+            m_timeline.invalidateHistory(false);
+        m_activity.scheduleRefresh();
     });
 }
 
@@ -249,7 +249,7 @@ void ChatsService::sendTaskReply(const QString &taskId, const QString &text, con
 
 void ChatsService::sendTaskMessage(const QString &taskId, const QString &text, const QString &replyId)
 {
-    const auto dialog = m_timeline.taskDialogs.value(taskId);
+    const auto dialog = m_timeline.taskDialog(taskId);
     if (dialog.isEmpty()) {
         emit failed(operationKey(OperationKind::SendTask, taskId), QStringLiteral("Сначала откройте чат задачи"));
         return;
@@ -259,12 +259,12 @@ void ChatsService::sendTaskMessage(const QString &taskId, const QString &text, c
 
 void ChatsService::rememberUnreadHistoryRows(const QString &dialog, qint64 chatId, const QJsonArray &rows, quint64 revision)
 {
-    if (chatId <= 0 || m_host.badgeChatId(dialog) != chatId)
+    if (chatId <= 0 || m_badges.badgeChatId(dialog) != chatId)
         return;
     auto &state = m_timeline.dialogMessageState(dialog);
     if (state.readReceiptRevision > revision)
         return;
-    const auto currentUser = numericId(m_host.currentUserId()).toLongLong();
+    const auto currentUser = numericId(m_directory.currentUserId()).toLongLong();
     QSet<qint64> pageUnread;
     for (const auto &value : rows) {
         const auto row = value.toObject();
@@ -309,10 +309,10 @@ void ChatsService::reconcileHistoryUnread(const QString &dialog, const QJsonObje
         || (!chatIdAlias.isUndefined() && numericId(string(chatIdAlias)).toLongLong() != chatId)
         || validDialog(field(chat, {"dialogId"})) != dialog || firstUnreadId != 0
         || !hasReadId || readId < 0
-        || m_timeline.chatCounterSnapshotRevision > revision)
+        || m_timeline.snapshotRevision() > revision)
         return;
-    const auto state = m_timeline.dialogMessageStates.constFind(dialog);
-    if (state != m_timeline.dialogMessageStates.cend() && readId < state->lastReadId)
+    const auto *state = m_timeline.findMessageState(dialog);
+    if (state && readId < state->lastReadId)
         return;
     auto &live = m_timeline.recentOverlay(dialog);
     if (live.counterRevision > revision || live.incomingId > readId)
@@ -332,8 +332,8 @@ void ChatsService::reconcileHistoryUnread(const QString &dialog, const QJsonObje
     live.counterRevision = revision;
     live.counter = 0;
     if (changed) {
-        m_host.publishUnreadChatCount();
-        m_host.republishChatBadges(chatId);
+        m_badges.publishUnreadChatCount();
+        m_badges.republishChatBadges(chatId);
     }
 }
 
@@ -344,18 +344,17 @@ void ChatsService::requestChatMessages(const QString &dialogId)
         emit failed(operationKey(OperationKind::Chat, dialogId), QStringLiteral("Некорректный номер диалога"));
         return;
     }
-    if (m_timeline.openDialog != valid) {
+    if (m_timeline.activeDialog() != valid) {
         m_portalHttp.invalidateHistory(false);
-        m_timeline.openDialog = valid;
-        m_timeline.chatDirty = false;
-        m_host.clearPopupHistory(false);
+        m_timeline.openHistory(valid, false);
+        m_history.clearPopupHistory(false);
     }
-    if (m_host.chatsSectionActive())
-        m_host.updateHistoryCatchup(true);
-    if (m_host.chatsSectionActive() && m_host.canAutoRefreshChats() && (m_portalHttp.atCapacity()
+    if (m_activity.chatsSectionActive())
+        m_activity.updateHistoryCatchup(true);
+    if (m_activity.chatsSectionActive() && m_activity.canAutoRefreshChats() && (m_portalHttp.atCapacity()
         || m_portalHttp.contains(operationKey(OperationKind::Chat, dialogId)))) {
-        m_timeline.chatDirty = true;
-        m_host.scheduleRefresh();
+        m_timeline.invalidateHistory(false);
+        m_activity.scheduleRefresh();
         return;
     }
     loadMessages(dialogId, valid, false);
@@ -363,26 +362,25 @@ void ChatsService::requestChatMessages(const QString &dialogId)
 
 void ChatsService::requestTaskMessages(const QString &taskId)
 {
-    if (m_timeline.openTask != taskId) {
+    if (m_timeline.activeTask() != taskId) {
         m_portalHttp.invalidateHistory(true);
-        m_timeline.openTask = taskId;
-        m_timeline.taskMessagesDirty = false;
-        m_host.clearPopupHistory(true);
+        m_timeline.openHistory(taskId, true);
+        m_history.clearPopupHistory(true);
     }
-    m_host.updateHistoryCatchup(true);
-    if (m_host.canAutoRefreshChats() && (m_portalHttp.atCapacity()
+    m_activity.updateHistoryCatchup(true);
+    if (m_activity.canAutoRefreshChats() && (m_portalHttp.atCapacity()
         || m_portalHttp.contains(operationKey(OperationKind::TaskMessages, taskId)))) {
-        m_timeline.taskMessagesDirty = true;
-        m_host.scheduleRefresh();
+        m_timeline.invalidateHistory(true);
+        m_activity.scheduleRefresh();
         return;
     }
-    if (const auto id = m_timeline.taskDialogs.value(taskId); !id.isEmpty()) {
+    if (const auto id = m_timeline.taskDialog(taskId); !id.isEmpty()) {
         loadMessages(taskId, id, true);
         return;
     }
     const auto op = operationKey(OperationKind::TaskMessages, taskId);
-    m_host.loadChatTask(taskId, op, [this, taskId, op](const QJsonObject &) {
-        const auto dialog = m_timeline.taskDialogs.value(taskId);
+    m_history.loadChatTask(taskId, op, [this, taskId, op](const QJsonObject &) {
+        const auto dialog = m_timeline.taskDialog(taskId);
         if (dialog.isEmpty()) {
             emit failed(op, QStringLiteral("У задачи нет чата. Старые обсуждения могут быть в комментариях портала"));
             return;

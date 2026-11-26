@@ -1,7 +1,7 @@
 #pragma once
 
 #include "chat_timeline.h"
-#include "portal_http.h"
+#include "cloud_service_context.h"
 #include "core/models.h"
 #include "core/tunables.h"
 
@@ -14,53 +14,67 @@
 
 namespace bx {
 
-class ChatsHost : public virtual SessionStateHost {
+class ChatActivityHost {
 public:
-    using ResolvedDialog = std::function<void(const QString &, qint64)>;
-    virtual void applyReadHistory(const QString &dialog, const QJsonObject &receipt, const QStringList &submitted) = 0;
-    virtual void clearPopupHistory(bool task) = 0;
-    virtual void loadChatTask(const QString &taskId, const QString &operation, std::function<void(QJsonObject)> onTask) = 0;
-    virtual bool canAutoRefreshChats() const = 0;
-    virtual void updateHistoryCatchup(bool restart) = 0;
-    virtual bool handleAnchorPull(const QString &command, const QJsonObject &params) = 0;
-    virtual void deliverChatPopups() = 0;
+    virtual ~ChatActivityHost() = default;
     virtual bool chatForeground() const = 0;
     virtual bool chatOnline() const = 0;
     virtual bool chatsSectionActive() const = 0;
+    virtual bool canAutoRefreshChats() const = 0;
+    virtual void updateHistoryCatchup(bool restart) = 0;
+    virtual void scheduleRefresh() = 0;
+};
+
+class ChatHistoryHost {
+public:
+    virtual ~ChatHistoryHost() = default;
+    virtual void applyReadHistory(const QString &dialog, const QJsonObject &receipt, const QStringList &submitted) = 0;
+    virtual void clearPopupHistory(bool task) = 0;
+    virtual void loadChatTask(const QString &taskId, const QString &operation, std::function<void(QJsonObject)> onTask) = 0;
+    virtual bool handleAnchorPull(const QString &command, const QJsonObject &params) = 0;
+    virtual void deliverChatPopups() = 0;
+    virtual QVector<Message> decodeMessages(const QJsonObject &data, bool sortChronologically, const QString &dialog = {}) const = 0;
+    virtual void reconcileHistoryPopups(const QString &dialog, qint64 chatId, bool task, const QJsonObject &history,
+                                const QVector<Message> &messages) = 0;
+};
+
+class ChatDirectoryHost {
+public:
+    virtual ~ChatDirectoryHost() = default;
+    using ResolvedDialog = std::function<void(const QString &, qint64)>;
+    virtual QString currentUserId() const = 0;
+    virtual void rememberCurrentUser(const QString &id) = 0;
+    virtual void applyChatContact(Chat &chat) const = 0;
+    virtual void rememberChatContact(const QString &dialogId, const QJsonObject &user, bool publish) = 0;
+    virtual void rememberDialog(const QString &dialogId, const QJsonObject &payload, bool rememberCounter = true) = 0;
+    virtual void rememberDialogContact(const QString &dialogId, const QJsonObject &payload) = 0;
+    virtual void resolveDialog(const QString &scopeId, bool task, const QString &operation,
+                       const QString &requestKey, ResolvedDialog onDialog) = 0;
+};
+
+class ChatBadgeHost {
+public:
+    virtual ~ChatBadgeHost() = default;
     virtual bool hasProjectChat(qint64 chatId) const = 0;
     virtual bool hasChatCounter(qint64 chatId) const = 0;
     virtual void publishProjectChatBadges(qint64 chatId) = 0;
     virtual void republishChatBadges(qint64 changedChatId = 0) = 0;
     virtual void trackProjectChat(const Chat &chat) = 0;
     virtual void publishProjectChatCounts() = 0;
-    virtual void applyChatContact(Chat &chat) const = 0;
-    virtual QUrl avatarUrlFromPortal(const QString &value) const = 0;
     virtual qint64 badgeChatId(const QString &dialog) const = 0;
-    virtual QVector<Message> decodeMessages(const QJsonObject &data, bool sortChronologically, const QString &dialog = {}) const = 0;
     virtual void decorateChatBadges(Chat &chat) const = 0;
     virtual void decorateProjectTaskChat(Chat &chat) const = 0;
-    virtual void failShape(const QString &operation) = 0;
     virtual void loadChatBadges() = 0;
     virtual void publishUnreadChatCount() = 0;
-    virtual void reconcileHistoryPopups(const QString &dialog, qint64 chatId, bool task, const QJsonObject &history,
-                                const QVector<Message> &messages) = 0;
-    virtual void rememberChatContact(const QString &dialogId, const QJsonObject &user, bool publish) = 0;
-    virtual void rememberCurrentUser(const QString &id) = 0;
-    virtual void rememberDialog(const QString &dialogId, const QJsonObject &payload, bool rememberCounter = true) = 0;
-    virtual void rememberDialogContact(const QString &dialogId, const QJsonObject &payload) = 0;
-    virtual void resolveDialog(const QString &scopeId, bool task, const QString &operation,
-                       const QString &requestKey, ResolvedDialog onDialog) = 0;
-    virtual void scheduleRefresh() = 0;
-    virtual void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser) = 0;
-    virtual QUrl portalOrigin() const = 0;
-    virtual QString currentUserId() const = 0;
     virtual bool hasCounterSnapshot() const = 0;
 };
 
 class ChatsService final : public QObject {
     Q_OBJECT
 public:
-    ChatsService(ChatsHost &host, ChatTimeline &timeline, PortalHttp &http, QObject *parent);
+    ChatsService(CloudServiceContext &session, ChatActivityHost &activity, ChatHistoryHost &history,
+                 ChatDirectoryHost &directory, ChatBadgeHost &badges, ChatTimeline &timeline,
+                 PortalHttp &http, QObject *parent);
     void handleImPull(const QString &command, const QJsonObject &params, const QJsonObject &recentExtra, const QString &mid);
     void reset();
     void invalidateRecentStatuses();
@@ -132,7 +146,11 @@ private:
     void reconcileHistoryUnread(const QString &dialog, const QJsonObject &chat, const QJsonArray &messages,
                                 qint64 expectedChatId, quint64 revision);
     using Fields = PortalHttp::Fields;
-    ChatsHost &m_host;
+    CloudServiceContext &m_session;
+    ChatActivityHost &m_activity;
+    ChatHistoryHost &m_history;
+    ChatDirectoryHost &m_directory;
+    ChatBadgeHost &m_badges;
     ChatTimeline &m_timeline;
     PortalHttp &m_portalHttp;
     QString pullDialog(const QJsonObject &params, const QString &chatId) const;

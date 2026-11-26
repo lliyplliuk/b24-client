@@ -32,7 +32,7 @@ void NotificationsService::handleIncomingNoticePull(const QString &command, cons
     const auto author = numericId(field(message, {"senderId", "authorId"}));
     const auto templateId = field(message, {"templateId", "uuid"});
     if ((!m_host.currentUserId().isEmpty() && m_host.currentUserId() == author)
-        || (!templateId.isEmpty() && m_timeline.sentTemplates.contains(templateId)))
+        || (!templateId.isEmpty() && m_timeline.wasSentTemplate(templateId)))
         return;
     const bool isMessage = command.startsWith(QLatin1String("message"));
     if (!isMessage && params.value(QStringLiteral("onlyFlash")).toBool())
@@ -151,14 +151,14 @@ void NotificationsService::prepareMessagePullNotice(Notification &entry, const Q
         }
         taskId = target->id.startsWith(QLatin1String("chat"))
             ? notificationTaskId(target->id, eventChat) : QString();
-        const bool listedTask = std::any_of(m_timeline.recentTaskChatItems.cbegin(), m_timeline.recentTaskChatItems.cend(),
+        const bool listedTask = std::any_of(m_timeline.recentChats(true).cbegin(), m_timeline.recentChats(true).cend(),
                                            [&target](const Chat &chat) { return chat.id == target->id; });
         const auto sections = params.value(QStringLiteral("recentConfig")).toObject().value(QStringLiteral("sections")).toArray();
         const bool metadataTaskChat = isTaskChatMetadata(field(eventChat, {"type", "kind"}),
             eventChat.value(QStringLiteral("entityLink")).toObject())
             || isTaskChatType(field(eventChat, {"entityType", "entity_type"}));
         target->taskChat = !taskId.isEmpty() || isRecentTaskChat(metadataTaskChat, listedTask, sections)
-            || std::find(m_timeline.taskDialogs.cbegin(), m_timeline.taskDialogs.cend(), target->id) != m_timeline.taskDialogs.cend();
+            || m_timeline.hasTaskForDialog(target->id);
         entry.ordinaryChatMessage = !target->taskChat;
     }
     if (target && !target->messageId.isEmpty()) {
@@ -244,10 +244,10 @@ void NotificationsService::deliverChatPopups()
 
 bool NotificationsService::chatMuted(const ChatPopup &popup) const
 {
-    const auto state = m_timeline.dialogMessageStates.constFind(popup.dialog);
+    const auto *state = m_timeline.findMessageState(popup.dialog);
     const auto user = m_host.currentUserId();
     return mutedListContains(popup.muteList, user)
-        || (state != m_timeline.dialogMessageStates.cend()
+        || (state
             && (state->muted.value_or(false) || mutedListContains(state->muteList, user)));
 }
 
@@ -560,19 +560,19 @@ void NotificationsService::clearHistory(bool task)
 
 bool NotificationsService::noticeHistoryRead(const QString &dialog, qint64 id) const
 {
-    const auto state = m_timeline.dialogMessageStates.constFind(dialog);
-    return state != m_timeline.dialogMessageStates.cend() && id <= state->lastReadId && !state->historyUnread.contains(id);
+    const auto *state = m_timeline.findMessageState(dialog);
+    return state && id <= state->lastReadId && !state->historyUnread.contains(id);
 }
 
 bool NotificationsService::noticeConfirmedRead(const QString &dialog, qint64 id) const
 {
-    const auto state = m_timeline.dialogMessageStates.constFind(dialog);
-    return state != m_timeline.dialogMessageStates.cend() && (id <= state->confirmedReadThrough || state->exactlyRead.contains(id));
+    const auto *state = m_timeline.findMessageState(dialog);
+    return state && (id <= state->confirmedReadThrough || state->exactlyRead.contains(id));
 }
 
 bool NotificationsService::watchingPopupDialog(const QString &dialog) const
 {
-    return (m_host.chatsSectionActive() && dialog == m_timeline.openDialog) || (!m_timeline.openTask.isEmpty() && dialog == m_timeline.taskDialogs.value(m_timeline.openTask));
+    return (m_host.chatsSectionActive() && dialog == m_timeline.activeDialog()) || (!m_timeline.activeTask().isEmpty() && dialog == m_timeline.activeTaskDialog());
 }
 
 QString NotificationsService::notificationTaskId(const QString &dialog, const QJsonObject &eventChat) const
@@ -590,10 +590,9 @@ QString NotificationsService::notificationTaskId(const QString &dialog, const QJ
     const auto entityType = field(eventChat, {"entityType", "entity_type"});
     if (isTaskChatType(entityType) || (entityType.isEmpty() && taskChat))
         add(field(eventChat, {"entityId", "entity_id"}));
-    for (auto it = m_timeline.taskDialogs.cbegin(); it != m_timeline.taskDialogs.cend(); ++it)
-        if (it.value() == dialog)
-            add(it.key());
-    for (const auto &known : m_timeline.recentTaskChatItems)
+    for (const auto &id : m_timeline.tasksForDialog(dialog))
+        add(id);
+    for (const auto &known : m_timeline.recentChats(true))
         if (known.id == dialog && known.taskChat)
             add(known.taskId);
     return matching.size() == 1 ? *matching.cbegin() : QString();

@@ -86,6 +86,7 @@ public:
                   const QString &requestKey = {});
     void componentAction(const QString &action, const Fields &fields, const QString &operation, Handler onData,
                          const QString &component = QStringLiteral("bitrix:tasks.kanban"), const QString &requestKey = {});
+    QByteArray csrfToken() const { return m_session.currentSession().csrf; }
     QUrl actionUrl(const QString &action) const;
     void fetchPortalHtml(const QUrl &url, std::function<void(QString)> handler);
 

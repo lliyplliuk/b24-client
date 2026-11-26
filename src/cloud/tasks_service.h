@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cloud/portal_http.h"
+#include "cloud_service_context.h"
 #include "core/models.h"
 
 #include <QJsonArray>
@@ -9,13 +9,9 @@
 
 namespace bx {
 
-class TasksHost : public virtual SessionStateHost {
+class TaskChatHost {
 public:
-    virtual QUrl portalOrigin() const = 0;
-    virtual QByteArray csrfToken() const = 0;
-    virtual void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser) = 0;
-    virtual void failShape(const QString &operation) = 0;
-    virtual QUrl avatarUrlFromPortal(const QString &value) const = 0;
+    virtual ~TaskChatHost() = default;
     virtual quint64 unreadBindingRevision() const = 0;
     virtual void rememberLoadedTask(const QString &taskId, const QJsonObject &task, quint64 bindingRevision) = 0;
     virtual void rememberTaskTitle(const QString &id, const QString &title) = 0;
@@ -23,6 +19,11 @@ public:
     virtual void invalidateTaskChat(const QString &taskId) = 0;
     virtual void clearDeletedTaskHistory(const QString &taskId) = 0;
     virtual void forgetTaskChat(const QString &taskId) = 0;
+};
+
+class TaskFileHost {
+public:
+    virtual ~TaskFileHost() = default;
     virtual QUrl taskFileUrl(const QString &value, qint64 size, bool photo) const = 0;
     virtual QUrl taskImageUrl(const QString &value, const QString &attachmentId, const QString &objectId,
                               bool original = false) const = 0;
@@ -33,7 +34,8 @@ public:
 class TasksService final : public QObject {
     Q_OBJECT
 public:
-    TasksService(TasksHost &host, PortalHttp &http, QObject *parent) : QObject(parent), m_host(host), m_portalHttp(http) {}
+    TasksService(CloudServiceContext &session, TaskChatHost &taskChats, TaskFileHost &files,
+                 PortalHttp &http, QObject *parent);
     void reset();
     void handleOperationFailure(const QString &operation);
     void attachUploadedFile(const QString &taskId, const QString &fileId, const QString &operation);
@@ -71,12 +73,16 @@ signals:
     void failed(const QString &operation, const QString &reason);
 
 private:
-    TasksHost &m_host;
+    CloudServiceContext &m_session;
+    TaskChatHost &m_taskChats;
+    TaskFileHost &m_files;
     PortalHttp &m_portalHttp;
     using Fields = PortalHttp::Fields;
     using Handler = PortalHttp::Handler;
     void createTaskRequest(const QString &projectId, const QString &parentId, const TaskEdit &edit);
     void updateTaskRequisite(const QString &taskId, const TaskEdit &edit);
+    void updateTaskObservers(const QString &taskId, const QJsonObject &current, const QStringList &original,
+                             const QStringList &after, bool canManage);
     void updateTaskFields(const QString &taskId, QQueue<QPair<QString, QJsonObject>> writes,
                           const QString &requestKey = {});
     void finishTaskCardRead(const QString &taskId);
