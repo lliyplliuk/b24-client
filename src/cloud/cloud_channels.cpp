@@ -448,7 +448,7 @@ void CloudBackend::streamMessageFile(const QUrl &url, const std::shared_ptr<Mess
         request.setRawHeader("Accept-Encoding", "identity");
     auto *reply = m_http.get(request);
     download->reply = reply;
-    m_requests.insert(reply);
+    m_requests.insert(reply, {});
     reply->setReadBufferSize(downloadBlockBytes);
     if (download->mode == MessageDownloadMode::Video) {
         const int remaining = qMax(0, videoDownloadTimeoutMs - int(download->lifetime.elapsed()));
@@ -500,11 +500,10 @@ void CloudBackend::streamMessageFile(const QUrl &url, const std::shared_ptr<Mess
                 m_downloadTargets.remove(target);
         };
         const auto mode = download->mode;
-        if (!m_started || m_authExpired ||
-            (mode == MessageDownloadMode::Video && download->accountRevision != m_accountScopeRevision)) {
+        if (!m_started || m_authExpired || download->accountRevision != m_accountScopeRevision) {
             releaseTarget();
             download->file.cancelWriting();
-            if (m_started && mode != MessageDownloadMode::File)
+            if (m_started && (mode != MessageDownloadMode::File || download->accountRevision != m_accountScopeRevision))
                 failMessageDownload(download->requestedTarget, QStringLiteral("Сеанс портала завершён"), mode);
             return;
         }

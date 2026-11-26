@@ -179,6 +179,7 @@ private:
     void withCurrentUser(const QString &operation, std::function<void(qint64)> onUser);
     void requestCurrentUser(const QString &operation, std::function<void(const QString &)> onUser,
                             const std::shared_ptr<Session> &candidate = {});
+    void resetAccountScopedState();
     void rememberCurrentUser(const QString &id);
     Fields boardFields(const QString &projectId) const;
     Task boardTask(const QJsonObject &item, const QString &id, const QString &projectId,
@@ -469,7 +470,7 @@ private:
     QTimer m_configExpiry;
     QTimer m_historyCatchup;
     QTimer m_sessionKeepalive;
-    QSet<QNetworkReply *> m_requests;
+    QHash<QNetworkReply *, QString> m_requests;
     QNetworkReply *m_sessionRecoveryReply = nullptr;
     QSet<QString> m_inflightOperations;
     QHash<QString, QString> m_taskDialogs;

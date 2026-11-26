@@ -369,7 +369,7 @@ QNetworkReply *CloudBackend::startWorktimeRequest(const QUrl &url, const QByteAr
     }
 
     auto *reply = form.isEmpty() ? m_http.get(request) : m_http.post(request, form);
-    m_requests.insert(reply);
+    m_requests.insert(reply, {});
     reply->setReadBufferSize(limit + 1);
     QTimer::singleShot(15000, reply, [reply] {
         if (!reply->isFinished())

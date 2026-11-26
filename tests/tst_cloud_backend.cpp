@@ -255,6 +255,7 @@ public:
     QByteArray ordinaryRecentBadgeFixture;
     QByteArray recentHistoryFixture;
     QByteArray taskRecentBadgeFixture;
+    QString taskChatTitle = QStringLiteral("Проверить маршрут");
     QByteArray messengerPage;
     bool approveVisibleRead = false;
     bool approveAnchorRead = true;
@@ -926,7 +927,8 @@ private:
                     "startDatePlan":"2026-08-01T09:00:00Z","endDatePlan":"2026-08-03T12:00:00Z"},
                     {"id":43,"title":"Без дат","groupId":17},{"id":99,"title":"Не этот проект","groupId":18}]})");
             if (request.field(QStringLiteral("filter[ID][0]")) == QStringLiteral("42"))
-                return ajaxResult(R"({"tasks":[{"id":"42","title":"Проверить маршрут","groupId":17}]})");
+                return ajaxResult(QJsonDocument(QJsonObject{{"tasks", QJsonArray{
+                    QJsonObject{{"id", "42"}, {"title", taskChatTitle}, {"groupId", 17}}}}}).toJson(QJsonDocument::Compact));
             if (!request.field(QStringLiteral("filter[STAGE_ID]")).isEmpty())
                 return ajaxResult(R"({"tasks":[]})");
             return ajaxResult(R"({"tasks":[{"id":"149","title":"Найти смету","groupId":"17","stageId":"60"},
@@ -1219,6 +1221,9 @@ private slots:
     void taskCardRequiresTheMatchingLegacyResponse_data();
     void taskCardRequiresTheMatchingLegacyResponse();
     void discardsParallelTaskCardFromPreviousAccount();
+    void discardsCachedChatDataFromPreviousAccount();
+    void discardsPendingProjectsAndPullCursorFromPreviousAccount();
+    void settlesPendingSendOnAccountChange();
     void restoresReplyFromKeyedPhotoAndKeepsExactScope();
     void sendsOriginalReplyIdInBothChatScopes();
     void performsVerifiedMessageActions();
@@ -2178,6 +2183,161 @@ void TestCloudBackend::discardsParallelTaskCardFromPreviousAccount()
     QCOMPARE(cards.size(), 1);
     for (const auto &summary : summaries)
         QCOMPARE(summary.first().value<Task>().name, QStringLiteral("Current account task"));
+}
+
+void TestCloudBackend::discardsCachedChatDataFromPreviousAccount()
+{
+    CloudFixture fixture;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,"recentItems":[],"chats":[]})";
+    fixture.richRecentFixture = true;
+    fixture.taskChatTitle = QStringLiteral("Account A task");
+    fixture.chatResponseOverride = ajaxResult(R"({"chatId":91,"pins":[{"messageId":690}],
+        "messages":[{"id":710,"chatId":91,"authorId":11,"text":"Reply","replyId":690}],
+        "additionalMessages":[{"id":690,"chatId":91,"authorId":22,"text":"Account A message"}]})");
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy accounts(&backend, &Backend::accountScopeChanged);
+    QSignalSpy tasks(&backend, &Backend::taskChatsLoaded);
+    QSignalSpy pins(&backend, &Backend::pinnedMessagesLoaded);
+    QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
+    backend.setForeground(false);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 1);
+    backend.requestTaskChats();
+    QTRY_VERIFY(!tasks.isEmpty()
+                && tasks.last().first().value<QVector<Chat>>().value(0).title == fixture.taskChatTitle);
+    const auto dialog = QStringLiteral("chat91");
+    backend.requestPinnedMessages(dialog);
+    backend.requestChatMessages(dialog);
+    QTRY_COMPARE(history.size(), 1);
+    QTRY_COMPARE(pins.size(), 1);
+    QCOMPARE(history.last().at(1).value<QVector<Message>>().value(0).replyText, QStringLiteral("Account A message"));
+    QCOMPARE(pins.last().at(1).value<QVector<Message>>().value(0).text, QStringLiteral("Account A message"));
+
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
+    fixture.taskChatTitle = QStringLiteral("Account B task");
+    fixture.chatResponseOverride = ajaxResult(R"({"chatId":91,"pins":[],
+        "messages":[{"id":710,"chatId":91,"authorId":22,"text":"Reply","replyId":690}]})");
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 2);
+    pins.clear();
+    tasks.clear();
+    history.clear();
+    backend.requestPinnedMessages(dialog);
+    backend.requestChatMessages(dialog);
+    backend.requestTaskChats();
+    QTRY_VERIFY(!pins.isEmpty());
+    QTRY_VERIFY(!history.isEmpty());
+    QTRY_VERIFY(!tasks.isEmpty());
+    for (const auto &snapshot : pins)
+        QVERIFY(snapshot.at(1).value<QVector<Message>>().isEmpty());
+    const auto reply = history.first().at(1).value<QVector<Message>>().value(0);
+    QCOMPARE(reply.replyId, QStringLiteral("690"));
+    QVERIFY(reply.replyText.isEmpty());
+    QTRY_COMPARE(tasks.last().first().value<QVector<Chat>>().value(0).title, fixture.taskChatTitle);
+    for (const auto &snapshot : tasks)
+        QVERIFY(snapshot.first().value<QVector<Chat>>().value(0).title != QLatin1String("Account A task"));
+}
+
+void TestCloudBackend::discardsPendingProjectsAndPullCursorFromPreviousAccount()
+{
+    CloudFixture fixture;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,"recentItems":[],"chats":[]})";
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy accounts(&backend, &Backend::accountScopeChanged);
+    QSignalSpy projects(&backend, &Backend::projectsLoaded);
+    QSignalSpy feed(&backend, &Backend::notificationsLoaded);
+    backend.setForeground(false);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 1);
+    QTRY_COMPARE(fixture.socketRequests.size(), 1);
+    fixture.pushIm(QStringLiteral("account-a-cursor"), QStringLiteral("notifyAdd"),
+                   {{"id", 900}, {"text", "Account A notification"}});
+    QTRY_COMPARE(feed.size(), 1);
+    fixture.holdNotificationReply = QStringLiteral("socialnetwork.api.workgroup.list");
+    backend.requestProjects();
+    QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+
+    fixture.currentUserId = 22;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
+    fixture.projectFallbackFixture = true;
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 2);
+    fixture.releaseHeldNotificationReply();
+    backend.requestProjects();
+    QTRY_COMPARE(projects.size(), 1);
+    QCOMPARE(projects.first().first().value<QVector<Project>>().value(0).name, QStringLiteral("Мой проект"));
+    QTRY_COMPARE(fixture.socketRequests.size(), 2);
+    QCOMPARE(fixture.requestsFor(pushPath).size(), 2);
+    const QUrlQuery subscription(fixture.socketRequests.last().url());
+    QVERIFY(!subscription.hasQueryItem(QStringLiteral("mid")));
+    QVERIFY(!subscription.hasQueryItem(QStringLiteral("tag")));
+    QVERIFY(!subscription.hasQueryItem(QStringLiteral("time")));
+    QCOMPARE(projects.size(), 1);
+}
+
+void TestCloudBackend::settlesPendingSendOnAccountChange()
+{
+    CloudFixture fixture;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":11,"recentItems":[],"chats":[]})";
+    QVERIFY(fixture.start());
+    CloudBackend backend(fixture.session(), true);
+    QSignalSpy accounts(&backend, &Backend::accountScopeChanged);
+    QSignalSpy sent(&backend, &Backend::messageSent);
+    QSignalSpy errors(&backend, &Backend::failed);
+    const auto sendFailures = [&errors] {
+        return std::count_if(errors.cbegin(), errors.cend(), [](const QList<QVariant> &row) {
+            return row.first().toString() == QLatin1String("send:chat:chat91");
+        });
+    };
+    backend.setForeground(false);
+    backend.start();
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 1);
+    const auto action = QStringLiteral("im.v2.Chat.Message.send");
+    const auto dialog = QStringLiteral("chat91");
+    fixture.chatResponseOverride = ajaxResult(R"({"chatId":91,"pins":[{"messageId":690}],
+        "additionalMessages":[{"id":690,"chatId":91,"text":"Account A pin"}]})");
+    QSignalSpy pins(&backend, &Backend::pinnedMessagesLoaded);
+    backend.requestPinnedMessages(dialog);
+    QTRY_COMPARE(pins.size(), 1);
+    QCOMPARE(pins.first().at(1).value<QVector<Message>>().value(0).text, QStringLiteral("Account A pin"));
+
+    bool replayedPinsOnFailure = false;
+    connect(&backend, &Backend::failed, &pins, [&](const QString &operation, const QString &) {
+        if (operation == QLatin1String("send:chat:chat91")) {
+            const auto before = pins.size();
+            backend.requestPinnedMessages(dialog);
+            replayedPinsOnFailure = pins.size() != before && !pins.last().at(1).value<QVector<Message>>().isEmpty();
+        }
+    });
+    fixture.holdNotificationReply = action;
+    backend.sendChatMessage(dialog, QStringLiteral("Account A message"));
+    QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+
+    fixture.chatResponseOverride = ajaxResult(R"({"chatId":91,"pins":[]})");
+    fixture.currentUserId = 22;
+    fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
+    backend.requestRecentChats();
+    QTRY_COMPARE(accounts.size(), 2);
+    QTRY_COMPARE(sendFailures(), 1);
+    QVERIFY(!replayedPinsOnFailure);
+    QVERIFY(sent.isEmpty());
+    backend.sendChatMessage(dialog, QStringLiteral("Account B message"));
+    QTRY_COMPARE(sent.size(), 1);
+    QCOMPARE(sent.first().first().toString(), QStringLiteral("chat:chat91"));
+    QCOMPARE(fixture.requestsFor(action).size(), 2);
+    QCOMPARE(fixture.requestsFor(action).last().field(QStringLiteral("fields[message]")), QStringLiteral("Account B message"));
+
+    fixture.releaseHeldNotificationReply();
+    QSignalSpy recent(&backend, &Backend::recentChatsLoaded);
+    backend.requestRecentChats();
+    QTRY_VERIFY(!recent.isEmpty());
+    QCOMPARE(sent.size(), 1);
+    QCOMPARE(sendFailures(), 1);
 }
 
 void TestCloudBackend::restoresReplyFromKeyedPhotoAndKeepsExactScope()

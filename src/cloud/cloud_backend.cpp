@@ -898,16 +898,33 @@ void CloudBackend::start()
 void CloudBackend::stop()
 {
     m_started = false;
+    m_userId.clear();
+    resetAccountScopedState();
+    m_retry.stop();
+    m_watchdog.stop();
+    m_heartbeat.stop();
+    m_refresh.stop();
+    m_sessionKeepalive.stop();
+    m_configExpiry.stop();
+    m_socket.abort();
+    setOnline(false);
+}
+
+void CloudBackend::resetAccountScopedState()
+{
     ++m_accountScopeRevision;
-    m_taskCardReads.clear();
-    m_taskAttachmentRevisions.clear();
-    cancelSessionConfirmation();
     resetWorktime();
+    const auto pending = m_requests;
+
+    cancelSessionConfirmation();
     m_portalStatus.clear();
-    m_initialPortalStatusPending = false;
+    m_initialPortalStatusPending = m_started;
     m_unboundPortalStatuses.clear();
     ++m_portalStatusRevision;
     m_lastPortalStatusPushTime = 0;
+
+    m_taskCardReads.clear();
+    m_taskAttachmentRevisions.clear();
     m_loadingProjects = false;
     ++m_boardPageGeneration;
     m_boardColumnCursors.clear();
@@ -918,9 +935,11 @@ void CloudBackend::stop()
     m_projectDisks.clear();
     m_nextProjectGridPage.clear();
     m_nextProjectOffset = -1;
+    m_taskProjectScope = false;
+    m_emptyProjectPages = 0;
+
     clearRasterAssets();
     m_personalChatStatuses.clear();
-    resetChatCounters();
     m_chatAnchors.clear();
     m_chatAnchorCount = 0;
     m_pendingAnchorEvents.clear();
@@ -931,34 +950,57 @@ void CloudBackend::stop()
     m_havePinnedSnapshot = false;
     m_pinnedMessages.clear();
     m_pinnedChanges.clear();
-    resetNoticeState();
     m_registeredMessageFileUrls.clear();
     m_replyPreviews.clear();
     m_lastTypingRequest.clear();
-    m_retry.stop();
-    m_watchdog.stop();
-    m_heartbeat.stop();
-    m_refresh.stop();
-    m_historyCatchup.stop();
-    m_sessionKeepalive.stop();
-    m_configExpiry.stop();
     m_historiesWaitingForIdentity.clear();
     m_triedHistoryIdentity = false;
+    m_dialogMessageStates.clear();
+    m_messageViewerMembership.clear();
+    m_messageViewerCounts.clear();
+    m_taskDialogs.clear();
+    m_dialogChatIds.clear();
+    m_recentTitles.clear();
+    m_taskChatTitles.clear();
+
+    m_seenEvents.clear();
+    m_seenEventIds.clear();
+    m_sentTemplates.clear();
+    m_mid.clear();
+    m_tag.clear();
+    m_time.clear();
+
+    // MainWindow does not reopen the chat or task card on accountScopeChanged.
+    // Resume history updates only when a view requests them for the new account.
+    m_openDialog.clear();
+    m_openTask.clear();
+    m_chatHistoryRetry = {};
+    m_taskHistoryRetry = {};
+    m_recentDirty = false;
+    m_chatDirty = false;
+    m_taskMessagesDirty = false;
+    m_boardDirty = false;
+    updateHistoryCatchup();
+
     ++m_chatPopupSettingsGeneration;
     m_chatPopupSettings = {};
     m_chatPopupSettingsKnown = false;
     m_notificationSettings.clear();
     m_notificationSettingChanges.clear();
     m_notificationSettingsRevision = 0;
-    m_dialogMessageStates.clear();
-    m_messageViewerMembership.clear();
-    m_messageViewerCounts.clear();
     m_nextChatPopupSettingsRequest = 0;
-    m_socket.abort();
-    const auto pending = m_requests;
-    for (auto *reply : pending)
-        reply->abort();
-    setOnline(false);
+    resetChatCounters();
+    resetNoticeState();
+
+    // abort() can synchronously notify consumers. Only cancel requests from before the reset.
+    for (const auto &[reply, key] : pending.asKeyValueRange()) {
+        // The pending clipboard upload owns the staged file, which a new upload may still open.
+        // Its account-specific key allows the new request, and its stale response cannot advance the upload.
+        if (m_started && key.startsWith(QLatin1String(chatImageUploadRequestPrefix)))
+            continue;
+        if (m_requests.contains(reply))
+            reply->abort();
+    }
 }
 
 void CloudBackend::setOnline(bool online)
@@ -1286,12 +1328,6 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
     const bool latestHistory = historySnapshot || operation.startsWith(historyReadPrefix);
     const auto historyRevision = (key.startsWith(QLatin1String("task-messages:"))
         ? m_taskHistoryRetry : m_chatHistoryRetry).revision;
-    const bool accountScoped = personLookup || operation.startsWith(currentPersonPrefix) || !mutationKey.isEmpty() || latestHistory
-        || key.startsWith(notificationBatchPrefix) || key.startsWith(taskActionRequestPrefix)
-        || key.startsWith(QLatin1String(chatImageUploadRequestPrefix))
-        || operation.startsWith(QLatin1String("search-task-chats:"))
-        || key.startsWith(taskCardReadPrefix) || operation.startsWith(QLatin1String("task-files:"))
-        || operation.startsWith(QLatin1String("project-unread:"));
     const auto failedOperation = latestHistory ? key : operation;
     const auto rejectRequest = [&](const QString &reason) {
         if (optionalLookup(operation))
@@ -1348,7 +1384,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
 
     auto *reply = m_http.post(request, body);
     ownedBody.release()->setParent(reply);
-    m_requests.insert(reply);
+    m_requests.insert(reply, key);
     m_inflightOperations.insert(key);
     if (operation == sessionRecoveryOp)
         m_sessionRecoveryReply = reply;
@@ -1364,7 +1400,7 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
     const auto revision = m_sessionRevision;
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, operation, key, envelope, revision, candidate, historySnapshot, latestHistory, historyRevision, failedOperation,
-             accountScoped, accountScope, includeResponseMeta,
+             accountScope, includeResponseMeta,
              handler = std::move(onData)] {
         m_requests.remove(reply);
         reply->deleteLater();
@@ -1376,11 +1412,18 @@ void CloudBackend::webRequestRaw(QUrl url, QIODevice *body, const Headers &heade
         m_inflightOperations.remove(key);
         if (!m_started)
             return;
-        scheduleRefresh();
-        if (accountScoped && accountScope != m_accountScopeRevision)
+        if (accountScope != m_accountScopeRevision) {
+            // These operations leave controls busy until they receive a terminal signal.
+            if (key == operation && (key.startsWith(QLatin1String("send:")) || key.startsWith(QLatin1String("upload-"))
+                || key.startsWith(QLatin1String("board-edit:")) || key == QLatin1String("create-project")
+                || key.startsWith(QLatin1String("chat-pin:")) || key.startsWith(QLatin1String("project-pin:"))
+                || key.startsWith(QLatin1String("search-project-tasks:"))))
+                emit failed(operation, QStringLiteral("Аккаунт изменился. Результат запроса не подтверждён."));
             return;
+        }
+        scheduleRefresh();
         if (operation.startsWith(projectTaskChatsPrefix)
-            && (key != m_projectTaskChatsRequest || accountScope != m_accountScopeRevision))
+            && key != m_projectTaskChatsRequest)
             return;
         if (key != operation
             && (operation.startsWith(QLatin1String("board:")) || operation.startsWith(QLatin1String("board-column:")))
@@ -1616,7 +1659,7 @@ void CloudBackend::recoverSession(const Session &candidate, std::function<bool()
             return;
         }
         const auto pending = m_requests;
-        for (auto *reply : pending)
+        for (auto *reply : pending.keys())
             reply->abort();
         resetWorktime();
         m_session = *verified;
@@ -1642,26 +1685,9 @@ void CloudBackend::rememberCurrentUser(const QString &id)
     const bool accountChanged = !m_userId.isEmpty();
     m_userId = id;
     if (accountChanged) {
-        ++m_accountScopeRevision;
         ++m_sessionRevision;
-        clearRasterAssets();
-        m_taskCardReads.clear();
-        m_taskAttachmentRevisions.clear();
-        cancelSessionConfirmation();
-        resetWorktime();
-        resetChatCounters();
-        m_taskDialogs.clear();
-        m_dialogChatIds.clear();
-        m_dialogMessageStates.clear();
-        m_recentTitles.clear();
-        ++m_chatPopupSettingsGeneration;
-        m_chatPopupSettings = {};
-        m_chatPopupSettingsKnown = false;
-        m_nextChatPopupSettingsRequest = 0;
-        m_notificationSettings.clear();
-        m_notificationSettingChanges.clear();
-        m_notificationSettingsRevision = 0;
-        resetNoticeState();
+        resetAccountScopedState();
+        scheduleReconnect(true);
     }
     bindPortalStatusIdentity(accountChanged);
     emit accountScopeChanged();
@@ -2860,7 +2886,7 @@ void CloudBackend::fetchPortalHtml(const QUrl &url, std::function<void(QString)>
     request.setRawHeader("Accept", "text/html");
     request.setTransferTimeout(8000);
     auto *reply = m_http.get(request);
-    m_requests.insert(reply);
+    m_requests.insert(reply, {});
     reply->setReadBufferSize(maxResponse + 1);
     QTimer::singleShot(8000, reply, [reply] {
         if (!reply->isFinished())
@@ -2870,10 +2896,10 @@ void CloudBackend::fetchPortalHtml(const QUrl &url, std::function<void(QString)>
         if (reply->bytesAvailable() > maxResponse)
             reply->abort();
     });
-    connect(reply, &QNetworkReply::finished, this, [this, reply, handler = std::move(handler)] {
+    connect(reply, &QNetworkReply::finished, this, [this, reply, scope = m_accountScopeRevision, handler = std::move(handler)] {
         m_requests.remove(reply);
         reply->deleteLater();
-        if (!m_started)
+        if (!m_started || scope != m_accountScopeRevision)
             return;
         scheduleRefresh();
         const auto contentType = reply->rawHeader("Content-Type").split(';').first().trimmed().toLower();

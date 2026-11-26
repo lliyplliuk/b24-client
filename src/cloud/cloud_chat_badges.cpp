@@ -520,6 +520,7 @@ void CloudBackend::resetChatCounters()
     m_chatBadgeRevision = 0;
     m_chatCounterSnapshotRevision = 0;
     m_badgePagePending = false;
+    m_badgePageOvertaken = false;
     m_chatBadgeRefresh.invalidate();
     m_haveCounterSnapshot = false;
     m_chatCounterSnapshotTotal = 0;

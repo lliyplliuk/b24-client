@@ -61,17 +61,13 @@ void CloudBackend::handlePortalStatusPush(const QJsonObject &users, qint64 stamp
 
 void CloudBackend::bindPortalStatusIdentity(bool accountChanged)
 {
+    if (accountChanged) {
+        loadInitialPortalStatus();
+        return;
+    }
     const auto pending = m_unboundPortalStatuses.value(m_userId);
     m_unboundPortalStatuses.clear();
-    if (accountChanged) {
-        m_portalStatus.clear();
-        ++m_portalStatusRevision;
-        m_lastPortalStatusPushTime = 0;
-        m_pendingInitialAlerts.clear();
-        m_pendingChatPopups.clear();
-        m_initialPortalStatusPending = m_started;
-        loadInitialPortalStatus();
-    } else if (!pending.status.isEmpty()) {
+    if (!pending.status.isEmpty()) {
         m_lastPortalStatusPushTime = pending.stamp;
         rememberPortalStatus(pending.status);
     }
