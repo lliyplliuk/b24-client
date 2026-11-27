@@ -186,7 +186,7 @@ QVector<Message> CloudBackend::decodeMessages(const QJsonObject &data, bool sort
         }
         return result;
     };
-    const auto state = m_timeline.dialogMessageStates.constFind(dialog);
+    const auto *state = m_timeline.findMessageState(dialog);
     QVector<Message> messages;
     for (const auto row : rows) {
         if (messages.size() >= tunables::kPageSizeMessages)
@@ -201,13 +201,13 @@ QVector<Message> CloudBackend::decodeMessages(const QJsonObject &data, bool sort
         const bool outgoing = !system && !m_userId.isEmpty() && m_userId == authorId;
         const auto numericId = positiveId(id);
         const auto explicitUnread = message.value(QStringLiteral("unread"));
-        const bool readByCursor = state != m_timeline.dialogMessageStates.cend() && numericId > 0
+        const bool readByCursor = state && numericId > 0
             && (numericId <= state->confirmedReadThrough || state->exactlyRead.contains(numericId)
                 || (numericId <= state->lastReadId
                     && !(explicitUnread.toBool() && state->historyUnread.contains(numericId))));
         const bool unread = !dialog.isEmpty() && !outgoing && !readByCursor && (explicitUnread.isBool()
             ? explicitUnread.toBool()
-            : state != m_timeline.dialogMessageStates.cend() && !m_userId.isEmpty() && positiveId(authorId) > 0
+            : state && !m_userId.isEmpty() && positiveId(authorId) > 0
                 && state->lastReadId >= 0 && numericId > state->lastReadId && state->unreadCounter != 0);
         Message entry;
         entry.id = id;
@@ -216,7 +216,7 @@ QVector<Message> CloudBackend::decodeMessages(const QJsonObject &data, bool sort
         entry.createdAt = date(timestamp.isUndefined() ? message.value(QStringLiteral("DATE_CREATE")) : timestamp);
         entry.outgoing = outgoing;
         entry.seenByOthers = outgoing && (message.value(QStringLiteral("viewedByOthers")).toBool()
-            || (state != m_timeline.dialogMessageStates.cend() && state->seenByOthers.contains(numericId)));
+            || (state && state->seenByOthers.contains(numericId)));
         if (canRequestViewers && outgoing && numericId > 0 && sameChat(message)) {
             const auto key = viewerDialog + QLatin1Char(':') + QString::number(numericId);
             if (deletedMessage(message)) {
@@ -242,20 +242,18 @@ QVector<Message> CloudBackend::decodeMessages(const QJsonObject &data, bool sort
         entry.replyId = replyMessageId(message);
         if (!entry.replyId.isEmpty()) {
             const auto reply = replySources.value(entry.replyId);
-            const auto previewKey = ChatTimeline::replyPreviewKey(dialog, entry.replyId);
             if (!reply.isEmpty() && deletedMessage(reply)) {
-                m_timeline.replyPreviews.remove(previewKey);
+                m_timeline.forgetReplyPreview(dialog, entry.replyId);
             } else if (!reply.isEmpty()) {
                 entry.replyAuthor = authorLabel(authorOf(reply)).left(512);
                 entry.replyText = field(reply, {"text", "TEXT"}).left(2000);
                 entry.replyFiles = filesFor(reply);
                 if (!dialog.isEmpty()) {
-                    m_timeline.replyPreviews.insert(previewKey,
-                        new ChatTimeline::ReplyPreview{entry.replyAuthor, entry.replyText, entry.replyFiles},
-                        1 + entry.replyFiles.size());
+                    m_timeline.rememberReplyPreview(dialog, entry.replyId,
+                        {entry.replyAuthor, entry.replyText, entry.replyFiles});
                 }
             } else if (!dialog.isEmpty()) {
-                if (const auto *cached = m_timeline.replyPreviews.object(previewKey)) {
+                if (const auto *cached = m_timeline.replyPreview(dialog, entry.replyId)) {
                     entry.replyAuthor = cached->author;
                     entry.replyText = cached->text;
                     entry.replyFiles = cached->files;
@@ -263,12 +261,12 @@ QVector<Message> CloudBackend::decodeMessages(const QJsonObject &data, bool sort
             }
         }
         if (!dialog.isEmpty() && numericId > 0 && sameChat(message)) {
-            const auto key = ChatTimeline::replyPreviewKey(dialog, QString::number(numericId));
+            const auto messageId = QString::number(numericId);
             if (deletedMessage(message))
-                m_timeline.replyPreviews.remove(key);
+                m_timeline.forgetReplyPreview(dialog, messageId);
             else
-                m_timeline.replyPreviews.insert(key, new ChatTimeline::ReplyPreview{entry.author.left(512), entry.text.left(2000), entry.files},
-                                       1 + entry.files.size());
+                m_timeline.rememberReplyPreview(dialog, messageId,
+                    {entry.author.left(512), entry.text.left(2000), entry.files});
         }
         messages.append(std::move(entry));
     }

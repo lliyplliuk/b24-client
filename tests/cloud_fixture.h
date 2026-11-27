@@ -3,6 +3,7 @@
 #include "cloud/cloud_backend.h"
 
 #include <QJsonArray>
+#include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
 #include <QTcpServer>
@@ -49,6 +50,7 @@ public:
                 const QString &module = QStringLiteral("im"));
     void pushMessage(const QString &mid, const QString &id, int chatId = 91, int author = 22,
                      bool important = false, int age = 0, bool messageMute = false);
+    bool waitForPullDelivery();
     void closePull();
     void releaseHeldOnlineResponse();
     void releaseHeldChatResponse();
@@ -191,8 +193,23 @@ public:
     {
         return http(backend).pendingRequests().key(operation);
     }
+    static QPointer<QNetworkReply> pendingReplyForRoute(bx::CloudBackend &backend, const QString &route)
+    {
+        QPointer<QNetworkReply> match;
+        const auto pending = http(backend).pendingRequests();
+        for (auto *reply : pending.keys()) {
+            const auto url = reply->url();
+            if (url.path() != route && QUrlQuery(url).queryItemValue(QStringLiteral("action")) != route)
+                continue;
+            if (match)
+                return {}; // The route must identify exactly one outstanding request.
+            match = reply;
+        }
+        return match;
+    }
     static void resetAccount(bx::CloudBackend &backend) { backend.resetAccountScopedState(); }
     static quint64 sessionRevision(const bx::CloudBackend &backend) { return backend.m_sessionRevision; }
+    static void expireChatBadgeCooldown(bx::CloudBackend &backend) { backend.m_chatBadgeRefresh.invalidate(); }
     static void refreshNow(bx::CloudBackend &backend)
     {
         backend.m_refresh.stop();

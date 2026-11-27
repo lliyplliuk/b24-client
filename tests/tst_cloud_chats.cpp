@@ -2,7 +2,6 @@
 #include "core/tunables.h"
 #include "ui/reaction_catalog.h"
 
-#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -330,7 +329,11 @@ void TestCloudChats::marksOnlyTheVisibleDialogAfterConfirmedRead()
     backend.readChatMessages(dialog, incoming, visible);
     backend.setForeground(true);
     backend.readChatMessages(QStringLiteral("chat92"), incoming, visible);
-    QTest::qWait(60);
+    const auto &http = CloudTestAccess::http(backend);
+    QVERIFY(!http.contains(operationKey(OperationKind::ReadVisibleMessages, dialog)));
+    QVERIFY(!http.contains(operationKey(OperationKind::ReadVisibleMessages, QStringLiteral("chat92"))));
+    QVERIFY(!http.contains(operationKey(OperationKind::ReadVisibleAnchors, QStringLiteral("91"))));
+    QVERIFY(!http.contains(operationKey(OperationKind::ReadVisibleAnchors, QStringLiteral("92"))));
     QVERIFY(fixture.requestsFor(read).isEmpty());
     QVERIFY(fixture.requestsFor(anchors).isEmpty());
 
@@ -364,7 +367,7 @@ void TestCloudChats::marksOnlyTheVisibleDialogAfterConfirmedRead()
     QCOMPARE(acknowledgements.first().at(2).toLongLong(), 0);
     QCOMPARE(fixture.requestsFor(read).size(), 2);
     backend.readChatMessages(dialog, incoming, visible);
-    QTest::qWait(60);
+    QVERIFY(!http.contains(operationKey(OperationKind::ReadVisibleMessages, dialog)));
     QCOMPARE(fixture.requestsFor(read).size(), 2);
 
     fixture.holdNextReadResponse = read;
@@ -508,7 +511,7 @@ void TestCloudChats::acknowledgesVisibleReactionAnchorsWithoutLosingNewPush()
     fixture.approveAnchorRead = false;
     backend.readChatMessages(dialog, {}, outgoingVisible);
     QTRY_COMPARE(fixture.requestsFor(action).size(), 1);
-    QTest::qWait(60);
+    QTRY_VERIFY(!CloudTestAccess::http(backend).contains(operationKey(OperationKind::ReadVisibleAnchors, QStringLiteral("91"))));
     QVERIFY(row().hasReaction);
     fixture.approveAnchorRead = true;
 
@@ -627,7 +630,8 @@ void TestCloudChats::readsExplicitTaskUnreadBeforeNewerSystemCursor()
     const QStringList later{QStringLiteral("5355386"), QStringLiteral("5355387"), QStringLiteral("5355388"),
                             QStringLiteral("5355389"), QStringLiteral("5415839"), QStringLiteral("5415841")};
     backend.readChatMessages(dialog, later, later);
-    QTest::qWait(50);
+    const auto readOperation = operationKey(OperationKind::ReadVisibleMessages, dialog);
+    QVERIFY(!CloudTestAccess::http(backend).contains(readOperation));
     QVERIFY(fixture.requestsFor(action).isEmpty());
     QCOMPARE(row().unread, 1);
 
@@ -651,7 +655,7 @@ void TestCloudChats::readsExplicitTaskUnreadBeforeNewerSystemCursor()
     });
     QVERIFY(acknowledged != repeated.cend() && !acknowledged->unread);
     backend.readChatMessages(dialog, {older});
-    QTest::qWait(50);
+    QVERIFY(!CloudTestAccess::http(backend).contains(readOperation));
     QCOMPARE(fixture.requestsFor(action).size(), 1);
 }
 
@@ -1123,7 +1127,7 @@ void TestCloudChats::immediatelyUpdatesLiveRecentAndProtectsItFromOldSnapshots()
                    {{"dialogId", "chat91"}, {"chatId", 91}, {"lastId", 900}, {"counter", 0}, {"unread", false}}, 20);
     fixture.pushIm(QStringLiteral("old-partial"), QStringLiteral("readMessageChat"),
                    {{"dialogId", "chat91"}, {"chatId", 91}, {"lastId", 900}, {"counter", 1}, {"unread", false}}, 20);
-    QTest::qWait(100);
+    QVERIFY(fixture.waitForPullDelivery());
     QCOMPARE(ordinary.size(), 4);
 
     fixture.pushIm(QStringLiteral("current-partial"), QStringLiteral("readMessageChat"),
@@ -1143,7 +1147,7 @@ void TestCloudChats::immediatelyUpdatesLiveRecentAndProtectsItFromOldSnapshots()
     QCOMPARE(cleared->unread, 0);
     push(QStringLiteral("new-mid-old-message"), 91, 901, 4, 22, false);
     push(QStringLiteral("own-message"), 91, 904, 8, 11, false);
-    QTest::qWait(150);
+    QVERIFY(fixture.waitForPullDelivery());
     QCOMPARE(ordinary.size(), 6);
 }
 
@@ -1430,6 +1434,8 @@ void TestCloudChats::searchesTaskChatsByAccessibleTaskTitleAndNumber()
     fixture.holdNotificationReply = url;
     backend.searchTaskChats(query);
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    const auto oldSearch = CloudTestAccess::pendingReplyForRoute(backend, url);
+    QVERIFY(oldSearch);
     QSignalSpy accounts(&backend, &Backend::accountScopeChanged);
     fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
     backend.requestRecentChats();
@@ -1439,7 +1445,7 @@ void TestCloudChats::searchesTaskChatsByAccessibleTaskTitleAndNumber()
     QTRY_COMPARE(results.size(), 5);
     QVERIFY(results.last().at(1).value<QVector<Chat>>().isEmpty());
     fixture.releaseHeldNotificationReply();
-    QTest::qWait(50);
+    QTRY_VERIFY(oldSearch.isNull());
     QCOMPARE(results.size(), 5);
     QVERIFY(errors.isEmpty());
 }
@@ -1635,8 +1641,10 @@ void TestCloudChats::loadsOlderHistoryWithScopedCursor()
                    {{"dialogId", "chat91"}, {"chatId", 91}});
     QTRY_COMPARE(removed.size(), 3);
     QCOMPARE(removed.last().at(2).toLongLong(), 0);
+    const auto olderReply = CloudTestAccess::pendingReplyForRoute(backend, action);
+    QVERIFY(olderReply);
     fixture.releaseHeldReadResponse();
-    QTest::qWait(60);
+    QTRY_VERIFY(olderReply.isNull());
     QCOMPARE(loaded.size(), 2);
 }
 
@@ -1707,7 +1715,12 @@ void TestCloudChats::refreshesTaskChatAfterProjectChange()
     } else {
         fixture.pushIm(QStringLiteral("different-task"), QStringLiteral("task_update"),
                        {{"taskId", 43}, {"groupId", 18}}, 0, QStringLiteral("tasks"));
-        QTest::qWait(350);
+        QTRY_COMPARE(previewInvalidations.size(), 1);
+        QCOMPARE(previewInvalidations.first().first().toString(), QStringLiteral("43"));
+        const auto operation = taskCard ? operationKey(OperationKind::TaskMessages, taskId)
+                                        : operationKey(OperationKind::Chat, dialog);
+        CloudTestAccess::refreshNow(backend);
+        QCOMPARE(CloudTestAccess::http(backend).contains(operation), inflight);
         QCOMPARE(history.size(), 1);
         fixture.pushIm(QStringLiteral("moved-task"), QStringLiteral("task_update"),
                        {{"fields", QJsonObject{{"ID", 42}, {"GROUP_ID", 18}}}}, 0, QStringLiteral("tasks"));
@@ -1841,9 +1854,26 @@ void TestCloudChats::recoversLatestHistoryAfterATemporaryFailure()
             CloudTestAccess::refreshNow(backend);
         });
     }
+    const auto &http = CloudTestAccess::http(backend);
+    // Account changes clear the operation key before the scheduled retry callback runs.
+    // Its subscriber lives until that callback releases the stale request.
+    std::weak_ptr<int> retrySubscriber;
+    if (changeAccount) {
+        const auto lifetime = std::make_shared<int>();
+        retrySubscriber = lifetime;
+        CloudTestAccess::http(backend).ajax(snapshot,
+            {{QStringLiteral("dialogId"), dialog}, {QStringLiteral("messageLimit"), QStringLiteral("25")}},
+            operationKey(OperationKind::ChatHistoryRead, operation), [lifetime](QJsonValue) {}, operation);
+    }
+    if (changeAccount)
+        QVERIFY(!retrySubscriber.expired());
+    auto *original = CloudTestAccess::pendingReply(backend, operation);
+    QVERIFY(original);
+    QSignalSpy originalFinished(original, &QNetworkReply::finished);
     fixture.releaseHeldNotificationReply(mode != QLatin1String("malformed"));
     if (mode == QLatin1String("switch") || mode == QLatin1String("background") || changeAccount) {
-        QTest::qWait(80);
+        QTRY_COMPARE(originalFinished.size(), 1);
+        QVERIFY(http.contains(operation));
         QCOMPARE(historyErrors(), 0);
     }
     if (mode == QLatin1String("switch"))
@@ -1864,12 +1894,14 @@ void TestCloudChats::recoversLatestHistoryAfterATemporaryFailure()
         QCOMPARE(historyErrors(), 0);
     } else if (mode == QLatin1String("exhausted") || mode == QLatin1String("malformed")) {
         QTRY_COMPARE_WITH_TIMEOUT(historyErrors(), 1, 2000);
-        QTest::qWait(500);
+        QVERIFY(!http.contains(operation));
         QCOMPARE(historyErrors(), 1);
         QCOMPARE(fixture.requestsFor(snapshot).size(), mode == QLatin1String("exhausted") ? 2 : 1);
         QVERIFY(history.isEmpty());
     } else {
-        QTest::qWait(750);
+        QTRY_VERIFY(!http.contains(operation));
+        if (changeAccount)
+            QTRY_VERIFY(retrySubscriber.expired());
         const auto snapshots = fixture.requestsFor(snapshot);
         QCOMPARE(std::count_if(snapshots.cbegin(), snapshots.cend(), [&](const auto &request) {
             return request.field(QStringLiteral("dialogId")) == dialog;
@@ -1962,7 +1994,8 @@ void TestCloudChats::coalescesManualHistoryRefreshWhileLatestReadIsInFlight()
     fixture.releaseHeldChatResponse();
     QTRY_COMPARE_WITH_TIMEOUT(history.size(), 2, 2000);
     QCOMPARE(history.last().at(1).value<QVector<Message>>().first().text, QStringLiteral("Refreshed"));
-    QTest::qWait(300);
+    CloudTestAccess::refreshNow(backend);
+    QVERIFY(!CloudTestAccess::http(backend).contains(operationKey(OperationKind::Chat, dialog)));
     QCOMPARE(fixture.requestsFor(action).size(), 2);
 }
 
@@ -1988,8 +2021,6 @@ void TestCloudChats::reconcilesUnreadFromScopedActiveHistory()
     QSignalSpy online(&backend, &Backend::connectionChanged);
     QSignalSpy recent(&backend, &Backend::recentChatsLoaded);
     QSignalSpy history(&backend, &Backend::chatMessagesLoaded);
-    QElapsedTimer counterCooldown;
-    counterCooldown.start();
     backend.start();
     backend.requestRecentChats();
     QTRY_VERIFY(!recent.isEmpty() && !online.isEmpty());
@@ -2036,7 +2067,7 @@ void TestCloudChats::reconcilesUnreadFromScopedActiveHistory()
     QCOMPARE(backend.unreadChatCount().value_or(-1), 6);
 
     // Start the scoped snapshot first, then let a newer global snapshot finish before it.
-    QTest::qWait(qMax<qint64>(0, 15050 - counterCooldown.elapsed()));
+    CloudTestAccess::expireChatBadgeCooldown(backend);
     fixture.holdNextChatResponse = true;
     fixture.chatResponseOverride = ajaxResult(R"({"chat":{"id":91,"dialogId":"103","lastId":704,"unreadId":0,"userCounter":2},
         "messages":[{"id":704,"chatId":91,"authorId":11,"unread":false,"text":"Own"}]})");
@@ -2154,7 +2185,7 @@ void TestCloudChats::ignoresParticipantCountsInUnreadBadges()
     QCOMPARE(unread(second), 0);
     QVERIFY(!history.last().last().value<QVector<Message>>().last().unread);
     backend.readChatMessages(second, {latest}, {latest});
-    QTest::qWait(30);
+    QVERIFY(!CloudTestAccess::http(backend).contains(operationKey(OperationKind::ReadVisibleMessages, second)));
     QCOMPARE(fixture.requestsFor(read).size(), 1);
 }
 

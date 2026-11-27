@@ -48,7 +48,9 @@ void TestCloudPull::refreshesOnlyActiveViewsAndKeepsInflightInvalidations()
 
     backend.setActiveSection(2);
     fixture.pushMessage(QStringLiteral("inactive"), QStringLiteral("903"));
-    QTest::qWait(300);
+    QVERIFY(fixture.waitForPullDelivery());
+    CloudTestAccess::refreshNow(backend);
+    QVERIFY(!CloudTestAccess::http(backend).contains(operationKey(OperationKind::Chat, QStringLiteral("chat91"))));
     QCOMPARE(fixture.requestsFor(chatLoad).size(), 2);
     const auto recentBeforeSwitch = recent.size();
 
@@ -177,9 +179,13 @@ void TestCloudPull::refreshesVisibleInactiveHistory()
     push(QStringLiteral("two"), QStringLiteral("902"));
     push(QStringLiteral("three"), QStringLiteral("903"));
     QTRY_COMPARE_WITH_TIMEOUT(history.size(), 2, 1500);
-    QTest::qWait(350);
+    QVERIFY(fixture.waitForPullDelivery());
+    const auto historyOperation = task ? operationKey(OperationKind::TaskMessages, QStringLiteral("42"))
+                                       : operationKey(OperationKind::Chat, QStringLiteral("chat91"));
+    CloudTestAccess::refreshNow(backend);
+    QVERIFY(!CloudTestAccess::http(backend).contains(historyOperation));
     QCOMPARE(history.size(), 2);
-    QCOMPARE(fixture.requestsFor(QStringLiteral("im.v2.Recent.load")).size(), recentReads + (task ? 0 : 1));
+    QTRY_COMPARE(fixture.requestsFor(QStringLiteral("im.v2.Recent.load")).size(), recentReads + (task ? 0 : 1));
 
     auto *timer = backend.findChild<QTimer *>(QStringLiteral("active-history-catchup"));
     QVERIFY(timer && timer->isActive());
@@ -190,7 +196,10 @@ void TestCloudPull::refreshesVisibleInactiveHistory()
     backend.setWorkspaceVisible(false);
     QVERIFY(!timer->isActive());
     push(QStringLiteral("hidden"), QStringLiteral("904"));
-    QTest::qWait(400);
+    QVERIFY(fixture.waitForPullDelivery());
+    CloudTestAccess::refreshNow(backend);
+    QVERIFY(!timer->isActive());
+    QVERIFY(!CloudTestAccess::http(backend).contains(historyOperation));
     QCOMPARE(history.size(), 3);
     backend.setWorkspaceVisible(true);
     QTRY_COMPARE(history.size(), 4);
@@ -198,7 +207,10 @@ void TestCloudPull::refreshesVisibleInactiveHistory()
     backend.clearOpenHistory(task);
     QVERIFY(!timer->isActive());
     push(QStringLiteral("closed"), QStringLiteral("905"));
-    QTest::qWait(400);
+    QVERIFY(fixture.waitForPullDelivery());
+    CloudTestAccess::refreshNow(backend);
+    QVERIFY(!timer->isActive());
+    QVERIFY(!CloudTestAccess::http(backend).contains(historyOperation));
     QCOMPARE(history.size(), 4);
     QVERIFY(fixture.requestsFor(QStringLiteral("im.v2.Chat.Message.read")).isEmpty());
     QVERIFY(fixture.requestsFor(QStringLiteral("applyFilter")).isEmpty());

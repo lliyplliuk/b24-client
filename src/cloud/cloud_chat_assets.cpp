@@ -46,7 +46,7 @@ void CloudBackend::requestChatAssets(const QString &dialog, ChatAssetKind kind, 
 
 void CloudBackend::requestChatLinkPreviews(const QString &scopeId, bool task, ChatLinkPreviewHandler complete)
 {
-    const auto dialog = task ? m_timeline.taskDialogs.value(scopeId) : validDialog(scopeId);
+    const auto dialog = task ? m_timeline.taskDialog(scopeId) : validDialog(scopeId);
     const auto chatId = badgeChatId(dialog);
     if (chatId <= 0 || m_authExpired) {
         complete({});
@@ -150,7 +150,7 @@ void CloudBackend::requestMessageViewers(const QString &scopeId, const QString &
                                         MessageViewersHandler complete)
 {
     const auto scope = settingsScope();
-    const auto dialog = task ? m_timeline.taskDialogs.value(scopeId) : validDialog(scopeId);
+    const auto dialog = task ? m_timeline.taskDialog(scopeId) : validDialog(scopeId);
     const auto id = positiveId(messageId);
     const auto chatId = badgeChatId(dialog);
     const auto group = groupChatId(dialog);
@@ -160,7 +160,7 @@ void CloudBackend::requestMessageViewers(const QString &scopeId, const QString &
     const auto *member = m_messageViewerMembership.object(viewerDialog);
     if (m_authExpired || scope.isEmpty() || id <= 0 || chatId <= 0 || !knownCount
         || (group > 0 && (group != chatId || !member || !*member))
-        || (task ? m_timeline.openTask != scopeId : m_timeline.openDialog != dialog)) {
+        || (task ? m_timeline.activeTask() != scopeId : m_timeline.activeDialog() != dialog)) {
         complete(std::nullopt);
         return;
     }
@@ -177,7 +177,7 @@ void CloudBackend::requestMessageViewers(const QString &scopeId, const QString &
         if (m_authExpired || settingsScope() != scope || !views.isArray()
             || !m_messageViewerCounts.contains(key) || badgeChatId(dialog) != chatId
             || (group > 0 && (!memberNow || !*memberNow))
-            || (task ? m_timeline.openTask != scopeId : m_timeline.openDialog != dialog)) {
+            || (task ? m_timeline.activeTask() != scopeId : m_timeline.activeDialog() != dialog)) {
             complete(std::nullopt);
             return;
         }

@@ -263,7 +263,7 @@ void CloudBackend::requestProjectTimeline(const QString &projectId)
 
 void CloudBackend::updateTaskChatProject(const QString &taskId, qint64 project)
 {
-    m_projects.updateProjectUnreadTask(taskId.toLongLong(), groupDialogChatId(m_timeline.taskDialogs.value(taskId)), project);
+    m_projects.updateProjectUnreadTask(taskId.toLongLong(), groupDialogChatId(m_timeline.taskDialog(taskId)), project);
 }
 
 void CloudBackend::sendChatMessage(const QString &dialogId, const QString &text)
@@ -323,7 +323,7 @@ void CloudBackend::deleteNotification(const QString &id)
 
 void CloudBackend::handleTaskPull(const QJsonObject &fields, const QString &groupId, const QString &taskId, bool invalidatePreview)
 {
-    m_projects.handleTaskPull(fields, groupId, taskId, groupDialogChatId(m_timeline.taskDialogs.value(taskId)));
+    m_projects.handleTaskPull(fields, groupId, taskId, groupDialogChatId(m_timeline.taskDialog(taskId)));
     if (invalidatePreview)
         emit taskLinkPreviewInvalidated(taskId);
     invalidateTaskChat(taskId);
@@ -384,10 +384,10 @@ bool CloudBackend::initialStatusPending() const
 
 void CloudBackend::popupIdentityResolved()
 {
-    if (!m_timeline.openDialog.isEmpty())
-        m_timeline.chatDirty = true;
-    if (!m_timeline.openTask.isEmpty())
-        m_timeline.taskMessagesDirty = true;
+    if (!m_timeline.activeDialog().isEmpty())
+        m_timeline.invalidateHistory(false);
+    if (!m_timeline.activeTask().isEmpty())
+        m_timeline.invalidateHistory(true);
     scheduleRefresh();
 }
 

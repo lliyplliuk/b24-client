@@ -2,7 +2,6 @@
 #include "cloud/cloud_chat_metadata.h"
 #include "cloud/cloud_rows.h"
 
-#include "core/tunables.h"
 #include "signin/session_capture.h"
 #include "signin/session_restore.h"
 
@@ -113,11 +112,7 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     m_historyCatchup.setObjectName(QStringLiteral("active-history-catchup"));
     m_historyCatchup.setParent(this);
     connect(&m_historyCatchup, &QTimer::timeout, this, [this] {
-        if (m_activeSection == 0) {
-            m_timeline.recentDirty = true;
-            m_timeline.chatDirty = !m_timeline.openDialog.isEmpty();
-        }
-        m_timeline.taskMessagesDirty = !m_timeline.openTask.isEmpty();
+        m_timeline.invalidateOpenViews(m_activeSection == 0);
         scheduleRefresh();
     });
     m_sessionKeepalive.setInterval(15 * 60 * 1000);
@@ -141,10 +136,8 @@ CloudBackend::CloudBackend(Session session, bool allowLoopback, QObject *parent)
     connect(&m_pull, &PullChannel::imEvent, &m_chats, &ChatsService::handleImPull);
     connect(&m_pull, &PullChannel::connected, this, [this] {
         const bool refreshPopupSettings = m_resumed && m_notices.reconnectSettingsNeeded();
-        if (m_resumed) {
-            for (auto &state : m_timeline.dialogMessageStates)
-                state.muteFromPull = false;
-        }
+        if (m_resumed)
+            m_timeline.resetPullMuteFlags();
         if (refreshPopupSettings)
             m_notices.resetReconnectSettings();
         setOnline(true);
@@ -281,11 +274,7 @@ void CloudBackend::updateChatViewActivity(bool wasWatching)
         m_portalHttp.invalidateHistory(false);
         m_portalHttp.invalidateHistory(true);
     } else if (!m_foreground && m_started) {
-        if (m_activeSection == 0) {
-            m_timeline.recentDirty = true;
-            m_timeline.chatDirty = !m_timeline.openDialog.isEmpty();
-        }
-        m_timeline.taskMessagesDirty = !m_timeline.openTask.isEmpty();
+        m_timeline.invalidateOpenViews(m_activeSection == 0);
         scheduleRefresh();
     }
     updateHistoryCatchup();
@@ -306,25 +295,17 @@ void CloudBackend::setActiveSection(int section)
 
 void CloudBackend::clearOpenHistory(bool task)
 {
-    if (task) {
-        m_portalHttp.invalidateHistory(true);
-        m_timeline.openTask.clear();
-        m_timeline.taskMessagesDirty = false;
-        m_notices.clearHistory(true);
-    } else {
-        m_portalHttp.invalidateHistory(false);
-        m_timeline.openDialog.clear();
-        m_timeline.chatDirty = false;
-        m_notices.clearHistory(false);
-    }
+    m_portalHttp.invalidateHistory(task);
+    m_timeline.openHistory({}, task);
+    m_notices.clearHistory(task);
     updateHistoryCatchup();
 }
 
 void CloudBackend::updateHistoryCatchup(bool restart)
 {
-    const bool watchingChat = m_activeSection == 0 && !m_timeline.openDialog.isEmpty();
+    const bool watchingChat = m_activeSection == 0 && !m_timeline.activeDialog().isEmpty();
     // A task card can be open over any workspace section.
-    const bool watchingTask = !m_timeline.openTask.isEmpty();
+    const bool watchingTask = !m_timeline.activeTask().isEmpty();
     const bool shouldRun = m_started && canAutoRefreshChats() && !m_authExpired && (watchingChat || watchingTask);
     // With two histories open, traffic in one must not postpone the safety refresh for the other.
     const bool restartSingleHistory = restart && !(watchingChat && watchingTask);
@@ -459,10 +440,6 @@ bool CloudBackend::refreshCsrf(Session candidate, quint64 revision)
 void CloudBackend::invalidateActiveView()
 {
     switch (m_activeSection) {
-    case 0:
-        m_timeline.recentDirty = true;
-        m_timeline.chatDirty = !m_timeline.openDialog.isEmpty();
-        break;
     case 1:
         m_projects.invalidateOpenBoard();
         break;
@@ -470,7 +447,7 @@ void CloudBackend::invalidateActiveView()
         m_notificationsDirty = true;
         break;
     }
-    m_timeline.taskMessagesDirty = !m_timeline.openTask.isEmpty();
+    m_timeline.invalidateOpenViews(m_activeSection == 0);
     scheduleRefresh();
 }
 
@@ -478,9 +455,9 @@ void CloudBackend::scheduleRefresh()
 {
     if (!m_started || !canAutoRefreshChats() || m_authExpired || m_refresh.isActive())
         return;
-    const bool sectionDirty = m_activeSection == 0 ? m_timeline.recentDirty || m_timeline.chatDirty
+    const bool sectionDirty = m_activeSection == 0 ? m_timeline.isRecentDirty() || m_timeline.isHistoryDirty(false)
         : m_foreground && (m_activeSection == 1 ? m_projects.boardDirty() : m_activeSection == 2 && m_notificationsDirty);
-    if (sectionDirty || m_timeline.taskMessagesDirty)
+    if (sectionDirty || m_timeline.isHistoryDirty(true))
         m_refresh.start(250);
 }
 
@@ -488,39 +465,41 @@ void CloudBackend::refreshDirtyViews()
 {
     if (!m_started || !canAutoRefreshChats() || m_authExpired)
         return;
-    const auto takeDirty = [this](bool &dirty, const QString &operation) {
-        if (!dirty || m_portalHttp.atCapacity() || m_portalHttp.contains(operation))
-            return false;
-        dirty = false;
-        return true;
+    const auto canRequest = [this](const QString &operation) {
+        return !m_portalHttp.atCapacity() && !m_portalHttp.contains(operation);
     };
     if (m_activeSection == 0) {
-        if (takeDirty(m_timeline.recentDirty, m_timeline.showTaskChats ? taskRecentOp : recentOp))
-            m_chats.loadRecentChats(m_timeline.showTaskChats);
-        if (!m_timeline.openDialog.isEmpty() && takeDirty(m_timeline.chatDirty, operationKey(OperationKind::Chat, m_timeline.openDialog)))
-            requestChatMessages(m_timeline.openDialog);
+        const bool taskChats = m_timeline.showingTaskChats();
+        if (canRequest(taskChats ? taskRecentOp : recentOp) && m_timeline.takeRecentDirty())
+            m_chats.loadRecentChats(taskChats);
+        const auto &dialog = m_timeline.activeDialog();
+        if (!dialog.isEmpty() && canRequest(operationKey(OperationKind::Chat, dialog)) && m_timeline.takeHistoryDirty(false))
+            requestChatMessages(dialog);
     } else if (m_foreground && m_activeSection == 1) {
         m_projects.refreshDirtyBoard();
-    } else if (m_foreground && m_activeSection == 2 && takeDirty(m_notificationsDirty,
-                                                m_notices.historyRequestKey())) {
+    } else if (m_foreground && m_activeSection == 2 && m_notificationsDirty && canRequest(m_notices.historyRequestKey())) {
+        m_notificationsDirty = false;
         requestNotifications();
     }
-    if (!m_timeline.openTask.isEmpty() && takeDirty(m_timeline.taskMessagesDirty, operationKey(OperationKind::TaskMessages, m_timeline.openTask)))
-        requestTaskMessages(m_timeline.openTask);
+    const auto &task = m_timeline.activeTask();
+    if (!task.isEmpty() && canRequest(operationKey(OperationKind::TaskMessages, task)) && m_timeline.takeHistoryDirty(true))
+        requestTaskMessages(task);
 }
 
 void CloudBackend::invalidateTaskChat(const QString &taskId)
 {
     if (!taskId.isEmpty()) {
-        if (taskId == m_timeline.openTask)
-            m_timeline.taskMessagesDirty = true;
-        const auto listed = std::find_if(m_timeline.recentTaskChatItems.cbegin(), m_timeline.recentTaskChatItems.cend(),
+        if (taskId == m_timeline.activeTask())
+            m_timeline.invalidateHistory(true);
+        const auto &taskChats = m_timeline.recentChats(true);
+        const auto listed = std::find_if(taskChats.cbegin(), taskChats.cend(),
             [&taskId](const Chat &chat) { return chat.taskId == taskId; });
-        if (listed != m_timeline.recentTaskChatItems.cend() && m_timeline.showTaskChats)
-            m_timeline.recentDirty = true;
-        if (!m_timeline.openDialog.isEmpty() && (m_timeline.taskDialogs.value(taskId) == m_timeline.openDialog
-            || (listed != m_timeline.recentTaskChatItems.cend() && listed->id == m_timeline.openDialog)))
-            m_timeline.chatDirty = true;
+        if (listed != taskChats.cend() && m_timeline.showingTaskChats())
+            m_timeline.invalidateRecent();
+        const auto &dialog = m_timeline.activeDialog();
+        if (!dialog.isEmpty() && (m_timeline.taskDialog(taskId) == dialog
+            || (listed != taskChats.cend() && listed->id == dialog)))
+            m_timeline.invalidateHistory(false);
     }
     scheduleRefresh();
 }
@@ -647,8 +626,8 @@ void CloudBackend::rememberCurrentUser(const QString &id)
 bool CloudBackend::isCurrentHistory(bool task, const QString &key, const QString &dialog) const
 {
     return canAutoRefreshChats() && !dialog.isEmpty()
-        && (task ? m_timeline.openTask == key && m_timeline.taskDialogs.value(key) == dialog
-                 : m_activeSection == 0 && m_timeline.openDialog == dialog);
+        && (task ? m_timeline.activeTask() == key && m_timeline.taskDialog(key) == dialog
+                 : m_activeSection == 0 && m_timeline.activeDialog() == dialog);
 }
 
 QString CloudBackend::settingsScope() const
@@ -673,24 +652,22 @@ void CloudBackend::rememberLoadedTask(const QString &taskId, const QJsonObject &
             m_projects.rememberProjectUnreadTask(chatId, taskId.toLongLong(), group);
             m_projects.publishProjectUnreadCounts();
         }
-        if (m_timeline.taskDialogs.size() >= tunables::kPageSizeChats)
-            m_timeline.taskDialogs.erase(m_timeline.taskDialogs.begin());
-        m_timeline.taskDialogs.insert(taskId, dialog);
+        m_timeline.rememberTaskDialog(taskId, dialog);
     } else {
-        m_timeline.taskDialogs.remove(taskId);
+        m_timeline.forgetTaskDialog(taskId);
     }
 }
 
 void CloudBackend::clearDeletedTaskHistory(const QString &taskId)
 {
-    if (m_timeline.openTask == taskId)
+    if (m_timeline.activeTask() == taskId)
         clearOpenHistory(true);
     invalidateTaskChat(taskId);
 }
 
 void CloudBackend::forgetTaskChat(const QString &taskId)
 {
-    m_timeline.taskDialogs.remove(taskId);
+    m_timeline.forgetTaskDialog(taskId);
     m_chats.forgetTaskTitle(taskId);
 }
 

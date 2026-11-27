@@ -6,6 +6,7 @@
 #include <QJsonValue>
 #include <QQueue>
 #include <QSet>
+#include <functional>
 
 namespace bx {
 
@@ -15,6 +16,9 @@ namespace bx {
 // History, recent rows and receipts compare revisions from the same badge clock.
 class ChatTimeline {
 public:
+    ChatTimeline() = default;
+    void resetAccount();
+
     struct RecentOverlay {
         Chat preview;
         struct HistoryPreview {
@@ -62,6 +66,16 @@ public:
     void openHistory(const QString &scope, bool task);
     void invalidateHistory(bool task);
     void invalidateRecent();
+    void invalidateOpenViews(bool chatSection);
+    bool isRecentDirty() const { return recentDirty; }
+    bool isHistoryDirty(bool task) const { return task ? taskMessagesDirty : chatDirty; }
+    bool takeRecentDirty();
+    bool takeHistoryDirty(bool task);
+    void resetPullMuteFlags();
+    void rememberTaskDialog(const QString &task, const QString &dialog);
+    void forgetTaskDialog(const QString &task);
+    void rememberChatId(const QString &dialog, qint64 id);
+    void updateRecentChat(const QString &dialog, const std::function<void(Chat &)> &update);
     QString taskDialog(const QString &task) const { return taskDialogs.value(task); }
     bool hasTaskForDialog(const QString &dialog) const;
     QStringList tasksForDialog(const QString &dialog) const { return taskDialogs.keys(dialog); }
@@ -81,15 +95,16 @@ public:
     bool wasSentTemplate(const QString &id) const { return sentTemplates.contains(id); }
     void rememberSentTemplate(const QString &id);
     bool hasReplyPreview(const QString &dialog, const QString &message) const;
-    void forgetReplyPreview(const QString &dialog, const QString &message);
+    void forgetReplyPreview(const QString &dialog, const QString &message) const;
+
+    struct ReplyPreview { QString author; QString text; QVector<MessageFile> files; };
+    const ReplyPreview *replyPreview(const QString &dialog, const QString &message) const;
+    void rememberReplyPreview(const QString &dialog, const QString &message, ReplyPreview preview) const;
+    void applyCounterSnapshotRevision(quint64 revision);
 
 private:
-    friend class CloudBackend;
-    ChatTimeline() = default;
     Q_DISABLE_COPY_MOVE(ChatTimeline)
 
-    void resetAccount();
-    struct ReplyPreview { QString author; QString text; QVector<MessageFile> files; };
     mutable QCache<QString, ReplyPreview> replyPreviews{128};
     static QString replyPreviewKey(const QString &dialog, const QString &message);
     QHash<QString, RecentOverlay> recentOverlays;

@@ -370,6 +370,8 @@ void TestCloudProjects::discardsBoardPagesFromPreviousSnapshots()
     fixture.badNextBoardPage = true;
     backend.requestMoreBoardTasks(project, stage);
     QTRY_COMPARE(fixture.requestsFor(QStringLiteral("getColumnItems")).size(), 1);
+    const auto previousReply = CloudTestAccess::pendingReplyForRoute(backend, QStringLiteral("getColumnItems"));
+    QVERIFY(previousReply);
     backend.requestProjectBoard(QStringLiteral("18"));
     QTRY_COMPARE(board.count(), 2);
     backend.requestProjectBoard(project);
@@ -380,7 +382,7 @@ void TestCloudProjects::discardsBoardPagesFromPreviousSnapshots()
     backend.requestMoreBoardTasks(project, stage);
     QTRY_COMPARE(page.count(), 3);
     fixture.releaseHeldBoardResponse();
-    QTest::qWait(70);
+    QTRY_VERIFY(previousReply.isNull());
     QCOMPARE(page.count(), 3);
     QVERIFY(failed.isEmpty());
     QCOMPARE(page.last().at(2).value<QVector<Task>>().first().id, QStringLiteral("43"));
@@ -435,6 +437,8 @@ void TestCloudProjects::confirmedKanbanMoveSupersedesOutstandingBoardRead()
     backend.start();
     backend.requestProjectBoard(project);
     QTRY_COMPARE(fixture.requestsFor(boardAction).size(), 1);
+    const auto previousReply = CloudTestAccess::pendingReplyForRoute(backend, boardAction);
+    QVERIFY(previousReply);
     for (const auto &result : {QByteArray("false"), QByteArray("null")}) {
         fixture.kanbanMoveResult = result;
         const auto previous = failed.size();
@@ -449,7 +453,7 @@ void TestCloudProjects::confirmedKanbanMoveSupersedesOutstandingBoardRead()
     QTRY_COMPARE(fixture.requestsFor(boardAction).size(), 2);
     QTRY_COMPARE(loaded.size(), 1);
     fixture.releaseHeldReadResponse();
-    QTest::qWait(60);
+    QTRY_VERIFY(previousReply.isNull());
     QCOMPARE(loaded.size(), 1);
     QCOMPARE(failed.size(), 2);
 }
@@ -640,12 +644,14 @@ void TestCloudProjects::pagesProjectTaskChatsAndTracksOnlyTheirConfirmedBadges()
     fixture.holdNotificationReply = route;
     backend.requestProjectTaskChats(firstProject);
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    const auto previousReply = CloudTestAccess::pendingReplyForRoute(backend, route);
+    QVERIFY(previousReply);
     backend.requestProjectTaskChats(secondProject);
     QTRY_COMPARE(pages.size(), 3);
     QCOMPARE(pages.last().at(0).toString(), secondProject);
     QCOMPARE(pages.last().at(3).toInt(), -1);
     fixture.releaseHeldNotificationReply();
-    QTest::qWait(80);
+    QTRY_VERIFY(previousReply.isNull());
     QCOMPARE(pages.size(), 3);
     QVERIFY(failures.isEmpty());
     backend.requestProjectTaskChats({});
@@ -653,7 +659,7 @@ void TestCloudProjects::pagesProjectTaskChatsAndTracksOnlyTheirConfirmedBadges()
     fixture.pushIm(QStringLiteral("project-closed-message"), QStringLiteral("messageChat"),
         {{"chatId", 174}, {"dialogId", secondChat}, {"counter", 3},
          {"message", QJsonObject{{"id", 682}, {"chatId", 174}, {"senderId", 22}, {"text", "New"}}}});
-    QTest::qWait(80);
+    QVERIFY(fixture.waitForPullDelivery());
     QCOMPARE(badges.size(), before);
 }
 

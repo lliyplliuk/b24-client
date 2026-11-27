@@ -82,9 +82,12 @@ void TestCloudAccount::discardsParallelTaskCardFromPreviousAccount()
     backend.start();
     backend.requestRecentChats();
     QTRY_COMPARE(accounts.size(), 1);
-    fixture.holdNotificationReply = QStringLiteral("tasks.task.get");
+    const auto route = QStringLiteral("tasks.task.get");
+    fixture.holdNotificationReply = route;
     backend.requestTask(QStringLiteral("42"));
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    const auto previousReply = CloudTestAccess::pendingReplyForRoute(backend, route);
+    QVERIFY(previousReply);
     QTRY_COMPARE(fixture.requestsFor(QStringLiteral("tasks.v2.Task.get")).size(), 1);
     fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
     backend.requestRecentChats();
@@ -96,7 +99,7 @@ void TestCloudAccount::discardsParallelTaskCardFromPreviousAccount()
     QCOMPARE(cards.first().first().value<Task>().name, QStringLiteral("Current account task"));
     QVERIFY(!cards.first().first().value<Task>().editRights.remove);
     fixture.releaseHeldNotificationReply();
-    QTest::qWait(50);
+    QTRY_VERIFY(previousReply.isNull());
     QCOMPARE(cards.size(), 1);
     for (const auto &summary : summaries)
         QCOMPARE(summary.first().value<Task>().name, QStringLiteral("Current account task"));
@@ -117,9 +120,12 @@ void TestCloudAccount::discardsTaskAttachmentsFromPreviousAccount()
     backend.requestRecentChats();
     QTRY_COMPARE(accounts.size(), 1);
 
-    fixture.holdNotificationReply = QStringLiteral("tasks.v2.File.listObjects");
+    const auto route = QStringLiteral("tasks.v2.File.listObjects");
+    fixture.holdNotificationReply = route;
     backend.requestTask(QStringLiteral("42"));
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    const auto previousReply = CloudTestAccess::pendingReplyForRoute(backend, route);
+    QVERIFY(previousReply);
     QCOMPARE(cards.size(), 1);
     fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
     backend.requestRecentChats();
@@ -129,7 +135,7 @@ void TestCloudAccount::discardsTaskAttachmentsFromPreviousAccount()
     QTRY_COMPARE(cards.size(), 3);
     QCOMPARE(cards.last().first().value<Task>().attachments, QStringList{QStringLiteral("current.txt")});
     fixture.releaseHeldNotificationReply();
-    QTest::qWait(50);
+    QTRY_VERIFY(previousReply.isNull());
     QCOMPARE(cards.size(), 3);
 }
 
@@ -378,9 +384,12 @@ void TestCloudAccount::discardsTaskProjectAndStageRepliesFromPreviousAccount()
     const auto taskId = QStringLiteral("42");
     const auto preflight = QStringLiteral("tasks.v2.Task.get");
     const auto write = stage ? QStringLiteral("moveStage") : QStringLiteral("tasks.v2.Task.update");
-    fixture.holdNotificationReply = holdWrite ? write : preflight;
+    const auto heldRoute = holdWrite ? write : preflight;
+    fixture.holdNotificationReply = heldRoute;
     backend.updateTask(taskId, edit);
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    const auto previousReply = CloudTestAccess::pendingReplyForRoute(backend, heldRoute);
+    QVERIFY(previousReply);
     backend.updateTask(taskId, edit);
 
     fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
@@ -388,7 +397,7 @@ void TestCloudAccount::discardsTaskProjectAndStageRepliesFromPreviousAccount()
     QTRY_COMPARE(accounts.size(), 2);
     QCOMPARE(fixture.requestsFor(preflight).size(), 1);
     fixture.releaseHeldNotificationReply(failReply);
-    QTest::qWait(50);
+    QTRY_VERIFY(previousReply.isNull());
     QCOMPARE(fixture.requestsFor(write).size(), holdWrite ? 1 : 0);
     QVERIFY(updates.isEmpty());
     QVERIFY(std::none_of(failures.cbegin(), failures.cend(), [](const QList<QVariant> &failure) {
@@ -419,20 +428,25 @@ void TestCloudAccount::ignoresTaskActionResponsesFromPreviousAccounts()
     QTRY_COMPARE(accounts.size(), 1);
     const auto taskId = QStringLiteral("42");
     const auto deletePath = QStringLiteral("/rest/tasks.task.delete.json");
-    fixture.holdNotificationReply = QStringLiteral("tasks.v2.Task.get");
+    const auto preflight = QStringLiteral("tasks.v2.Task.get");
+    fixture.holdNotificationReply = preflight;
     backend.deleteTask(taskId);
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    const auto previousPreflight = CloudTestAccess::pendingReplyForRoute(backend, preflight);
+    QVERIFY(previousPreflight);
     fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
     backend.requestRecentChats();
     QTRY_COMPARE(accounts.size(), 2);
     fixture.releaseHeldNotificationReply();
-    QTest::qWait(50);
+    QTRY_VERIFY(previousPreflight.isNull());
     QVERIFY(fixture.requestsFor(deletePath).isEmpty());
 
     fixture.holdNotificationReply = deletePath;
     backend.deleteTask(taskId);
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
     QCOMPARE(fixture.requestsFor(deletePath).size(), 1);
+    const auto previousDelete = CloudTestAccess::pendingReplyForRoute(backend, deletePath);
+    QVERIFY(previousDelete);
     fixture.ordinaryRecentBadgeFixture = R"({"userId":11,"recentItems":[],"chats":[]})";
     backend.requestRecentChats();
     QTRY_COMPARE(accounts.size(), 3);
@@ -440,7 +454,7 @@ void TestCloudAccount::ignoresTaskActionResponsesFromPreviousAccounts()
     QTRY_COMPARE(deleted.size(), 1);
     QCOMPARE(fixture.requestsFor(deletePath).size(), 2);
     fixture.releaseHeldNotificationReply();
-    QTest::qWait(50);
+    QTRY_VERIFY(previousDelete.isNull());
     QCOMPARE(deleted.size(), 1);
 
     const auto statusAction = QStringLiteral("tasks.v2.Task.Status.start");
@@ -452,9 +466,11 @@ void TestCloudAccount::ignoresTaskActionResponsesFromPreviousAccounts()
     delegate.requireDelegate = true;
     const QList<QPair<QString, TaskEdit>> edits{{statusAction, start}, {delegateAction, delegate}};
     for (const auto &[action, edit] : edits) {
-        fixture.holdNotificationReply = QStringLiteral("tasks.v2.Task.get");
+        fixture.holdNotificationReply = preflight;
         backend.updateTask(taskId, edit);
         QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+        const auto previousAction = CloudTestAccess::pendingReplyForRoute(backend, preflight);
+        QVERIFY(previousAction);
         const auto accountCount = accounts.size();
         fixture.ordinaryRecentBadgeFixture = action == statusAction
             ? R"({"userId":22,"recentItems":[],"chats":[]})"
@@ -462,7 +478,7 @@ void TestCloudAccount::ignoresTaskActionResponsesFromPreviousAccounts()
         backend.requestRecentChats();
         QTRY_COMPARE(accounts.size(), accountCount + 1);
         fixture.releaseHeldNotificationReply();
-        QTest::qWait(50);
+        QTRY_VERIFY(previousAction.isNull());
         QVERIFY(fixture.requestsFor(action).isEmpty());
     }
     QVERIFY(errors.isEmpty());
@@ -519,6 +535,8 @@ void TestCloudAccount::ignoresNotificationRepliesFromPreviousAccount()
     fixture.rejectNoticeBatch = rejectOldBatch;
     send();
     QTRY_VERIFY(fixture.holdNotificationReply.isEmpty());
+    const auto previousReply = CloudTestAccess::pendingReplyForRoute(backend, batchPath);
+    QVERIFY(previousReply);
     fixture.ordinaryRecentBadgeFixture = R"({"userId":22,"recentItems":[],"chats":[]})";
     backend.requestRecentChats();
     QTRY_COMPARE(accounts.size(), 2);
@@ -537,7 +555,7 @@ void TestCloudAccount::ignoresNotificationRepliesFromPreviousAccount()
         QCOMPARE(read.size(), 1);
     }
     fixture.releaseHeldNotificationReply();
-    QTest::qWait(120);
+    QTRY_VERIFY(previousReply.isNull());
     QCOMPARE(outcome.size(), 1);
     QCOMPARE(errors.size(), 0);
     QCOMPARE(read.size(), action == QLatin1String("im.notify.read.list") ? 1 : 0);

@@ -47,10 +47,7 @@ void CloudBackend::rememberChatContact(const QString &dialog, const QJsonObject 
         contact.position = position.toString().trimmed().left(256);
     if (!publish || (contact.position == previous.position && contact.onlineUntil == previous.onlineUntil))
         return;
-    for (auto &chat : m_timeline.recentChatItems) {
-        if (chat.id == dialog)
-            applyChatContact(chat);
-    }
+    m_timeline.updateRecentChat(dialog, [this](Chat &chat) { applyChatContact(chat); });
     const auto current = contact;
     emit chatContactChanged(dialog, current.onlineUntil, current.position);
 }
@@ -90,8 +87,8 @@ void CloudBackend::handleOnlinePull(const QJsonObject &params)
     const auto users = params.value(QStringLiteral("users"));
     const auto update = [this](const QJsonObject &user) {
         const auto id = field(user, {"id"});
-        if (positiveId(id) == 0 || (!m_chatContacts.contains(id) && id != m_timeline.openDialog
-            && std::none_of(m_timeline.recentChatItems.cbegin(), m_timeline.recentChatItems.cend(), [&id](const Chat &chat) { return chat.id == id; })))
+        if (positiveId(id) == 0 || (!m_chatContacts.contains(id) && id != m_timeline.activeDialog()
+            && std::none_of(m_timeline.recentChats(false).cbegin(), m_timeline.recentChats(false).cend(), [&id](const Chat &chat) { return chat.id == id; })))
             return;
         rememberChatContact(id, user, true);
     };
@@ -143,22 +140,20 @@ void CloudBackend::rememberDialog(const QString &dialog, const QJsonObject &obje
         id = positiveId(field(chat, {"id", "chatId"}));
     if (id == 0)
         return;
-    if (!m_timeline.dialogChatIds.contains(dialog) && m_timeline.dialogChatIds.size() >= tunables::kPageSizeChats)
-        m_timeline.dialogChatIds.erase(m_timeline.dialogChatIds.begin());
-    m_timeline.dialogChatIds.insert(dialog, id);
+    m_timeline.rememberChatId(dialog, id);
 }
 
 void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QString &operation,
                                  const QString &requestKey, ResolvedDialog onDialog)
 {
     if (task) {
-        const auto known = m_timeline.taskDialogs.value(scopeId);
+        const auto known = m_timeline.taskDialog(scopeId);
         if (const auto id = groupChatId(known); id > 0) {
             onDialog(known, id);
             return;
         }
         m_tasks.loadTask(scopeId, operation, [this, scopeId, operation, onDialog](const QJsonObject &) {
-            const auto dialog = m_timeline.taskDialogs.value(scopeId);
+            const auto dialog = m_timeline.taskDialog(scopeId);
             const auto chatId = groupChatId(dialog);
             if (chatId == 0) {
                 emit failed(operation, QStringLiteral("У задачи нет чата"));
@@ -174,7 +169,7 @@ void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QStrin
         emit failed(operation, QStringLiteral("Некорректный номер диалога"));
         return;
     }
-    if (auto chatId = groupChatId(dialog); chatId > 0 || (chatId = m_timeline.dialogChatIds.value(dialog)) > 0) {
+    if (auto chatId = groupChatId(dialog); chatId > 0 || (chatId = m_timeline.knownChatId(dialog)) > 0) {
         onDialog(dialog, chatId);
         return;
     }
@@ -184,7 +179,7 @@ void CloudBackend::resolveDialog(const QString &scopeId, bool task, const QStrin
         if (scope != m_accountScopeRevision)
             return;
         rememberDialog(dialog, data.toObject());
-        const auto chatId = m_timeline.dialogChatIds.value(dialog);
+        const auto chatId = m_timeline.knownChatId(dialog);
         if (chatId == 0) {
             failShape(operation);
             return;

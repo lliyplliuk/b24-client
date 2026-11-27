@@ -96,6 +96,54 @@ const QPixmap *RowPainter::filePreview(const MessageFile &file) const
     return photo && !photo->isNull() ? photo : nullptr;
 }
 
+void RowPainter::visitFileGeometry(const QModelIndex &index, const QRect &row, const FileVisitor &visit) const
+{
+    const auto entries = files(index, MessageFiles);
+    for (const auto section : {AttachmentSection::Media, AttachmentSection::Documents}) {
+        if (layoutFiles(entries, firstFileRect(row, index, section), section, visit, nullptr))
+            return;
+    }
+}
+
+bool RowPainter::layoutFiles(const QVector<MessageFile> &entries, const QRect &area, AttachmentSection section,
+                             const FileVisitor &visit, int *height) const
+{
+    int y = area.top();
+    for (qsizetype i = 0; i < entries.size();) {
+        const auto &file = entries.at(i);
+        const bool media = isMediaFile(file);
+        if (media != (section == AttachmentSection::Media)) {
+            ++i;
+            continue;
+        }
+        qsizetype end = i + 1;
+        while (media && end < entries.size() && isMediaFile(entries.at(end)))
+            ++end;
+        if (end == i + 1) {
+            const auto geometry = fileGeometry(QRect(area.left(), y, area.width(), fileControlHeight), file);
+            if (visit(file, geometry))
+                return true;
+            y += geometry.bounds().height() + galleryGap;
+        } else {
+            const auto width = qMin(area.width(), galleryWidthLimit);
+            const int columns = width >= 204 ? 2 : 1;
+            const int tileWidth = (width - (columns - 1) * galleryGap) / columns;
+            const int tileHeight = qBound(52, tileWidth * 9 / 16, 128);
+            for (qsizetype tile = 0; tile < end - i; ++tile) {
+                const int x = area.left() + int(tile % columns) * (tileWidth + galleryGap);
+                const int top = y + int(tile / columns) * (tileHeight + galleryGap);
+                if (visit(entries.at(i + tile), FileGeometry{QRect(x, top, tileWidth, tileHeight), {}}))
+                    return true;
+            }
+            y += int((end - i + columns - 1) / columns) * (tileHeight + galleryGap);
+        }
+        i = end;
+    }
+    if (height)
+        *height = y - area.top();
+    return false;
+}
+
 void RowPainter::setLinkThumbnailSource(std::function<const QImage *(const QUrl &)> source)
 {
     m_linkThumbnail = std::move(source);

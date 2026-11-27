@@ -1,3 +1,5 @@
+#include "ui/history_surface.h"
+#include "ui/task_card_controller.h"
 #include "ui/task_card_dialog.h"
 #include "ui/task_picker_choice_delegate.h"
 #include <QToolButton>
@@ -10,6 +12,23 @@ class UiTaskCardTest : public PilotFixture {
     Q_OBJECT
 
 private slots:
+    void lateHistorySignalsAfterTaskCardCloses()
+    {
+        std::unique_ptr<FixtureBackend> backend(makeFixture());
+        MainWindow window(backend.get());
+        window.openTaskCard(QStringLiteral("501"));
+        auto *controller = window.findChild<TaskCardController *>();
+        QVERIFY(controller && controller->card());
+        auto *surface = controller->findChild<ui::HistorySurface *>();
+        QVERIFY(surface);
+        QVERIFY(controller->clearTask());
+        QVERIFY(!controller->card());
+
+        emit surface->pinsChanged({});
+        emit surface->historyCleared();
+        QVERIFY(!controller->card());
+    }
+
     void taskCardShowsNumberAndCopiesNumberAndLink()
     {
         std::unique_ptr<FixtureBackend> backend(makeFixture());

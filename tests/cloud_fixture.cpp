@@ -5,6 +5,7 @@
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QSettings>
+#include <QSignalSpy>
 #include <QTcpSocket>
 #include <QTest>
 #include <QWebSocket>
@@ -88,6 +89,15 @@ void CloudFixture::pushMessage(const QString &mid, const QString &id, int chatId
     pushIm(mid, QStringLiteral("messageChat"), {{QStringLiteral("chatId"), chatId},
                {QStringLiteral("dialogId"), QStringLiteral("chat%1").arg(chatId)},
                {QStringLiteral("notify"), true}, {QStringLiteral("message"), message}}, age);
+}
+
+bool CloudFixture::waitForPullDelivery()
+{
+    // The client handles earlier frames before replying to this application-level ping.
+    auto *socket = clients.last();
+    QSignalSpy messages(socket, &QWebSocket::textMessageReceived);
+    socket->sendTextMessage(QStringLiteral("ping"));
+    return messages.wait() && messages.last().first().toString() == QStringLiteral("pong");
 }
 
 void CloudFixture::closePull()

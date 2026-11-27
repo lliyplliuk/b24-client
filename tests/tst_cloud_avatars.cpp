@@ -62,8 +62,11 @@ public:
                     requests.append(request);
                     const auto reply = respond(request);
                     QObject::disconnect(socket, &QTcpSocket::readyRead, socket, nullptr);
-                    if (holdImages && isHeldImageRequest(request))
+                    if (holdImages && isHeldImageRequest(request)) {
+                        QObject::connect(socket, &QTcpSocket::disconnected, &server,
+                                         [this] { ++disconnectedImages; });
                         return;
+                    }
                     socket->write("HTTP/1.1 " + reply.status + "\r\nConnection: close\r\nContent-Type: "
                                   + reply.type + "\r\nContent-Length: " + QByteArray::number(reply.body.size())
                                   + "\r\n" + reply.additionalHeaders + "\r\n" + reply.body);
@@ -87,6 +90,7 @@ public:
     QList<Request> requests;
     std::function<Response(const Request &)> respond;
     bool holdImages = false;
+    int disconnectedImages = 0;
 private:
     QTcpServer server;
 };
@@ -346,7 +350,7 @@ void TestCloudAvatars::capsConcurrentRequestsAndClearsPendingOnStop()
     };
     QTRY_COMPARE(countImages(), 4);
     backend.stop();
-    QTest::qWait(50);
+    QTRY_COMPARE(server.disconnectedImages, 4);
     QCOMPARE(countImages(), 4);
     QCOMPARE(avatarSpy.size(), 0);
 }

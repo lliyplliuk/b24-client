@@ -146,7 +146,7 @@ void CloudBackend::searchPeople(const QString &requestId, const QString &query, 
     const auto context = mention ? u"IM_CHAT_SEARCH"_s : u"tasks-card"_s;
     QJsonObject options;
     if (mention) {
-        const qint64 chat = groupId.isEmpty() ? m_timeline.dialogChatIds.value(userId) : groupId.toLongLong();
+        const qint64 chat = groupId.isEmpty() ? m_timeline.knownChatId(userId) : groupId.toLongLong();
         options = {{u"exclude"_s, QJsonArray{u"chats"_s}}, {u"contextChatId"_s, chat}, {u"mentionSearch"_s, true}};
     } else {
         options = {{u"emailUsers"_s, true}, {u"inviteGuestLink"_s, true}, {u"analyticsSource"_s, u"tasks"_s}};

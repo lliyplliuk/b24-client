@@ -8,6 +8,8 @@ namespace bx::ui {
 class TaskCardDialog;
 class TaskPickerSummary;
 
+// QObject provides the event filter and the connection context for lambdas.
+// This helper declares no signals, slots or properties that require Q_OBJECT.
 class TaskCardRequisites final : public QObject {
 public:
     TaskCardRequisites(TaskCardDialog &dialog, QWidget *fields, QVBoxLayout *details,

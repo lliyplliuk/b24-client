@@ -69,6 +69,8 @@ void TaskCardController::connectBackend()
                 true, !m_cardSearchQuery.isEmpty(), !m_cardContextMessageId.isEmpty()};
     }, this);
     connect(surface, &ui::HistorySurface::pinsChanged, this, [this](const QVector<Message> &messages) {
+        if (!m_card)
+            return;
         m_card->setPinnedMessages(messages);
     });
     connect(surface, &ui::HistorySurface::olderPageAdded, this, [this] {
@@ -76,6 +78,8 @@ void TaskCardController::connectBackend()
         emit avatarsRequested();
     });
     connect(surface, &ui::HistorySurface::historyCleared, this, [this] {
+        if (!m_card)
+            return;
         m_cardContextMessageId.clear();
         m_card->setContextMode(false);
         m_card->setChatStatus(QStringLiteral("Сообщений пока нет"));

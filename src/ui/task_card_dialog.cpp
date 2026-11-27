@@ -739,11 +739,14 @@ void TaskCardDialog::showTaskContent(const Task &task, bool detailsLoaded)
 bool TaskCardDialog::canUseTaskActions() const
 {
     return m_writable && !m_editing && !m_moving && !m_sending && !m_uploading && !m_editMode
-        && !m_requisites->stageOpen() && !m_requisites->editor()->active() && !m_composer->editingMessage();
+        && m_requisites && !m_requisites->stageOpen() && !m_requisites->editor()->active()
+        && !m_composer->editingMessage();
 }
 
 void TaskCardDialog::updateButtons()
 {
+    if (!m_requisites)
+        return;
     m_relations->setWritable(m_writable);
     if (!m_send)
         return;

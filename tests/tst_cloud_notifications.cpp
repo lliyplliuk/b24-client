@@ -214,7 +214,8 @@ void TestCloudNotifications::gatesChatPopupsBySoundAndMessageSettings()
     QTRY_COMPARE_WITH_TIMEOUT(online.size(), 3, 5000);
     QTRY_COMPARE(fixture.requestsFor(QStringLiteral("im.v2.Settings.General.list")).size(), 2);
     fixture.pushMessage(QStringLiteral("muted-while-disconnected"), QStringLiteral("910"));
-    QTest::qWait(100);
+    QVERIFY(fixture.waitForPullDelivery());
+    QTRY_VERIFY(!CloudTestAccess::http(backend).contains(operationKey(OperationKind::ChatSoundSettings)));
     QCOMPARE(popups.size(), 2);
 }
 
@@ -247,8 +248,7 @@ void TestCloudNotifications::chatPopupsRespectExplicitDesktopDelivery()
     QTRY_COMPARE(fixture.requestsFor(QStringLiteral("im.v2.Settings.General.list")).size(), 1);
     if (desktopDelivery)
         QTRY_COMPARE_WITH_TIMEOUT(popups.size(), 1, 500);
-    else
-        QTest::qWait(120);
+    QTRY_VERIFY(!CloudTestAccess::http(backend).contains(operationKey(OperationKind::ChatSoundSettings)));
     QCOMPARE(popups.size(), desktopDelivery ? 1 : 0);
 
     fixture.pushIm(QStringLiteral("desktop-settings-toggle"), QStringLiteral("settingsUpdate"),
@@ -1149,8 +1149,9 @@ void TestCloudNotifications::desktopBannersCatchUpFromHistory()
     QCOMPARE(delivered.targets.first().id, dialog);
     QCOMPARE(delivered.targets.first().taskChat, task);
     rows.removeLast();
+    const auto beforeDuplicate = history.size();
     fixture.pushMessage(QStringLiteral("history-before-push"), QStringLiteral("902"), chatId);
-    QTest::qWait(350);
+    QTRY_VERIFY(history.size() > beforeDuplicate);
     QCOMPARE(banners.size(), 1);
 
     fixture.pushMessage(QStringLiteral("push-before-history"), QStringLiteral("903"), chatId);
@@ -1187,7 +1188,7 @@ void TestCloudNotifications::desktopBannersCatchUpFromHistory()
 
     fixture.pushIm(QStringLiteral("history-chat-muted"), QStringLiteral("chatMuteNotify"),
                    {{"dialogId", dialog}, {"muted", true}});
-    QTest::qWait(30);
+    QVERIFY(fixture.waitForPullDelivery());
     rows.append(row(912));
     publish();
     load();

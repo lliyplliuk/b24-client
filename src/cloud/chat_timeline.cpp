@@ -2,6 +2,7 @@
 #include "core/tunables.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace bx {
 
@@ -72,6 +73,58 @@ void ChatTimeline::invalidateRecent()
     recentDirty = true;
 }
 
+void ChatTimeline::invalidateOpenViews(bool chatSection)
+{
+    if (chatSection) {
+        invalidateRecent();
+        chatDirty = !openDialog.isEmpty();
+    }
+    taskMessagesDirty = !openTask.isEmpty();
+}
+
+bool ChatTimeline::takeRecentDirty()
+{
+    return std::exchange(recentDirty, false);
+}
+
+bool ChatTimeline::takeHistoryDirty(bool task)
+{
+    return std::exchange(task ? taskMessagesDirty : chatDirty, false);
+}
+
+void ChatTimeline::resetPullMuteFlags()
+{
+    for (auto &state : dialogMessageStates)
+        state.muteFromPull = false;
+}
+
+void ChatTimeline::rememberTaskDialog(const QString &task, const QString &dialog)
+{
+    if (taskDialogs.size() >= tunables::kPageSizeChats)
+        taskDialogs.erase(taskDialogs.begin());
+    taskDialogs.insert(task, dialog);
+}
+
+void ChatTimeline::forgetTaskDialog(const QString &task)
+{
+    taskDialogs.remove(task);
+}
+
+void ChatTimeline::rememberChatId(const QString &dialog, qint64 id)
+{
+    if (!dialogChatIds.contains(dialog) && dialogChatIds.size() >= tunables::kPageSizeChats)
+        dialogChatIds.erase(dialogChatIds.begin());
+    dialogChatIds.insert(dialog, id);
+}
+
+void ChatTimeline::updateRecentChat(const QString &dialog, const std::function<void(Chat &)> &update)
+{
+    for (auto &chat : recentChatItems) {
+        if (chat.id == dialog)
+            update(chat);
+    }
+}
+
 void ChatTimeline::replaceRecentChats(QVector<Chat> chats, bool task)
 {
     (task ? recentTaskChatItems : recentChatItems) = std::move(chats);
@@ -97,7 +150,7 @@ bool ChatTimeline::hasReplyPreview(const QString &dialog, const QString &message
     return replyPreviews.contains(replyPreviewKey(dialog, message));
 }
 
-void ChatTimeline::forgetReplyPreview(const QString &dialog, const QString &message)
+void ChatTimeline::forgetReplyPreview(const QString &dialog, const QString &message) const
 {
     replyPreviews.remove(replyPreviewKey(dialog, message));
 }
@@ -105,6 +158,28 @@ void ChatTimeline::forgetReplyPreview(const QString &dialog, const QString &mess
 bool ChatTimeline::hasTaskForDialog(const QString &dialog) const
 {
     return std::find(taskDialogs.cbegin(), taskDialogs.cend(), dialog) != taskDialogs.cend();
+}
+
+const ChatTimeline::ReplyPreview *ChatTimeline::replyPreview(const QString &dialog, const QString &message) const
+{
+    return replyPreviews.object(replyPreviewKey(dialog, message));
+}
+
+void ChatTimeline::rememberReplyPreview(const QString &dialog, const QString &message, ReplyPreview preview) const
+{
+    const auto cost = 1 + preview.files.size();
+    replyPreviews.insert(replyPreviewKey(dialog, message), new ReplyPreview(std::move(preview)), cost);
+}
+
+void ChatTimeline::applyCounterSnapshotRevision(quint64 revision)
+{
+    chatCounterSnapshotRevision = revision;
+    for (auto &overlay : recentOverlays) {
+        if (overlay.counterRevision <= revision) {
+            overlay.counter.reset();
+            overlay.markedUnread.reset();
+        }
+    }
 }
 
 void ChatTimeline::resetAccount()
